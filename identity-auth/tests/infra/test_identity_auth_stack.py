@@ -106,6 +106,19 @@ def test_event_bridge_rule_matches_otp_requested(template):
     )
 
 
+def test_vpc_has_no_nat_gateway_or_public_subnet(template):
+    # Every Lambda and the Redis subnet group only ever use
+    # PRIVATE_ISOLATED subnets — a NAT Gateway (and the public/egress
+    # tiers it exists to serve) would be provisioned and billed for
+    # nothing.
+    template.resource_count_is("AWS::EC2::NatGateway", 0)
+    template.resource_count_is("AWS::EC2::EIP", 0)
+    subnets = template.find_resources("AWS::EC2::Subnet")
+    for props in subnets.values():
+        tags = {t["Key"]: t["Value"] for t in props["Properties"].get("Tags", [])}
+        assert "aws-cdk:subnet-type" not in tags or tags["aws-cdk:subnet-type"] == "Isolated"
+
+
 def test_waf_web_acl_has_rate_based_rule(template):
     template.has_resource_properties(
         "AWS::WAFv2::WebACL",

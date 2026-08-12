@@ -24,6 +24,15 @@ class RateLimiterPort(Protocol):
         ...
 
 
+class OtpSendLockPort(Protocol):
+    def acquire(self, key: str, ttl_seconds: int) -> bool:
+        """Attempts to acquire a short-lived mutex. Returns True if acquired,
+        False if another caller currently holds it."""
+        ...
+
+    def release(self, key: str) -> None: ...
+
+
 class CognitoPort(Protocol):
     def find_verified_sub_by_phone(self, mobile: str) -> str | None:
         """Returns the Cognito `sub` if a phone_number_verified user exists, else None."""

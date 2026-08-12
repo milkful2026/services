@@ -7,7 +7,7 @@ import json
 import pytest
 
 import handlers.otp_send_handler as otp_send_handler
-from domain.exceptions import RateLimitExceededError
+from domain.exceptions import NotificationPublishError, RateLimitExceededError
 from domain.otp_service import OtpService
 
 
@@ -20,11 +20,15 @@ class FakeCognito:
 
 
 class FakePublisher:
-    def __init__(self):
+    def __init__(self, fail_times: int = 0):
         self.calls: list[tuple] = []
+        self._fail_times = fail_times
 
     def publish_otp_requested(self, mobile: str, otp: str, correlation_id: str) -> None:
         self.calls.append((mobile, otp, correlation_id))
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            raise NotificationPublishError("boom")
 
 
 class RaisingRateLimiter:
@@ -163,3 +167,20 @@ def test_send_otp_resend_within_cooldown_does_not_republish():
 
     # Second call is a resend within cooldown — must not publish a new SMS.
     assert len(publisher.calls) == 1
+
+
+def test_send_otp_publish_failure_returns_502_and_does_not_block_immediate_retry():
+    publisher = FakePublisher(fail_times=1)
+    _inject_deps(publisher=publisher)
+
+    first = otp_send_handler.handler(_event({"mobile": "+919876543210"}), None)
+    assert first["statusCode"] == 502
+    body = json.loads(first["body"])
+    assert body["data"]["errorCode"] == "NOTIFICATION_PUBLISH_FAILED"
+
+    # An immediate retry (well within the resend cooldown) must actually
+    # attempt to publish again, not be silently swallowed as a cooldown
+    # resend for an OTP that was never delivered.
+    second = otp_send_handler.handler(_event({"mobile": "+919876543210"}), None)
+    assert second["statusCode"] == 200
+    assert len(publisher.calls) == 2

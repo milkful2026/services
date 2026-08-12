@@ -146,19 +146,18 @@ class IdentityAuthStack(Stack):
         return table
 
     def _build_vpc_and_redis(self) -> tuple[ec2.Vpc, str, ec2.SecurityGroup]:
-        # Dedicated to this service — see module docstring point 3.
+        # Dedicated to this service — see module docstring point 3. Only
+        # PRIVATE_ISOLATED subnets are used below (Lambdas and the Redis
+        # subnet group); no public or egress-routed tier or NAT Gateway is
+        # provisioned, since nothing in this stack needs internet access.
         vpc = ec2.Vpc(
             self,
             "IdentityAuthVpc",
             max_azs=2,
-            nat_gateways=1,
+            nat_gateways=0,
             subnet_configuration=[
-                ec2.SubnetConfiguration(name="public", subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=24),
                 ec2.SubnetConfiguration(
                     name="private-isolated", subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=24
-                ),
-                ec2.SubnetConfiguration(
-                    name="private-with-egress", subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS, cidr_mask=24
                 ),
             ],
         )
@@ -294,10 +293,10 @@ class IdentityAuthStack(Stack):
         wafv2.CfnWebACLAssociation(
             self,
             "IdentityAuthWebAclAssociation",
-            resource_arn=(
-                f"arn:aws:apigateway:{self.region}::/apis/{http_api.http_api_id}"
-                f"/stages/{apigwv2.HttpStage.DEFAULT_STAGE_NAME if hasattr(apigwv2.HttpStage, 'DEFAULT_STAGE_NAME') else '$default'}"
-            ),
+            # $default is the literal (non-configurable) name HttpApi gives
+            # its auto-created default stage; aws-cdk-lib's HttpStage has no
+            # constant for it.
+            resource_arn=f"arn:aws:apigateway:{self.region}::/apis/{http_api.http_api_id}/stages/$default",
             web_acl_arn=web_acl.attr_arn,
         )
 

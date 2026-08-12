@@ -19,7 +19,11 @@ import string
 import boto3
 from botocore.exceptions import ClientError
 
-from domain.exceptions import ExternalServiceUnavailableError, InvalidRefreshTokenError
+from domain.exceptions import (
+    ExternalServiceUnavailableError,
+    InvalidRefreshTokenError,
+    SocialAccountConflictError,
+)
 from domain.models import TokenBundle
 
 logger = logging.getLogger(__name__)
@@ -158,6 +162,28 @@ class CognitoAdapter:
                 attrs.get("phone_number"),
                 False,
                 mobile_verified,
+            )
+
+        # No email-username record exists, but a phone-username record from
+        # OTP registration may already own this email — Username lookup
+        # above can't find it (Username == mobile there, not email). Check
+        # by email attribute before creating a second, disconnected
+        # identity for the same person. Full merge UX is an unresolved
+        # product decision (README "Deferred / tech debt"); this only
+        # prevents silently creating a duplicate account — it does not
+        # attempt to link them.
+        try:
+            response = self._client.list_users(
+                UserPoolId=self._user_pool_id,
+                Filter=f'email = "{email}"',
+                Limit=1,
+            )
+        except ClientError as exc:
+            raise self._log_and_wrap("list_users", exc) from exc
+        if response.get("Users"):
+            raise SocialAccountConflictError(
+                f"{provider} email is already associated with an existing account",
+                merge_instruction_code="CONTACT_SUPPORT",
             )
 
         try:

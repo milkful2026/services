@@ -131,3 +131,44 @@ def test_verify_jwks_fetch_failure_raises_unavailable(adapter):
 
     with pytest.raises(ExternalServiceUnavailableError):
         adapter.verify("google", "irrelevant-token")
+
+
+@responses.activate
+def test_verify_forces_jwks_refresh_when_kid_missing_from_cache(adapter, rsa_key, jwks_document):
+    # First fetch returns a JWKS document that does NOT yet contain the
+    # token's kid (as if this warm Lambda cached the JWKS shortly before a
+    # real key rotation on the provider's side).
+    responses.get(GOOGLE_JWKS_URL, json={"keys": []})
+    responses.get(GOOGLE_JWKS_URL, json=jwks_document)
+    token = _sign_token(rsa_key)
+
+    claims = adapter.verify("google", token)
+
+    assert claims["sub"] == "google-user-sub-123"
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_verify_unknown_kid_still_raises_after_forced_refresh(adapter, rsa_key, jwks_document):
+    # Both the cached and the force-refreshed JWKS lack the token's kid —
+    # this is a genuinely invalid token, not a rotation race.
+    responses.get(GOOGLE_JWKS_URL, json={"keys": []})
+    responses.get(GOOGLE_JWKS_URL, json={"keys": []})
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": "https://accounts.google.com",
+            "aud": "test-google-client-id",
+            "sub": "x",
+            "iat": now,
+            "exp": now + 3600,
+        },
+        rsa_key,
+        algorithm="RS256",
+        headers={"kid": "some-other-kid"},
+    )
+
+    with pytest.raises(InvalidSocialTokenError):
+        adapter.verify("google", token)
+
+    assert len(responses.calls) == 2

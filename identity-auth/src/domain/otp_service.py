@@ -12,11 +12,12 @@ import uuid
 
 import bcrypt
 
-from adapters.interfaces import OtpStorePort, RateLimiterPort
+from adapters.interfaces import OtpSendLockPort, OtpStorePort, RateLimiterPort
 from domain.exceptions import (
     OtpAttemptsExceededError,
     OtpExpiredError,
     OtpInvalidError,
+    OtpRequestInProgressError,
     OtpRequestNotFoundError,
 )
 from domain.models import OtpRecord, OtpStatus
@@ -33,6 +34,8 @@ class OtpService:
         max_attempts: int = 3,
         rate_limit_max_requests: int = 3,
         rate_limit_window_seconds: int = 900,
+        send_lock: OtpSendLockPort | None = None,
+        send_lock_ttl_seconds: int = 10,
     ) -> None:
         self._otp_store = otp_store
         self._rate_limiter = rate_limiter
@@ -42,6 +45,8 @@ class OtpService:
         self._max_attempts = max_attempts
         self._rate_limit_max_requests = rate_limit_max_requests
         self._rate_limit_window_seconds = rate_limit_window_seconds
+        self._send_lock = send_lock
+        self._send_lock_ttl_seconds = send_lock_ttl_seconds
 
     def request_otp(self, mobile: str, purpose: str = "REGISTER") -> tuple[OtpRecord, str, bool]:
         """Returns (record, plaintext_otp, is_resend).
@@ -50,6 +55,23 @@ class OtpService:
         mobile — the caller must not re-publish the SMS in that case,
         only if `resendAfter` has elapsed (spec FR-1 edge case).
         """
+        if self._send_lock is None:
+            return self._request_otp_locked(mobile, purpose)
+
+        lock_key = f"register:otp:lock:{mobile}"
+        if not self._send_lock.acquire(lock_key, self._send_lock_ttl_seconds):
+            # Another request for this mobile is already inside the
+            # check-then-act section below — without this, both could see
+            # no active OTP and each create a separate ACTIVE record.
+            raise OtpRequestInProgressError(
+                "A request for this mobile is already being processed"
+            )
+        try:
+            return self._request_otp_locked(mobile, purpose)
+        finally:
+            self._send_lock.release(lock_key)
+
+    def _request_otp_locked(self, mobile: str, purpose: str) -> tuple[OtpRecord, str, bool]:
         existing = self._otp_store.get_active_by_mobile(mobile)
         now = int(time.time())
 
@@ -87,6 +109,15 @@ class OtpService:
         )
         self._otp_store.put(record)
         return record, plaintext_otp, False
+
+    def mark_send_failed(self, request_id: str) -> None:
+        """Called by the handler when publishing the OTP SMS fails after
+        retries. Moves the record out of ACTIVE so the next request_otp()
+        call for this mobile is treated as a fresh send instead of being
+        silently swallowed by the resend cooldown for an OTP that was
+        never actually delivered.
+        """
+        self._otp_store.mark_status(request_id, OtpStatus.SEND_FAILED.value)
 
     def verify_otp(self, mobile: str, otp: str, request_id: str) -> OtpRecord:
         record = self._otp_store.get(request_id)

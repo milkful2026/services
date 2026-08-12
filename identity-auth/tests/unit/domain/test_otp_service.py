@@ -11,6 +11,7 @@ from domain.exceptions import (
     OtpAttemptsExceededError,
     OtpExpiredError,
     OtpInvalidError,
+    OtpRequestInProgressError,
     OtpRequestNotFoundError,
     RateLimitExceededError,
 )
@@ -185,3 +186,73 @@ def test_verify_otp_already_locked_raises_attempts_exceeded_without_reincrementi
         service.verify_otp("+919876543210", "999999", record.request_id)
 
     assert store.records[record.request_id].attempts == 0
+
+
+def test_mark_send_failed_moves_record_out_of_active(service, store):
+    record, _, _ = service.request_otp("+919876543210")
+
+    service.mark_send_failed(record.request_id)
+
+    assert store.records[record.request_id].status == OtpStatus.SEND_FAILED
+
+
+def test_request_otp_after_send_failed_is_treated_as_fresh_send_not_cooldown(
+    service, store, limiter
+):
+    record, _, _ = service.request_otp("+919876543210")
+    service.mark_send_failed(record.request_id)
+
+    # Immediately retrying — well within what would have been the resend
+    # cooldown — must generate and publish a brand-new OTP rather than
+    # being swallowed as a silent within-cooldown resend, since the first
+    # one was never actually delivered.
+    second, plaintext, is_resend = service.request_otp("+919876543210")
+
+    assert is_resend is False
+    assert plaintext != ""
+    assert limiter.calls == ["register:otp:+919876543210", "register:otp:+919876543210"]
+
+
+class FakeLock:
+    def __init__(self):
+        self.held: set[str] = set()
+        self.acquire_calls: list[str] = []
+
+    def acquire(self, key: str, ttl_seconds: int) -> bool:
+        self.acquire_calls.append(key)
+        if key in self.held:
+            return False
+        self.held.add(key)
+        return True
+
+    def release(self, key: str) -> None:
+        self.held.discard(key)
+
+
+def test_request_otp_without_lock_configured_is_unaffected(service):
+    # Default fixture has no send_lock — must behave exactly as before.
+    record, plaintext, is_resend = service.request_otp("+919876543210")
+    assert is_resend is False
+    assert plaintext != ""
+
+
+def test_request_otp_acquires_and_releases_send_lock_per_mobile(store, limiter):
+    lock = FakeLock()
+    service = OtpService(otp_store=store, rate_limiter=limiter, send_lock=lock)
+
+    service.request_otp("+919876543210")
+
+    assert lock.acquire_calls == ["register:otp:lock:+919876543210"]
+    assert lock.held == set()  # released after the call completes
+
+
+def test_request_otp_raises_when_lock_already_held(store, limiter):
+    lock = FakeLock()
+    lock.held.add("register:otp:lock:+919876543210")
+    service = OtpService(otp_store=store, rate_limiter=limiter, send_lock=lock)
+
+    with pytest.raises(OtpRequestInProgressError):
+        service.request_otp("+919876543210")
+
+    # A rejected concurrent request must not have consumed rate-limit budget.
+    assert limiter.calls == []

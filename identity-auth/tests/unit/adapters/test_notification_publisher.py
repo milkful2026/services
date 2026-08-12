@@ -73,8 +73,12 @@ def test_publish_retries_then_raises_on_failed_entry(publisher, monkeypatch):
 
     monkeypatch.setattr(publisher._client, "put_events", _fail_entry)
 
-    with pytest.raises(NotificationPublishError):
+    with pytest.raises(NotificationPublishError) as exc_info:
         publisher.publish_otp_requested("+919876543210", "123456", "corr-1")
+
+    # A partial-batch failure (no ClientError raised) must still surface the
+    # real per-entry error in `cause`, not the literal string "None".
+    assert "InternalFailure" in exc_info.value.details["cause"]
 
 
 def test_publish_succeeds_after_transient_failure(publisher, monkeypatch):

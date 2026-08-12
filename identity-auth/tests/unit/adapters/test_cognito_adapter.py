@@ -13,7 +13,11 @@ import pytest
 from botocore.exceptions import ClientError
 
 from adapters.cognito_adapter import CognitoAdapter
-from domain.exceptions import ExternalServiceUnavailableError, InvalidRefreshTokenError
+from domain.exceptions import (
+    ExternalServiceUnavailableError,
+    InvalidRefreshTokenError,
+    SocialAccountConflictError,
+)
 
 
 @pytest.fixture
@@ -82,6 +86,43 @@ def test_find_or_create_federated_user_finds_existing_link(adapter):
 def test_refresh_tokens_invalid_raises_domain_error(adapter):
     with pytest.raises(InvalidRefreshTokenError):
         adapter.refresh_tokens("not-a-real-refresh-token")
+
+
+def test_find_or_create_federated_user_raises_conflict_for_existing_email(
+    adapter, cognito_user_pool
+):
+    # Simulate a pre-existing phone-username record (from OTP registration)
+    # that already owns this email attribute. Real Cognito's AdminGetUser
+    # requires the literal Username (the phone number here) and would NOT
+    # resolve by email — moto's mock is more lenient here (a documented
+    # fidelity gap, see this module's docstring), so admin_get_user is
+    # monkeypatched to match real-AWS semantics for this one call.
+    cognito_user_pool["client"].admin_create_user(
+        UserPoolId=cognito_user_pool["pool_id"],
+        Username="+919876543210",
+        UserAttributes=[
+            {"Name": "phone_number", "Value": "+919876543210"},
+            {"Name": "phone_number_verified", "Value": "true"},
+            {"Name": "email", "Value": "user@example.com"},
+        ],
+        MessageAction="SUPPRESS",
+    )
+
+    real_admin_get_user = adapter._client.admin_get_user
+
+    def _admin_get_user_by_literal_username_only(UserPoolId, Username):
+        if Username == "user@example.com":
+            raise adapter._client.exceptions.UserNotFoundException(
+                {"Error": {"Code": "UserNotFoundException"}}, "AdminGetUser"
+            )
+        return real_admin_get_user(UserPoolId=UserPoolId, Username=Username)
+
+    adapter._client.admin_get_user = _admin_get_user_by_literal_username_only
+
+    with pytest.raises(SocialAccountConflictError) as exc_info:
+        adapter.find_or_create_federated_user("google", "google-sub-123", "user@example.com")
+
+    assert exc_info.value.details["mergeInstructionCode"] == "CONTACT_SUPPORT"
 
 
 def test_register_and_issue_tokens_wraps_client_error(adapter, monkeypatch):

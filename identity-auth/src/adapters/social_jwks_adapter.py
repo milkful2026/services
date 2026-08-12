@@ -44,8 +44,30 @@ class SocialJwksAdapter:
         jwks = self._get_jwks(provider)
 
         try:
-            header = jwt.get_unverified_header(id_token)
-            signing_key = self._find_key(jwks, header.get("kid"))
+            kid = jwt.get_unverified_header(id_token).get("kid")
+        except jwt.PyJWTError as exc:
+            logger.info(
+                "social_jwks.verify rejected token",
+                extra={
+                    "correlationId": self._correlation_id,
+                    "provider": provider,
+                    "error": str(exc),
+                },
+            )
+            raise InvalidSocialTokenError(f"Invalid {provider} idToken") from exc
+
+        signing_key = self._find_key(jwks, kid)
+        if signing_key is None:
+            # The cached JWKS may be stale relative to a real key rotation
+            # on the provider's side — force one refetch before concluding
+            # the token is actually invalid, rather than rejecting valid
+            # tokens for up to `cache_ttl_seconds` after every rotation.
+            jwks = self._get_jwks(provider, force_refresh=True)
+            signing_key = self._find_key(jwks, kid)
+        if signing_key is None:
+            raise InvalidSocialTokenError("Signing key not found in JWKS")
+
+        try:
             claims = jwt.decode(
                 id_token,
                 key=signing_key,
@@ -56,7 +78,11 @@ class SocialJwksAdapter:
         except jwt.PyJWTError as exc:
             logger.info(
                 "social_jwks.verify rejected token",
-                extra={"correlationId": self._correlation_id, "provider": provider, "error": str(exc)},
+                extra={
+                    "correlationId": self._correlation_id,
+                    "provider": provider,
+                    "error": str(exc),
+                },
             )
             raise InvalidSocialTokenError(f"Invalid {provider} idToken") from exc
 
@@ -65,8 +91,8 @@ class SocialJwksAdapter:
 
         return claims
 
-    def _get_jwks(self, provider: str) -> dict:
-        cached = self._cache.get(provider)
+    def _get_jwks(self, provider: str, force_refresh: bool = False) -> dict:
+        cached = None if force_refresh else self._cache.get(provider)
         if cached is not None:
             return cached
 
@@ -88,4 +114,4 @@ class SocialJwksAdapter:
         for key in jwks.get("keys", []):
             if key.get("kid") == kid:
                 return jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
-        raise InvalidSocialTokenError("Signing key not found in JWKS")
+        return None

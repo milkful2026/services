@@ -50,7 +50,7 @@ class EventBridgeNotificationPublisher:
             "payload": {"mobile": mobile, "otp": otp},
         }
 
-        last_exc: ClientError | None = None
+        last_cause: str | None = None
         for attempt in range(self._max_retries + 1):
             try:
                 response = self._client.put_events(
@@ -65,6 +65,7 @@ class EventBridgeNotificationPublisher:
                 )
                 if response.get("FailedEntryCount", 0) == 0:
                     return
+                last_cause = str(response.get("Entries"))
                 logger.error(
                     "notification_publisher.put_events entry failed",
                     extra={
@@ -73,7 +74,7 @@ class EventBridgeNotificationPublisher:
                     },
                 )
             except ClientError as exc:
-                last_exc = exc
+                last_cause = str(exc)
                 logger.error(
                     "notification_publisher.put_events failed",
                     extra={
@@ -87,5 +88,5 @@ class EventBridgeNotificationPublisher:
                 time.sleep(self._backoff_base_seconds * (2**attempt))
 
         raise NotificationPublishError(
-            "Failed to publish OtpRequested after retries", details={"cause": str(last_exc)}
+            "Failed to publish OtpRequested after retries", details={"cause": last_cause}
         )

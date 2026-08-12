@@ -33,9 +33,13 @@ class RedisRateLimiterAdapter:
     def check_and_increment(self, key: str, max_requests: int, window_seconds: int) -> None:
         try:
             count = self._redis.incr(key)
-            if count == 1:
-                # Only the request that created the counter sets its
-                # expiry — avoids resetting the window on every request.
+            ttl = self._redis.ttl(key)
+            if ttl < 0:
+                # Either this is the request that created the counter, or a
+                # prior expire() call failed and left the key without a TTL
+                # (e.g. a transient Redis error between incr and expire) —
+                # either way, self-heal by (re)setting the expiry now rather
+                # than only ever attempting it once on count == 1.
                 self._redis.expire(key, window_seconds)
         except RedisError as exc:
             logger.error(
@@ -46,3 +50,34 @@ class RedisRateLimiterAdapter:
 
         if count > max_requests:
             raise RateLimitExceededError(f"Rate limit exceeded: {count}/{max_requests}")
+
+
+class RedisLockAdapter:
+    """Short-lived mutex built on Redis SET NX/EX — used to serialize the
+    otp/send check-then-act critical section per mobile so two concurrent
+    requests can't both observe "no active OTP" and each create one."""
+
+    def __init__(self, redis_client: redis.Redis, correlation_id: str = "") -> None:
+        self._redis = redis_client
+        self._correlation_id = correlation_id
+
+    def acquire(self, key: str, ttl_seconds: int) -> bool:
+        try:
+            return bool(self._redis.set(key, "1", nx=True, ex=ttl_seconds))
+        except RedisError as exc:
+            logger.error(
+                "lock.acquire failed",
+                extra={"correlationId": self._correlation_id, "key": key, "error": str(exc)},
+            )
+            raise ExternalServiceUnavailableError("Lock service unavailable") from exc
+
+    def release(self, key: str) -> None:
+        try:
+            self._redis.delete(key)
+        except RedisError as exc:
+            # Best-effort: the lock's own TTL guarantees it is released even
+            # if this delete fails, so a transient error here isn't fatal.
+            logger.warning(
+                "lock.release failed",
+                extra={"correlationId": self._correlation_id, "key": key, "error": str(exc)},
+            )

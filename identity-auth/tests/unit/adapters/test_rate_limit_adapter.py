@@ -52,3 +52,17 @@ def test_wraps_redis_error(adapter, monkeypatch):
 
     with pytest.raises(ExternalServiceUnavailableError):
         adapter.check_and_increment("register:otp:+919876543210", max_requests=3, window_seconds=900)
+
+
+def test_self_heals_a_counter_left_without_ttl(adapter, fake_redis):
+    # Simulate the bug this guards against: a prior expire() call failed
+    # (e.g. transient Redis error) after incr() succeeded, leaving the
+    # counter with no TTL — it must not be stuck that way forever.
+    key = "register:otp:+919876543210"
+    fake_redis.incr(key)
+    fake_redis.persist(key)
+    assert fake_redis.ttl(key) < 0
+
+    adapter.check_and_increment(key, max_requests=3, window_seconds=900)
+
+    assert fake_redis.ttl(key) > 0

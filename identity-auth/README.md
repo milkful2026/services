@@ -52,7 +52,12 @@ here and in the PR description rather than silently assumed:
    `requiresMobileVerification: true`) is a placeholder identifier, not a
    signed credential, and `POST /v1/auth/otp/verify`'s request contract
    has no field to accept it back — this whole branch is inert until the
-   merge UX is scoped.
+   merge UX is scoped. To avoid silently creating a second, disconnected
+   identity in the meantime, `find_or_create_federated_user` now checks
+   for an existing user with a matching `email` attribute before creating
+   one and raises `SocialAccountConflictError` (409, `mergeInstructionCode:
+   "CONTACT_SUPPORT"`) if found — a conservative stopgap, not the merge UX
+   itself.
 4. **EventBridge bus.** `OtpRequested` publishes to the account **default**
    bus, not a new named bus — no shared `milkful-domain-events` bus exists
    yet. The CDK stack's rule target is a CloudWatch log group (not a

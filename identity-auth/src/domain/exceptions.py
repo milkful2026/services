@@ -61,6 +61,15 @@ class RateLimitExceededError(IdentityAuthError):
     http_status = 429
 
 
+class OtpRequestInProgressError(IdentityAuthError):
+    """A concurrent otp/send request for the same mobile is already being
+    processed — the client should retry shortly rather than racing to
+    create a second ACTIVE OTP record for the same mobile."""
+
+    error_code = "OTP_REQUEST_IN_PROGRESS"
+    http_status = 409
+
+
 class InvalidSocialTokenError(IdentityAuthError):
     error_code = "INVALID_SOCIAL_TOKEN"
     http_status = 401

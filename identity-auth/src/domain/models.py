@@ -13,6 +13,7 @@ class OtpStatus(str, Enum):
     ACTIVE = "ACTIVE"
     CONSUMED = "CONSUMED"
     LOCKED = "LOCKED"
+    SEND_FAILED = "SEND_FAILED"
 
 
 @dataclass

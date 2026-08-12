@@ -17,9 +17,13 @@ from pydantic import ValidationError as PydanticValidationError
 from adapters.cognito_adapter import CognitoAdapter
 from adapters.notification_publisher import EventBridgeNotificationPublisher
 from adapters.otp_store_adapter import DynamoDbOtpStoreAdapter
-from adapters.rate_limit_adapter import RedisRateLimiterAdapter, build_redis_client
+from adapters.rate_limit_adapter import (
+    RedisLockAdapter,
+    RedisRateLimiterAdapter,
+    build_redis_client,
+)
 from config.env import get_settings
-from domain.exceptions import IdentityAuthError, UserExistsError
+from domain.exceptions import IdentityAuthError, NotificationPublishError, UserExistsError
 from domain.otp_service import OtpService
 from handlers.dto import OtpSendRequest, error_response, success_response, validation_error_response
 
@@ -35,9 +39,11 @@ def _get_deps() -> dict:
 
     settings = get_settings()
     otp_store = DynamoDbOtpStoreAdapter(settings.otp_requests_table_name, settings.aws_region)
-    rate_limiter = RedisRateLimiterAdapter(
-        build_redis_client(settings.redis_host, settings.redis_port, settings.redis_use_tls)
+    redis_client = build_redis_client(
+        settings.redis_host, settings.redis_port, settings.redis_use_tls
     )
+    rate_limiter = RedisRateLimiterAdapter(redis_client)
+    send_lock = RedisLockAdapter(redis_client)
     cognito = CognitoAdapter(
         settings.cognito_user_pool_id, settings.cognito_client_id, settings.aws_region
     )
@@ -53,6 +59,7 @@ def _get_deps() -> dict:
         max_attempts=settings.otp_max_attempts,
         rate_limit_max_requests=settings.otp_rate_limit_max_requests,
         rate_limit_window_seconds=settings.otp_rate_limit_window_seconds,
+        send_lock=send_lock,
     )
 
     _deps = {
@@ -80,7 +87,16 @@ def handler(event: dict, context) -> dict:
 
         record, plaintext_otp, is_resend = deps["otp_service"].request_otp(request.mobile)
         if not is_resend:
-            deps["publisher"].publish_otp_requested(request.mobile, plaintext_otp, correlation_id)
+            try:
+                deps["publisher"].publish_otp_requested(
+                    request.mobile, plaintext_otp, correlation_id
+                )
+            except NotificationPublishError:
+                # The OTP record is already persisted as ACTIVE, but no SMS
+                # was ever delivered — move it out of ACTIVE so the next
+                # send attempt isn't swallowed by the resend cooldown.
+                deps["otp_service"].mark_send_failed(record.request_id)
+                raise
 
         return success_response(
             {
