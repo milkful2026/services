@@ -4,6 +4,7 @@ ElastiCache; moto for SQS. No real AWS credentials, DB, or network."""
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 
 from adapters.zone_repository import create_schema, serviceability_zones_table
 
@@ -23,10 +24,18 @@ def _env(monkeypatch):
 
 @pytest.fixture
 def sqlite_engine():
-    # A fresh in-memory DB per test — StaticPool would share one
-    # connection across threads, not needed here since tests are
-    # single-threaded and each test gets its own engine instance.
-    engine = create_engine("sqlite:///:memory:")
+    # StaticPool + check_same_thread=False: FastAPI's TestClient runs sync
+    # endpoint functions in a worker thread pool, but a plain in-memory
+    # SQLite DB is both thread-affine AND per-connection — without
+    # StaticPool forcing every checkout to reuse the same connection, a
+    # request handled on a different thread would silently see an empty
+    # database instead of raising, since it'd be a distinct, never-seeded
+    # in-memory DB.
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     create_schema(engine)
     yield engine
     engine.dispose()
