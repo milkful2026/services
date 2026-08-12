@@ -64,12 +64,36 @@ def otp_table(aws):
 @pytest.fixture
 def cognito_user_pool(aws):
     client = boto3.client("cognito-idp", region_name="ap-south-1")
-    pool = client.create_user_pool(PoolName="milkful-test-pool")
+    pool = client.create_user_pool(
+        PoolName="milkful-test-pool",
+        UsernameAttributes=["phone_number", "email"],
+        AutoVerifiedAttributes=["phone_number", "email"],
+        Schema=[
+            {"Name": "phone_number", "AttributeDataType": "String", "Mutable": True},
+            {"Name": "email", "AttributeDataType": "String", "Mutable": True},
+            {
+                "Name": "google_sub",
+                "AttributeDataType": "String",
+                "Mutable": True,
+                "DeveloperOnlyAttribute": False,
+            },
+            {
+                "Name": "apple_sub",
+                "AttributeDataType": "String",
+                "Mutable": True,
+                "DeveloperOnlyAttribute": False,
+            },
+        ],
+    )
     pool_id = pool["UserPool"]["Id"]
     app_client = client.create_user_pool_client(
         UserPoolId=pool_id,
         ClientName="milkful-test-client",
-        ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        ExplicitAuthFlows=[
+            "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+            "ALLOW_REFRESH_TOKEN_AUTH",
+            "ALLOW_USER_PASSWORD_AUTH",
+        ],
     )
     os.environ["IDENTITY_AUTH_COGNITO_USER_POOL_ID"] = pool_id
     os.environ["IDENTITY_AUTH_COGNITO_CLIENT_ID"] = app_client["UserPoolClient"]["ClientId"]

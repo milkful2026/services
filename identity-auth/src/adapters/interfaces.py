@@ -25,20 +25,32 @@ class RateLimiterPort(Protocol):
 
 
 class CognitoPort(Protocol):
-    def find_verified_user_by_phone(self, mobile: str) -> str | None:
+    def find_verified_sub_by_phone(self, mobile: str) -> str | None:
         """Returns the Cognito `sub` if a phone_number_verified user exists, else None."""
         ...
 
-    def create_or_confirm_user(self, mobile: str) -> tuple[str, bool]:
-        """Returns (sub, is_new_user)."""
+    def register_and_issue_tokens(self, mobile: str) -> tuple[TokenBundle, bool]:
+        """Create-or-confirm the Cognito user for `mobile`, mark phone_number_verified,
+        and issue tokens. Returns (tokens, is_new_user).
+
+        Username == mobile in this pool (phone is the username attribute), so no
+        separate username lookup is needed for the immediate token issuance that
+        follows — the password set here is single-use and never persisted.
+        """
         ...
 
-    def issue_tokens_for_sub(self, sub: str) -> TokenBundle: ...
-
     def find_or_create_federated_user(
-        self, provider: str, provider_sub: str, email: str | None
-    ) -> tuple[str, bool, bool]:
-        """Returns (sub, is_new_user, mobile_verified)."""
+        self, provider: str, provider_sub: str, email: str
+    ) -> tuple[str, str | None, bool, bool]:
+        """Returns (sub, mobile_or_none, is_new_user, mobile_verified).
+        `email` is required — this pool has no username-eligible identifier
+        for a federated user without one (see cognito_adapter's docstring).
+        """
+        ...
+
+    def issue_tokens(self, username: str) -> TokenBundle:
+        """Issues fresh tokens for an already-created/linked user, keyed by
+        Cognito Username (== mobile in this pool), not `sub`."""
         ...
 
     def refresh_tokens(self, refresh_token: str) -> TokenBundle: ...
