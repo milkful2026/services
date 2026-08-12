@@ -60,6 +60,18 @@ class RedisZoneCacheAdapter:
                 extra={"correlationId": self._correlation_id, "pincode": pincode, "error": str(exc)},
             )
 
+    def invalidate_by_prefix(self, prefix: str) -> None:
+        try:
+            pattern = f"{self._key(prefix)}*"
+            keys = list(self._redis.scan_iter(match=pattern))
+            if keys:
+                self._redis.delete(*keys)
+        except RedisError as exc:
+            logger.error(
+                "zone_cache.invalidate_by_prefix failed",
+                extra={"correlationId": self._correlation_id, "prefix": prefix, "error": str(exc)},
+            )
+
     @staticmethod
     def _key(pincode: str) -> str:
         return f"svc:{pincode}"

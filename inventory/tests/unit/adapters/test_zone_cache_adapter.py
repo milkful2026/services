@@ -52,3 +52,24 @@ def test_set_swallows_redis_error_without_raising(adapter, monkeypatch):
     monkeypatch.setattr(adapter._redis, "set", _raise)
 
     adapter.set("560001", {"serviceable": True}, ttl_seconds=900)  # must not raise
+
+
+def test_invalidate_by_prefix_removes_all_matching_keys(adapter):
+    adapter.set("560001", {"serviceable": True}, ttl_seconds=900)
+    adapter.set("560099", {"serviceable": True}, ttl_seconds=900)
+    adapter.set("110001", {"serviceable": False}, ttl_seconds=900)  # different prefix
+
+    adapter.invalidate_by_prefix("5600")
+
+    assert adapter.get("560001") is None
+    assert adapter.get("560099") is None
+    assert adapter.get("110001") is not None
+
+
+def test_invalidate_by_prefix_swallows_redis_error(adapter, monkeypatch):
+    def _raise(*args, **kwargs):
+        raise RedisError("connection refused")
+
+    monkeypatch.setattr(adapter._redis, "scan_iter", _raise)
+
+    adapter.invalidate_by_prefix("5600")  # must not raise
