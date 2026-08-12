@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 
@@ -90,3 +91,43 @@ def test_missing_payload_field_does_not_raise(sqs_queue, consumer, zone_cache):
 
     assert processed == 1
     assert zone_cache.invalidated_prefixes == []
+
+
+def test_string_pincode_prefixes_is_rejected_not_iterated_as_chars(sqs_queue, consumer, zone_cache):
+    # A string instead of a list is an easy serialization mistake for a
+    # producer to make — it must be rejected (left for retry/DLQ), not
+    # silently iterated character-by-character into four single-digit
+    # prefix invalidations.
+    sqs_queue["client"].send_message(
+        QueueUrl=sqs_queue["queue_url"],
+        MessageBody=json.dumps(
+            {
+                "correlationId": "corr-1",
+                "payload": {"zoneId": "blr-central", "pincodePrefixes": "5600"},
+            }
+        ),
+    )
+
+    processed = consumer.poll_once(wait_time_seconds=0)
+
+    assert processed == 1
+    assert zone_cache.invalidated_prefixes == []
+
+
+def test_process_message_failure_logs_use_the_event_own_correlation_id(sqs_queue, consumer, caplog):
+    # A malformed-but-parseable message (missing pincodePrefixes) still
+    # carries a real correlationId in the envelope — the failure log for
+    # it must use that, not the consumer's own (empty) default, so a bad
+    # ZoneUpdated event can actually be traced through the logs.
+    sqs_queue["client"].send_message(
+        QueueUrl=sqs_queue["queue_url"],
+        MessageBody=json.dumps({"correlationId": "corr-from-event", "payload": {}}),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        consumer.poll_once(wait_time_seconds=0)
+
+    [record] = [
+        r for r in caplog.records if "zone_update_consumer failed to process message" in r.message
+    ]
+    assert record.correlationId == "corr-from-event"

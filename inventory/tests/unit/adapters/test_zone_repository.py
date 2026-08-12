@@ -46,6 +46,19 @@ def test_get_active_zones_empty_when_no_rows(repository):
     assert repository.get_active_zones() == []
 
 
+def test_get_active_zones_returns_deterministic_order(sqlite_engine, repository):
+    # Insert in an order different from id sort order — without ORDER BY,
+    # a match that picks "the first zone returned" for overlapping zones
+    # would be non-deterministic across requests/deploys.
+    seed_zone(sqlite_engine, id="zone-c", pincode_prefixes=["5600"])
+    seed_zone(sqlite_engine, id="zone-a", pincode_prefixes=["5600"])
+    seed_zone(sqlite_engine, id="zone-b", pincode_prefixes=["5600"])
+
+    zones = repository.get_active_zones()
+
+    assert [z.id for z in zones] == ["zone-a", "zone-b", "zone-c"]
+
+
 def test_get_active_zones_fails_closed_on_db_error(sqlite_engine, repository, monkeypatch):
     def _raise(*args, **kwargs):
         raise OperationalError("connect", {}, Exception("connection refused"))

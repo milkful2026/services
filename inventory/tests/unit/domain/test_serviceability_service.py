@@ -3,6 +3,7 @@ import pytest
 from domain.exceptions import InvalidPincodeError
 from domain.models import Slot, Zone
 from domain.serviceability_service import ServiceabilityService
+from handlers.dto import serialize_result
 
 
 class FakeZoneRepository:
@@ -141,3 +142,17 @@ def test_cache_miss_writes_result_with_configured_ttl(cache):
     service.check("560001", None, None)
 
     assert cache.set_calls == [("560001", 900)]
+
+
+def test_cached_shape_matches_api_response_shape(cache):
+    # `handlers.dto.serialize_result` and this module's cache
+    # serialization must be the same function under the hood — a
+    # cache-hit response and a DB-fetch response for the same query can't
+    # be allowed to drift in shape.
+    repo = FakeZoneRepository([BLR_CENTRAL])
+    service = ServiceabilityService(repo, cache)
+
+    result = service.check("560001", None, None)
+
+    cached_dict = cache.store["560001"]
+    assert cached_dict == serialize_result(result)

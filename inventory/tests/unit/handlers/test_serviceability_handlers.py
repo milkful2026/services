@@ -5,6 +5,7 @@ from domain.exceptions import InvalidPincodeError, ServiceUnavailableError
 from domain.models import ServiceabilityResult, Slot
 from handlers.app import app
 from handlers.dependencies import get_serviceability_service
+from handlers.health import consumer_health
 
 
 class FakeService:
@@ -105,6 +106,26 @@ def test_public_check_db_unavailable_returns_503(client):
 
     assert response.status_code == 503
     assert response.json()["data"]["errorCode"] == "SERVICE_UNAVAILABLE"
+
+
+def test_healthz_does_not_touch_serviceability_service(client):
+    # Deliberately no dependency override — if /healthz called through to
+    # ServiceabilityService it would blow up with no DB/cache configured.
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_healthz_reports_unhealthy_when_consumer_thread_has_died(client):
+    consumer_health.alive = False
+    try:
+        response = client.get("/healthz")
+    finally:
+        consumer_health.alive = True
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "unhealthy"
 
 
 def test_internal_check_uses_same_service_and_response_shape(client):

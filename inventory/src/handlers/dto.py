@@ -5,17 +5,11 @@ import uuid
 from typing import Any
 
 from domain.models import ServiceabilityResult
+from domain.serviceability_service import result_to_dict
 
 
 def serialize_result(result: ServiceabilityResult) -> dict[str, Any]:
-    return {
-        "serviceable": result.serviceable,
-        "zoneId": result.zone_id,
-        "zoneName": result.zone_name,
-        "slots": [{"id": s.id, "label": s.label} for s in result.slots],
-        "message": result.message,
-        "waitlistAvailable": result.waitlist_available,
-    }
+    return result_to_dict(result)
 
 
 def success_envelope(data: dict[str, Any]) -> dict[str, Any]:

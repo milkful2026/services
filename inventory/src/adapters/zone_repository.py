@@ -49,9 +49,13 @@ class SqlAlchemyZoneRepository:
         try:
             with self._engine.connect() as conn:
                 rows = conn.execute(
-                    select(serviceability_zones_table).where(
-                        serviceability_zones_table.c.active.is_(True)
-                    )
+                    select(serviceability_zones_table)
+                    .where(serviceability_zones_table.c.active.is_(True))
+                    # Overlapping zones/prefixes are matched in id order —
+                    # without this, Postgres gives no ordering guarantee and
+                    # which zone (and slots) a caller sees could differ
+                    # between requests.
+                    .order_by(serviceability_zones_table.c.id)
                 ).fetchall()
         except SQLAlchemyError as exc:
             logger.error(

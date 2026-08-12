@@ -55,6 +55,25 @@ def test_internal_alb_is_not_internet_facing(template):
     )
 
 
+def test_vpc_link_security_group_has_ingress_to_alb_security_group(template):
+    # Without this, the API Gateway VpcLink (and anything else in the VPC)
+    # has no ingress rule allowing it to reach the ALB's security group —
+    # the service would be completely unreachable despite synthesizing
+    # cleanly.
+    ingress_rules = template.find_resources("AWS::EC2::SecurityGroupIngress")
+    assert any(
+        props["Properties"].get("FromPort") == 80 and props["Properties"].get("ToPort") == 80
+        for props in ingress_rules.values()
+    )
+
+
+def test_alb_target_group_health_check_is_not_the_business_endpoint(template):
+    template.has_resource_properties(
+        "AWS::ElasticLoadBalancingV2::TargetGroup",
+        {"HealthCheckPath": "/healthz"},
+    )
+
+
 def test_ecr_repository_exists_for_ci_built_image(template):
     template.resource_count_is("AWS::ECR::Repository", 1)
 

@@ -231,14 +231,32 @@ class InventoryStack(Stack):
             "InventoryTargets",
             port=8000,
             targets=[fargate_service],
-            health_check=elbv2.HealthCheck(path="/v1/serviceability/check?pincode=560001"),
+            # A lightweight liveness path — NOT the real business endpoint,
+            # which queries Aurora/Redis and would turn a transient DB blip
+            # into ECS cycling the (single) task. See handlers/app.py.
+            health_check=elbv2.HealthCheck(path="/healthz"),
         )
         return alb, listener
 
     def _build_http_api(
         self, vpc: ec2.Vpc, alb: elbv2.ApplicationLoadBalancer, listener: elbv2.ApplicationListener
     ) -> apigwv2.HttpApi:
-        vpc_link = apigwv2.VpcLink(self, "InventoryVpcLink", vpc=vpc)
+        # A VpcLink with no explicit security_groups gets an
+        # auto-generated one CDK doesn't hand back a reference to, leaving
+        # no way to grant it ingress on the ALB — so it's created
+        # explicitly here purely to be the source of that ingress rule.
+        vpc_link_security_group = ec2.SecurityGroup(
+            self,
+            "InventoryVpcLinkSecurityGroup",
+            vpc=vpc,
+            description="Inventory API Gateway VPC Link",
+        )
+        alb.connections.allow_from(
+            vpc_link_security_group, ec2.Port.tcp(80), "API Gateway VPC Link -> ALB"
+        )
+        vpc_link = apigwv2.VpcLink(
+            self, "InventoryVpcLink", vpc=vpc, security_groups=[vpc_link_security_group]
+        )
         http_api = apigwv2.HttpApi(self, "InventoryHttpApi", api_name="inventory")
 
         # Public route only — the internal route is intentionally never

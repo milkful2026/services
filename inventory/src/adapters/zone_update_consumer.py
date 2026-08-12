@@ -61,16 +61,20 @@ class ZoneUpdateConsumer:
             self.poll_once()
 
     def _process_message(self, message: dict) -> None:
+        correlation_id = self._correlation_id
         try:
             body = json.loads(message["Body"])
+            correlation_id = body.get("correlationId", self._correlation_id)
             prefixes = body["payload"]["pincodePrefixes"]
+            if not isinstance(prefixes, list):
+                raise TypeError(f"pincodePrefixes must be a list, got {type(prefixes).__name__}")
             for prefix in prefixes:
                 self._zone_cache.invalidate_by_prefix(prefix)
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             logger.error(
                 "zone_update_consumer failed to process message — left for retry/DLQ",
                 extra={
-                    "correlationId": self._correlation_id,
+                    "correlationId": correlation_id,
                     "messageId": message.get("MessageId"),
                     "error": str(exc),
                 },
@@ -84,5 +88,5 @@ class ZoneUpdateConsumer:
         except ClientError as exc:
             logger.error(
                 "zone_update_consumer.delete_message failed",
-                extra={"correlationId": self._correlation_id, "error": str(exc)},
+                extra={"correlationId": correlation_id, "error": str(exc)},
             )

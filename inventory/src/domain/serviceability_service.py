@@ -41,7 +41,7 @@ class ServiceabilityService:
         zones = self._zone_repository.get_active_zones()
         result = self._match(pincode, lat, lng, zones)
 
-        self._zone_cache.set(pincode, _result_to_dict(result), self._cache_ttl_seconds)
+        self._zone_cache.set(pincode, result_to_dict(result), self._cache_ttl_seconds)
         return result
 
     def _match(
@@ -91,7 +91,10 @@ def _serviceable_result(zone: Zone) -> ServiceabilityResult:
     )
 
 
-def _result_to_dict(result: ServiceabilityResult) -> dict:
+def result_to_dict(result: ServiceabilityResult) -> dict:
+    """The canonical `ServiceabilityResult` <-> dict shape — shared by the
+    cache-aside serialization here and by `handlers/dto.serialize_result`,
+    so the cached representation and the API response can't drift apart."""
     return {
         "serviceable": result.serviceable,
         "zoneId": result.zone_id,

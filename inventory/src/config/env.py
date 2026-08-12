@@ -11,7 +11,11 @@ class Settings(BaseSettings):
 
     redis_host: str
     redis_port: int = 6379
-    redis_use_tls: bool = True
+    # The CDK stack provisions a plain AWS::ElastiCache::CacheCluster, which
+    # has no in-transit encryption support at all (only
+    # AWS::ElastiCache::ReplicationGroup does) — this must stay False until
+    # the infra is upgraded to a TLS-capable cluster type.
+    redis_use_tls: bool = False
     cache_ttl_seconds: int = 900  # 15 min, per spec §6
 
     zone_updated_queue_url: str = ""
