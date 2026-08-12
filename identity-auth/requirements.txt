@@ -1,0 +1,9 @@
+aws-lambda-powertools[tracer]==2.43.1
+pydantic==2.9.2
+pydantic-settings==2.6.1
+bcrypt==4.2.1
+boto3==1.35.68
+PyJWT[crypto]==2.10.1
+requests==2.32.3
+cachetools==5.5.0
+redis==5.2.1

@@ -1,0 +1,9 @@
+-r requirements.txt
+pytest==8.3.4
+pytest-cov==6.0.0
+pytest-mock==3.14.0
+moto[dynamodb,cognitoidp,events]==5.0.21
+fakeredis==2.26.2
+responses==0.25.3
+freezegun==1.5.1
+cryptography==43.0.3
