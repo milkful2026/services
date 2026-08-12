@@ -35,6 +35,12 @@ class UserRepositoryPort(Protocol):
         isn't a live Inventory call."""
         ...
 
+    def get_unpublished_outbox_events(self, limit: int) -> list[dict]:
+        """Used only by outbox_publisher_handler, not the request path."""
+        ...
+
+    def mark_outbox_published(self, event_id: str) -> None: ...
+
 
 class InventoryClientPort(Protocol):
     def check_serviceability(self, pincode: str, lat: float, lng: float) -> bool:
