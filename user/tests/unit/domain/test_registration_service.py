@@ -22,6 +22,13 @@ class FakeUserRepository:
 
 
 class FakeInventoryClient:
+    """Mirrors the real HttpInventoryClient's contract: returns a bool,
+    never raises NotServiceableError itself — the domain service is
+    responsible for turning `False` into that exception. An earlier
+    version of this fake raised on `serviceable=False`, which masked a
+    real bug where registration_service.register() called
+    check_serviceability() but never checked its return value."""
+
     def __init__(self, serviceable: bool = True, raises: Exception | None = None):
         self.serviceable = serviceable
         self.raises = raises
@@ -31,9 +38,7 @@ class FakeInventoryClient:
         self.calls.append((pincode, lat, lng))
         if self.raises:
             raise self.raises
-        if not self.serviceable:
-            raise NotServiceableError("not serviceable")
-        return True
+        return self.serviceable
 
 
 class FakeCognitoAttributes:

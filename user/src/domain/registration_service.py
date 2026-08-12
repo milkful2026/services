@@ -19,7 +19,7 @@ from adapters.interfaces import (
     InventoryClientPort,
     UserRepositoryPort,
 )
-from domain.exceptions import ValidationError
+from domain.exceptions import NotServiceableError, ValidationError
 from domain.models import Address, Consent, DeliverySlot, RegistrationRequest, RegistrationResult
 
 logger = logging.getLogger(__name__)
@@ -46,9 +46,13 @@ class RegistrationService:
 
         # Must complete and pass BEFORE the DB transaction — a
         # non-serviceable address must never reach the database.
-        self._inventory_client.check_serviceability(
+        serviceable = self._inventory_client.check_serviceability(
             default_address.pincode, default_address.lat, default_address.lng
         )
+        if not serviceable:
+            raise NotServiceableError(
+                f"Address with pincode {default_address.pincode!r} is not serviceable"
+            )
 
         result = self._user_repository.register(
             cognito_sub=request.cognito_sub,
