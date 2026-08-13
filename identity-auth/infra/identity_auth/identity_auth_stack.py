@@ -280,36 +280,37 @@ class IdentityAuthStack(Stack):
     ) -> apigwv2.HttpApi:
         http_api = apigwv2.HttpApi(self, "IdentityAuthHttpApi", api_name="identity-auth")
 
-        # No authorizer — these 6 routes are all pre-auth by definition
-        # (spec §6 / MA-21 §6: user isn't authenticated yet at send/verify
-        # time, same as registration's OTP endpoints).
-        unauthenticated_routes = [
-            ("/v1/auth/otp/send", otp_send_fn),
-            ("/v1/auth/otp/verify", otp_verify_fn),
-            ("/v1/auth/social", social_auth_fn),
-            ("/v1/auth/token/refresh", token_refresh_fn),
-            ("/v1/auth/login/otp/send", login_otp_send_fn),
-            ("/v1/auth/login/otp/verify", login_otp_verify_fn),
+        # A Cognito JWT authorizer, used only by /auth/logout below — the
+        # one authenticated route in this service (MA-21 §6: must be an
+        # authenticated request to log out of). Built once here so adding
+        # the next authenticated route is a one-line table entry instead
+        # of a copy-pasted authorizer-plus-add_routes block.
+        jwt_authorizer = apigwv2_authorizers.HttpUserPoolAuthorizer(
+            "IdentityAuthJwtAuthorizer", user_pool, user_pool_clients=[app_client]
+        )
+
+        # Every route this service exposes, with its authorizer (None ==
+        # pre-auth, per spec §6 / MA-21 §6: user isn't authenticated yet
+        # at send/verify time). One table, one loop — the next route
+        # can't ship without an authorizer just by landing in the wrong
+        # list.
+        RouteEntry = tuple[str, lambda_.Function, apigwv2_authorizers.HttpUserPoolAuthorizer | None]
+        routes: list[RouteEntry] = [
+            ("/v1/auth/otp/send", otp_send_fn, None),
+            ("/v1/auth/otp/verify", otp_verify_fn, None),
+            ("/v1/auth/social", social_auth_fn, None),
+            ("/v1/auth/token/refresh", token_refresh_fn, None),
+            ("/v1/auth/login/otp/send", login_otp_send_fn, None),
+            ("/v1/auth/login/otp/verify", login_otp_verify_fn, None),
+            ("/v1/auth/logout", logout_fn, jwt_authorizer),
         ]
-        for path, fn in unauthenticated_routes:
+        for path, fn, authorizer in routes:
             http_api.add_routes(
                 path=path,
                 methods=[apigwv2.HttpMethod.POST],
                 integration=apigwv2_integrations.HttpLambdaIntegration(f"{fn.node.id}Integration", fn),
+                authorizer=authorizer,
             )
-
-        # /auth/logout is the one authenticated route in this service —
-        # MA-21 §6 requires a Cognito authorizer (must be an
-        # authenticated request to log out of).
-        logout_authorizer = apigwv2_authorizers.HttpUserPoolAuthorizer(
-            "LogoutAuthorizer", user_pool, user_pool_clients=[app_client]
-        )
-        http_api.add_routes(
-            path="/v1/auth/logout",
-            methods=[apigwv2.HttpMethod.POST],
-            integration=apigwv2_integrations.HttpLambdaIntegration("LogoutIntegration", logout_fn),
-            authorizer=logout_authorizer,
-        )
 
         return http_api
 

@@ -21,7 +21,12 @@ from pydantic import ValidationError as PydanticValidationError
 from adapters.cognito_adapter import CognitoAdapter
 from config.env import get_settings
 from domain.exceptions import IdentityAuthError
-from handlers.dto import TokenRefreshRequest, error_response, no_content_response, validation_error_response
+from handlers.dto import (
+    LogoutRequest,
+    error_response,
+    no_content_response,
+    validation_error_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +52,7 @@ def handler(event: dict, context) -> dict:
 
     try:
         body = json.loads(event.get("body") or "{}")
-        request = TokenRefreshRequest.model_validate(body)
+        request = LogoutRequest.model_validate(body)
     except (json.JSONDecodeError, PydanticValidationError) as exc:
         return validation_error_response(str(exc))
 

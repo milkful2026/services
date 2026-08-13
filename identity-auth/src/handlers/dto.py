@@ -59,10 +59,23 @@ class SocialAuthRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class TokenRefreshRequest(BaseModel):
+class _RefreshTokenBodyDto(BaseModel):
+    """Both token/refresh and logout take the same {refreshToken} body
+    shape, but are given distinct, purpose-named subclasses rather than
+    sharing one type — grepping for either name should only surface the
+    endpoint it actually names."""
+
     refresh_token: str = Field(alias="refreshToken")
 
     model_config = {"populate_by_name": True}
+
+
+class TokenRefreshRequest(_RefreshTokenBodyDto):
+    pass
+
+
+class LogoutRequest(_RefreshTokenBodyDto):
+    pass
 
 
 def success_response(data: dict[str, Any], status_code: int = 200) -> dict[str, Any]:

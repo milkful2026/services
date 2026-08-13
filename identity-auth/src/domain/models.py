@@ -25,7 +25,8 @@ class OtpRecord:
     status: OtpStatus
     ttl: int  # epoch seconds
     last_sent_at: int  # epoch seconds
-    purpose: str = "REGISTER"  # reserved for MA-21 login; not branched on yet
+    # "REGISTER" | "LOGIN" — drives rate-limit/lock key isolation, see otp_service.py
+    purpose: str = "REGISTER"
 
 
 @dataclass

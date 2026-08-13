@@ -151,13 +151,72 @@ def test_request_otp_propagates_rate_limit_exceeded(store):
         service.request_otp("+919876543210")
 
 
-def test_verify_otp_success_marks_record_consumed(service, store):
+def test_verify_otp_success_does_not_mark_consumed(service, store):
+    # verify_otp() alone must leave the record ACTIVE — only
+    # mark_otp_consumed() (called by the handler after its own further
+    # step, e.g. issuing tokens, succeeds) consumes it. See
+    # OtpService.verify_otp's docstring.
     record, plaintext, _ = service.request_otp("+919876543210")
 
     result = service.verify_otp("+919876543210", plaintext, record.request_id)
 
     assert result.request_id == record.request_id
+    assert store.records[record.request_id].status == OtpStatus.ACTIVE
+
+
+def test_mark_otp_consumed_marks_record_consumed(service, store):
+    record, plaintext, _ = service.request_otp("+919876543210")
+    service.verify_otp("+919876543210", plaintext, record.request_id)
+
+    service.mark_otp_consumed(record.request_id)
+
     assert store.records[record.request_id].status == OtpStatus.CONSUMED
+
+
+def test_verify_otp_without_mark_consumed_can_be_retried(service, store):
+    # The exact scenario this split guards against: a downstream failure
+    # after verify_otp() succeeds (e.g. Cognito throttling) must not burn
+    # the code — a second verify_otp() call with the same code must still
+    # succeed.
+    record, plaintext, _ = service.request_otp("+919876543210")
+
+    service.verify_otp("+919876543210", plaintext, record.request_id)
+    result = service.verify_otp("+919876543210", plaintext, record.request_id)  # must not raise
+
+    assert result.request_id == record.request_id
+
+
+def test_verify_otp_works_without_a_rate_limiter_configured(store):
+    # rate_limiter is optional so verify-only callers aren't forced to
+    # wire one — verify_otp()/mark_otp_consumed() never touch it.
+    service = OtpService(otp_store=store)
+    record = OtpRecord(
+        request_id="req-1",
+        mobile="+919876543210",
+        otp_hash=bcrypt.hashpw(b"123456", bcrypt.gensalt()).decode(),
+        attempts=0,
+        status=OtpStatus.ACTIVE,
+        ttl=int(time.time()) + 300,
+        last_sent_at=int(time.time()),
+    )
+    store.put(record)
+
+    result = service.verify_otp("+919876543210", "123456", "req-1")
+    service.mark_otp_consumed("req-1")
+
+    assert result.request_id == "req-1"
+    assert store.records["req-1"].status == OtpStatus.CONSUMED
+
+
+def test_request_otp_without_rate_limiter_raises_attribute_error(store):
+    # The flip side of the above: request_otp() genuinely needs a rate
+    # limiter — omitting it is a composition-root bug, not a supported
+    # "no rate limiting" mode, and must fail loudly rather than silently
+    # skip the check.
+    service = OtpService(otp_store=store)
+
+    with pytest.raises(AttributeError):
+        service.request_otp("+919876543210")
 
 
 def test_verify_otp_unknown_request_id_raises_not_found(service):

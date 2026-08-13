@@ -131,3 +131,25 @@ def test_verify_otp_cognito_failure_propagates_as_503():
     )
 
     assert response["statusCode"] == 503
+
+
+def test_verify_otp_cognito_failure_leaves_otp_retryable():
+    # A transient Cognito failure must not burn the OTP — the record
+    # must stay ACTIVE (not CONSUMED) so a retry with the same
+    # requestId/otp can still succeed once Cognito recovers.
+    failing_cognito = FakeCognito(raise_on_issue=ExternalServiceUnavailableError("down"))
+    store, otp_service, _ = _inject_deps(cognito=failing_cognito)
+    record, plaintext, _ = otp_service.request_otp("+919876543210")
+
+    first = otp_verify_handler.handler(
+        _event({"mobile": "+919876543210", "otp": plaintext, "requestId": record.request_id}), None
+    )
+    assert first["statusCode"] == 503
+    assert store.records[record.request_id].status == OtpStatus.ACTIVE
+
+    failing_cognito.raise_on_issue = None  # Cognito recovers
+    second = otp_verify_handler.handler(
+        _event({"mobile": "+919876543210", "otp": plaintext, "requestId": record.request_id}), None
+    )
+    assert second["statusCode"] == 200
+    assert store.records[record.request_id].status == OtpStatus.CONSUMED

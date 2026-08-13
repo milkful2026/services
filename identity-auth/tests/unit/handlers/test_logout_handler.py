@@ -4,6 +4,15 @@ import pytest
 
 import handlers.logout_handler as logout_handler
 from domain.exceptions import ValidationError
+from handlers.dto import LogoutRequest, TokenRefreshRequest
+
+
+def test_logout_request_is_a_distinct_type_from_token_refresh_request():
+    # Same {refreshToken} body shape, but logout must not be modeled as a
+    # TokenRefreshRequest — the two endpoints are semantically unrelated
+    # and grepping for one shouldn't surface the other.
+    assert LogoutRequest is not TokenRefreshRequest
+    assert LogoutRequest(refreshToken="tok").refresh_token == "tok"
 
 
 class FakeCognito:

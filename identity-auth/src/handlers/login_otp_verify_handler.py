@@ -25,11 +25,15 @@ from pydantic import ValidationError as PydanticValidationError
 
 from adapters.cognito_adapter import CognitoAdapter
 from adapters.otp_store_adapter import DynamoDbOtpStoreAdapter
-from adapters.rate_limit_adapter import RedisRateLimiterAdapter, build_redis_client
 from config.env import get_settings
 from domain.exceptions import IdentityAuthError
 from domain.otp_service import OtpService
-from handlers.dto import OtpVerifyRequest, error_response, success_response, validation_error_response
+from handlers.dto import (
+    OtpVerifyRequest,
+    error_response,
+    success_response,
+    validation_error_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,21 +47,18 @@ def _get_deps() -> dict:
 
     settings = get_settings()
     otp_store = DynamoDbOtpStoreAdapter(settings.otp_requests_table_name, settings.aws_region)
-    rate_limiter = RedisRateLimiterAdapter(
-        build_redis_client(settings.redis_host, settings.redis_port, settings.redis_use_tls)
-    )
     cognito = CognitoAdapter(
         settings.cognito_user_pool_id, settings.cognito_client_id, settings.aws_region
     )
+    # No rate_limiter: verify_otp()/mark_otp_consumed() never call
+    # request_otp(), so there's no reason to pay for a Redis connection
+    # (and a Redis-outage failure mode) on this code path.
     otp_service = OtpService(
         otp_store=otp_store,
-        rate_limiter=rate_limiter,
         otp_length=settings.otp_length,
         ttl_seconds=settings.otp_ttl_seconds,
         resend_after_seconds=settings.otp_resend_after_seconds,
         max_attempts=settings.otp_max_attempts,
-        rate_limit_max_requests=settings.otp_rate_limit_max_requests,
-        rate_limit_window_seconds=settings.otp_rate_limit_window_seconds,
     )
 
     _deps = {"cognito": cognito, "otp_service": otp_service}
@@ -77,6 +78,11 @@ def handler(event: dict, context) -> dict:
     try:
         deps["otp_service"].verify_otp(request.mobile, request.otp, request.request_id)
         tokens = deps["cognito"].issue_tokens(request.mobile)
+        # Only marked consumed once tokens actually issued — a transient
+        # Cognito failure above must leave the OTP retryable rather than
+        # burning it for a login that never completed. See
+        # OtpService.verify_otp's docstring.
+        deps["otp_service"].mark_otp_consumed(request.request_id)
 
         return success_response(
             {
