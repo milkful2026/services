@@ -36,14 +36,9 @@ def _get_deps() -> dict:
         return _deps
 
     settings = get_settings()
-    otp_store = DynamoDbOtpStoreAdapter(
-        settings.otp_requests_table_name, settings.aws_region, endpoint_url=settings.aws_endpoint_url
-    )
+    otp_store = DynamoDbOtpStoreAdapter(settings.otp_requests_table_name, settings.aws_region)
     cognito = CognitoAdapter(
-        settings.cognito_user_pool_id,
-        settings.cognito_client_id,
-        settings.aws_region,
-        endpoint_url=settings.aws_endpoint_url,
+        settings.cognito_user_pool_id, settings.cognito_client_id, settings.aws_region
     )
     # No rate_limiter: verify_otp()/mark_otp_consumed() never call
     # request_otp(), so there's no reason to pay for a Redis connection

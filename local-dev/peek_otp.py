@@ -13,20 +13,12 @@ import json
 import sys
 
 import boto3
-
-ENDPOINT_URL = "http://localhost:5000"
-REGION = "us-east-1"
+from bootstrap import _creds
 
 
 def main() -> None:
     mobile_filter = sys.argv[1] if len(sys.argv) > 1 else None
-    sqs = boto3.client(
-        "sqs",
-        aws_access_key_id="local",
-        aws_secret_access_key="local",
-        region_name=REGION,
-        endpoint_url=ENDPOINT_URL,
-    )
+    sqs = boto3.client("sqs", **_creds)
     queue_url = sqs.get_queue_url(QueueName="otp-requested-debug")["QueueUrl"]
     response = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, VisibilityTimeout=1)
     messages = response.get("Messages", [])

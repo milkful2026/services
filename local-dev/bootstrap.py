@@ -6,16 +6,19 @@ Run once after `docker compose up -d`, before starting any service:
 
     python bootstrap.py
 
-Idempotent-ish: safe to re-run against a moto_server that already has
-these resources (existing-resource errors are swallowed), but moto_server
-keeps everything in memory, so a container restart clears it and this
-must be re-run.
+Idempotent: safe to re-run against a moto_server that already has these
+resources — every resource is looked up and reused if it already exists,
+never silently recreated — but moto_server keeps everything in memory,
+so a container restart clears it and this must be re-run.
 
 Writes one `.env.local` per service (identity-auth/.env.local,
 user/.env.local, inventory/.env.local) with the resource IDs it just
-created — each service's config/env.py reads that file automatically
-(see the `_LOCAL_ENV_FILE` pydantic-settings wiring). These files are
-generated, not committed — see .gitignore.
+created. Each service's run_local.py-style entrypoint loads that file
+into the real process environment at startup (see local-dev/_env_file.py)
+before constructing any client, so both this service's own settings and
+libraries that read env vars directly (e.g. boto3's native
+AWS_ENDPOINT_URL support) see the values. These files are generated, not
+committed — see .gitignore.
 """
 
 import json
@@ -50,41 +53,94 @@ def _ignore_already_exists(exc: ClientError, *codes: str) -> bool:
     return code in codes
 
 
+def _get_or_create_queue(sqs, name: str, **create_kwargs) -> tuple[str, str]:
+    """Returns (queue_url, queue_arn), reusing the queue if it already
+    exists rather than erroring."""
+    try:
+        queue_url = sqs.create_queue(QueueName=name, **create_kwargs)["QueueUrl"]
+        print(f"[sqs] created queue {name}")
+    except ClientError as exc:
+        if _ignore_already_exists(exc, "QueueAlreadyExists"):
+            queue_url = sqs.get_queue_url(QueueName=name)["QueueUrl"]
+            print(f"[sqs] queue {name} already exists, skipping")
+        else:
+            raise
+    queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])[
+        "Attributes"
+    ]["QueueArn"]
+    return queue_url, queue_arn
+
+
+def _wire_rule(events, rule_name: str, pattern: dict, target_id: str, target_arn: str) -> None:
+    """put_rule/put_targets are both idempotent upserts — unlike queue
+    creation there's no legitimate 'already exists' case to swallow, so
+    any ClientError here is a genuine wiring failure and must propagate
+    rather than being downgraded to a print that leaves the rest of the
+    script reporting success."""
+    events.put_rule(Name=rule_name, EventPattern=json.dumps(pattern), State="ENABLED")
+    events.put_targets(Rule=rule_name, Targets=[{"Id": target_id, "Arn": target_arn}])
+    print(f"[eventbridge] wired {rule_name} -> {target_id}")
+
+
 def bootstrap_cognito() -> tuple[str, str]:
+    # Real (and moto) Cognito doesn't error on a duplicate PoolName, so
+    # unlike the DynamoDB/SQS bootstrap functions this can't rely on
+    # catching an "already exists" ClientError — it has to look first.
+    # Without this, re-running bootstrap.py against a still-running
+    # moto_server silently creates a second pool + client every time,
+    # orphaning any state (e.g. registered users) built against the
+    # first one.
     client = boto3.client("cognito-idp", **_creds)
 
-    try:
-        pool = client.create_user_pool(
-            PoolName="milkful-local",
-            UsernameAttributes=["phone_number"],
-            AutoVerifiedAttributes=["phone_number", "email"],
-            Schema=[
-                {"Name": "phone_number", "AttributeDataType": "String", "Mutable": True},
-                {"Name": "email", "AttributeDataType": "String", "Mutable": True},
-                {"Name": "name", "AttributeDataType": "String", "Mutable": True},
-                {"Name": "google_sub", "AttributeDataType": "String", "Mutable": True},
-                {"Name": "apple_sub", "AttributeDataType": "String", "Mutable": True},
-                {"Name": "default_pincode", "AttributeDataType": "String", "Mutable": True},
+    pools = client.list_user_pools(MaxResults=60)["UserPools"]
+    existing_pool = next((p for p in pools if p["Name"] == "milkful-local"), None)
+    if existing_pool is not None:
+        pool_id = existing_pool["Id"]
+        print(f"[cognito] user pool milkful-local already exists ({pool_id}), skipping")
+    else:
+        try:
+            pool = client.create_user_pool(
+                PoolName="milkful-local",
+                UsernameAttributes=["phone_number"],
+                AutoVerifiedAttributes=["phone_number", "email"],
+                Schema=[
+                    {"Name": "phone_number", "AttributeDataType": "String", "Mutable": True},
+                    {"Name": "email", "AttributeDataType": "String", "Mutable": True},
+                    {"Name": "name", "AttributeDataType": "String", "Mutable": True},
+                    {"Name": "google_sub", "AttributeDataType": "String", "Mutable": True},
+                    {"Name": "apple_sub", "AttributeDataType": "String", "Mutable": True},
+                    {"Name": "default_pincode", "AttributeDataType": "String", "Mutable": True},
+                ],
+            )
+            pool_id = pool["UserPool"]["Id"]
+            print(f"[cognito] created user pool {pool_id}")
+        except ClientError as exc:
+            print(f"[cognito] create_user_pool failed: {exc}", file=sys.stderr)
+            raise
+
+    pool_clients = client.list_user_pool_clients(
+        UserPoolId=pool_id, MaxResults=60
+    )["UserPoolClients"]
+    existing_client = next(
+        (c for c in pool_clients if c["ClientName"] == "milkful-local-client"),
+        None,
+    )
+    if existing_client is not None:
+        client_id = existing_client["ClientId"]
+        print(f"[cognito] app client milkful-local-client already exists ({client_id}), skipping")
+    else:
+        client_resp = client.create_user_pool_client(
+            UserPoolId=pool_id,
+            ClientName="milkful-local-client",
+            GenerateSecret=False,
+            ExplicitAuthFlows=[
+                "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                "ALLOW_USER_PASSWORD_AUTH",
+                "ALLOW_REFRESH_TOKEN_AUTH",
             ],
         )
-        pool_id = pool["UserPool"]["Id"]
-        print(f"[cognito] created user pool {pool_id}")
-    except ClientError as exc:
-        print(f"[cognito] create_user_pool failed: {exc}", file=sys.stderr)
-        raise
-
-    client_resp = client.create_user_pool_client(
-        UserPoolId=pool_id,
-        ClientName="milkful-local-client",
-        GenerateSecret=False,
-        ExplicitAuthFlows=[
-            "ALLOW_ADMIN_USER_PASSWORD_AUTH",
-            "ALLOW_USER_PASSWORD_AUTH",
-            "ALLOW_REFRESH_TOKEN_AUTH",
-        ],
-    )
-    client_id = client_resp["UserPoolClient"]["ClientId"]
-    print(f"[cognito] created app client {client_id}")
+        client_id = client_resp["UserPoolClient"]["ClientId"]
+        print(f"[cognito] created app client {client_id}")
     return pool_id, client_id
 
 
@@ -133,84 +189,40 @@ def bootstrap_sqs_and_eventbridge() -> str:
     sqs = boto3.client("sqs", **_creds)
     events = boto3.client("events", **_creds)
 
-    try:
-        dlq_url = sqs.create_queue(QueueName="zone-updated-dlq")["QueueUrl"]
-    except ClientError as exc:
-        if _ignore_already_exists(exc, "QueueAlreadyExists"):
-            dlq_url = sqs.get_queue_url(QueueName="zone-updated-dlq")["QueueUrl"]
-        else:
-            raise
-    dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq_url, AttributeNames=["QueueArn"])[
-        "Attributes"
-    ]["QueueArn"]
+    _dlq_url, dlq_arn = _get_or_create_queue(sqs, "zone-updated-dlq")
 
-    try:
-        queue_url = sqs.create_queue(
-            QueueName="zone-updated",
-            Attributes={
-                "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
-            },
-        )["QueueUrl"]
-        print(f"[sqs] created queue {queue_url}")
-    except ClientError as exc:
-        if _ignore_already_exists(exc, "QueueAlreadyExists"):
-            queue_url = sqs.get_queue_url(QueueName="zone-updated")["QueueUrl"]
-            print(f"[sqs] queue zone-updated already exists, skipping")
-        else:
-            raise
-    queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])[
-        "Attributes"
-    ]["QueueArn"]
+    queue_url, queue_arn = _get_or_create_queue(
+        sqs,
+        "zone-updated",
+        Attributes={
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
+        },
+    )
 
     # Mirrors inventory_stack.py's ZoneUpdatedRule (EventBridge -> SQS) so
     # PutEvents from the "inventory-admin" source actually lands on the
     # queue locally, the same path production uses — not just a queue
     # that only works if something calls SendMessage directly.
-    try:
-        events.put_rule(
-            Name="ZoneUpdatedRule",
-            EventPattern=json.dumps(
-                {"source": ["inventory-admin"], "detail-type": ["inventory.zone.updated"]}
-            ),
-            State="ENABLED",
-        )
-        events.put_targets(
-            Rule="ZoneUpdatedRule",
-            Targets=[{"Id": "zone-updated-target", "Arn": queue_arn}],
-        )
-        print("[eventbridge] wired ZoneUpdatedRule -> zone-updated queue")
-    except ClientError as exc:
-        print(f"[eventbridge] rule wiring skipped (non-fatal for local dev): {exc}")
+    _wire_rule(
+        events,
+        "ZoneUpdatedRule",
+        {"source": ["inventory-admin"], "detail-type": ["inventory.zone.updated"]},
+        "zone-updated-target",
+        queue_arn,
+    )
 
     # Local-dev-only debug queue: no real SMS provider exists locally, so
     # this is how a developer sees the plaintext OTP identity-auth
     # publishes to identity.otp.requested — see peek_otp.py. Nothing
     # like this exists in production; it's purely a local visibility aid.
-    try:
-        otp_debug_queue_url = sqs.create_queue(QueueName="otp-requested-debug")["QueueUrl"]
-    except ClientError as exc:
-        if _ignore_already_exists(exc, "QueueAlreadyExists"):
-            otp_debug_queue_url = sqs.get_queue_url(QueueName="otp-requested-debug")["QueueUrl"]
-        else:
-            raise
-    otp_debug_queue_arn = sqs.get_queue_attributes(
-        QueueUrl=otp_debug_queue_url, AttributeNames=["QueueArn"]
-    )["Attributes"]["QueueArn"]
-    try:
-        events.put_rule(
-            Name="OtpRequestedDebugRule",
-            EventPattern=json.dumps(
-                {"source": ["identity-auth"], "detail-type": ["identity.otp.requested"]}
-            ),
-            State="ENABLED",
-        )
-        events.put_targets(
-            Rule="OtpRequestedDebugRule",
-            Targets=[{"Id": "otp-debug-target", "Arn": otp_debug_queue_arn}],
-        )
-        print("[eventbridge] wired OtpRequestedDebugRule -> otp-requested-debug queue")
-    except ClientError as exc:
-        print(f"[eventbridge] otp debug rule wiring skipped (non-fatal for local dev): {exc}")
+    _otp_debug_queue_url, otp_debug_queue_arn = _get_or_create_queue(sqs, "otp-requested-debug")
+    _wire_rule(
+        events,
+        "OtpRequestedDebugRule",
+        {"source": ["identity-auth"], "detail-type": ["identity.otp.requested"]},
+        "otp-debug-target",
+        otp_debug_queue_arn,
+    )
 
     return queue_url
 
@@ -227,13 +239,18 @@ def main() -> None:
     table_name = bootstrap_dynamodb()
     queue_url = bootstrap_sqs_and_eventbridge()
 
+    # AWS_ENDPOINT_URL (unprefixed): the standard env var name botocore
+    # itself reads natively — written once per service's .env.local so
+    # each service's run_local.py-style entrypoint can load it into the
+    # real process environment before boto3 constructs any client. No
+    # per-service Settings field or adapter parameter needed for it.
     _write_env_file(
         "identity-auth",
         {
             "IDENTITY_AUTH_COGNITO_USER_POOL_ID": pool_id,
             "IDENTITY_AUTH_COGNITO_CLIENT_ID": client_id,
             "IDENTITY_AUTH_AWS_REGION": REGION,
-            "IDENTITY_AUTH_AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
             "IDENTITY_AUTH_OTP_REQUESTS_TABLE_NAME": table_name,
             "IDENTITY_AUTH_REDIS_HOST": REDIS_HOST,
             "IDENTITY_AUTH_REDIS_PORT": str(REDIS_PORT),
@@ -248,7 +265,7 @@ def main() -> None:
                 f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/milkful_user"
             ),
             "USER_AWS_REGION": REGION,
-            "USER_AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
             "USER_COGNITO_USER_POOL_ID": pool_id,
             "USER_INVENTORY_INTERNAL_BASE_URL": INVENTORY_HTTP_URL,
             "USER_EVENT_BUS_NAME": "default",
@@ -261,7 +278,7 @@ def main() -> None:
                 f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/milkful_inventory"
             ),
             "INVENTORY_AWS_REGION": REGION,
-            "INVENTORY_AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
             "INVENTORY_REDIS_HOST": REDIS_HOST,
             "INVENTORY_REDIS_PORT": str(REDIS_PORT),
             "INVENTORY_REDIS_USE_TLS": "false",

@@ -4,7 +4,9 @@ Fargate deployable handles both, since nothing in this spec (unlike
 Wallet's) calls for separating them into two artifacts."""
 
 import logging
+import os
 import threading
+from pathlib import Path
 
 import uvicorn
 
@@ -17,6 +19,24 @@ from handlers.health import consumer_health
 logger = logging.getLogger(__name__)
 
 
+def _load_local_env_file() -> None:
+    # Local dev only: populates real env vars (including the standard
+    # AWS_ENDPOINT_URL botocore reads natively) from bootstrap.py's
+    # generated .env.local. A no-op if absent, as in every deployed
+    # environment. Duplicated (not imported) from local-dev/_env_file.py
+    # deliberately — this file is inventory's real container entrypoint,
+    # and local-dev/ isn't shipped in the production image.
+    path = Path(__file__).resolve().parents[1] / ".env.local"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
 def _run_consumer() -> None:
     try:
         settings = get_settings()
@@ -27,7 +47,6 @@ def _run_consumer() -> None:
             queue_url=settings.zone_updated_queue_url,
             zone_cache=zone_cache,
             region_name=settings.aws_region,
-            endpoint_url=settings.aws_endpoint_url,
         )
         consumer.run_forever()
     except Exception:
@@ -42,6 +61,7 @@ def _run_consumer() -> None:
 
 
 def main() -> None:
+    _load_local_env_file()
     consumer_thread = threading.Thread(target=_run_consumer, daemon=True, name="zone-update-consumer")
     consumer_thread.start()
     uvicorn.run(app, host="0.0.0.0", port=8000)  # noqa: S104 — Fargate task, not exposed directly

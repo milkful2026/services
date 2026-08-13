@@ -5,28 +5,21 @@ never deep inside domain modules — and every value comes from env vars /
 Secrets Manager, never hardcoded.
 """
 
-from pathlib import Path
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# Optional — only present in local dev, written by
-# services/local-dev/bootstrap.py. Silently ignored by pydantic-settings
-# when absent, so this has no effect on tests or real deployments.
-_LOCAL_ENV_FILE = Path(__file__).resolve().parents[2] / ".env.local"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="IDENTITY_AUTH_", env_file=_LOCAL_ENV_FILE, env_file_encoding="utf-8"
-    )
+    # Local dev populates real env vars (including the standard
+    # AWS_ENDPOINT_URL botocore already reads natively) by loading
+    # services/local-dev/*/.env.local at the process entrypoint — see
+    # run_local.py — not via any local-dev-specific wiring here. This
+    # class is identical in every environment.
+    model_config = SettingsConfigDict(env_prefix="IDENTITY_AUTH_")
 
     # Cognito
     cognito_user_pool_id: str
     cognito_client_id: str
     aws_region: str = "ap-south-1"
-    # Local dev only: points boto3 at moto_server instead of real AWS.
-    # None in every deployed environment, so behavior there is unchanged.
-    aws_endpoint_url: str | None = None
 
     # DynamoDB
     otp_requests_table_name: str

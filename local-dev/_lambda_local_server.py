@@ -8,16 +8,21 @@ here unmodified; each service's own run_local.py just supplies a
 
 JWT claims: real API Gateway verifies the token's signature via its
 Cognito JWT authorizer *before* invoking the Lambda. This shim does not
-verify anything — it base64-decodes the JWT payload as-is (moto's own
-Cognito tokens aren't properly signed either) and passes it through as
-`requestContext.authorizer.jwt.claims`. Fine for a developer's own
-machine; never a stand-in for the real authorizer anywhere else.
+verify anything — it decodes the JWT payload as-is via PyJWT's
+`verify_signature=False` mode (moto's own Cognito tokens aren't properly
+signed either) and passes it through as `requestContext.authorizer.jwt.
+claims`. Fine for a developer's own machine; never a stand-in for the
+real authorizer anywhere else. Requires PyJWT — already a dependency of
+identity-auth; added to user/inventory's requirements-dev.txt purely for
+this shim (their own handler code never imports it).
 """
 
-import base64
 import json
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
+
+import jwt
 
 
 def _decode_jwt_claims(auth_header: str | None) -> dict:
@@ -25,11 +30,9 @@ def _decode_jwt_claims(auth_header: str | None) -> dict:
         return {}
     token = auth_header.split(" ", 1)[1].strip()
     try:
-        _, payload_b64, _ = token.split(".")
-        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded))
+        payload = jwt.decode(token, options={"verify_signature": False})
         return payload if isinstance(payload, dict) else {}
-    except Exception:
+    except jwt.PyJWTError:
         return {}
 
 
@@ -60,7 +63,26 @@ def _make_handler(routes: dict):
                 "requestContext": {"authorizer": {"jwt": {"claims": claims}}},
             }
 
-            response = route_fn(event, None)
+            try:
+                response = route_fn(event, None)
+            except Exception:
+                # Real API Gateway would never see this — Lambda's own
+                # invoke error handling returns a 502 to it. Without this,
+                # an unhandled exception here (e.g. moto_server not up
+                # yet) kills the connection with zero bytes written and
+                # the client just sees "Empty reply from server", with no
+                # indication of what actually went wrong.
+                traceback.print_exc()
+                body = json.dumps(
+                    {"error": "local server: handler raised an unhandled exception, see server log"}
+                ).encode()
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             status = response.get("statusCode", 200)
             resp_headers = dict(response.get("headers") or {})
             resp_body = response.get("body") or ""

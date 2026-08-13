@@ -26,9 +26,8 @@ class ZoneUpdateConsumer:
         zone_cache: ZoneCachePort,
         region_name: str,
         correlation_id: str = "",
-        endpoint_url: str | None = None,
     ) -> None:
-        self._sqs = boto3.client("sqs", region_name=region_name, endpoint_url=endpoint_url)
+        self._sqs = boto3.client("sqs", region_name=region_name)
         self._queue_url = queue_url
         self._zone_cache = zone_cache
         self._correlation_id = correlation_id

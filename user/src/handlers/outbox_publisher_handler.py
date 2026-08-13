@@ -29,10 +29,7 @@ def _get_deps() -> dict:
     engine = create_engine(settings.database_url)
     repository = SqlAlchemyUserRepository(engine)
     publisher = EventBridgeOutboxPublisher(
-        settings.event_bus_name,
-        settings.event_source,
-        settings.aws_region,
-        endpoint_url=settings.aws_endpoint_url,
+        settings.event_bus_name, settings.event_source, settings.aws_region
     )
 
     _deps = {"repository": repository, "publisher": publisher, "settings": settings}

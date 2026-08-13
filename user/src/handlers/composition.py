@@ -19,7 +19,5 @@ def build_registration_service(settings: Settings) -> RegistrationService:
     inventory_client = HttpInventoryClient(
         settings.inventory_internal_base_url, settings.inventory_request_timeout_seconds
     )
-    cognito_attributes = CognitoAttributeAdapter(
-        settings.cognito_user_pool_id, settings.aws_region, endpoint_url=settings.aws_endpoint_url
-    )
+    cognito_attributes = CognitoAttributeAdapter(settings.cognito_user_pool_id, settings.aws_region)
     return RegistrationService(repository, inventory_client, cognito_attributes)

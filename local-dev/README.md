@@ -60,7 +60,8 @@ curl -X POST localhost:8001/v1/auth/otp/verify \
   -d '{"mobile": "+919876543210", "otp": "<code>", "requestId": "<from send response>"}'
 # -> accessToken, refreshToken, isNewUser: true
 
-# 2. Call User Service's register endpoint (needs the accessToken above as a Bearer token)
+# 2. Call User Service's register endpoint (needs a Bearer token carrying a phone_number
+#    claim — see "Known gaps" below for why accessToken doesn't currently work here)
 curl -X POST localhost:8002/users/register -H "Authorization: Bearer <accessToken>" -d '{...}'
 
 # 3. Log in again later
@@ -70,7 +71,7 @@ curl -X POST localhost:8001/v1/auth/login/otp/verify \
   -d '{"mobile": "+919876543210", "otp": "<code>", "requestId": "<from send response>"}'
 # -> accessToken, refreshToken (no isNewUser)
 
-curl localhost:8002/users/me -H "Authorization: Bearer <accessToken>"
+curl localhost:8002/users/me -H "Authorization: Bearer <accessToken>"   # same gap as step 2
 
 # 4. Log out
 curl -X POST localhost:8001/v1/auth/logout -H "Authorization: Bearer <accessToken>" \
@@ -102,10 +103,21 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
   the AWS-facing half is proven; the Postgres-backed half (User Service register/get_me,
   Inventory serviceability) is implemented the same way but wasn't exercised against a live
   Postgres container. Worth a real run-through on a machine with Docker Desktop actually running.
-- **JWT claims aren't verified, only decoded.** `_lambda_local_server.py` base64-decodes
-  whatever's in the `Authorization: Bearer` header without checking its signature — real API
-  Gateway's Cognito JWT authorizer verifies it first. Fine for a developer's own machine; this
-  must never be treated as equivalent to the real authorizer.
+- **JWT claims aren't verified, only decoded.** `_lambda_local_server.py` decodes whatever's in
+  the `Authorization: Bearer` header via PyJWT's `verify_signature=False` mode, without checking
+  its signature — real API Gateway's Cognito JWT authorizer verifies it first. Fine for a
+  developer's own machine; this must never be treated as equivalent to the real authorizer.
+- **`/users/register` and `/users/me` need a `phone_number` claim that `accessToken` doesn't
+  carry.** identity-auth's `/v1/auth/otp/verify` and `/v1/auth/login/otp/verify` only ever return
+  `accessToken`/`refreshToken` (never `idToken` — an existing, deliberate spec decision: "idToken
+  is available on the TokenBundle but intentionally not added to the response since the spec
+  doesn't ask for it"). Cognito access tokens never carry custom/profile attributes regardless of
+  pool config, so following steps 2 and 5 above exactly as written gets a 400
+  `Missing or invalid JWT claims` from User Service. This wasn't caught earlier because this half
+  of the flow was never exercised end-to-end before (see the Docker-availability gap above) — it's
+  a real gap in the identity-auth ↔ user-service contract, not just a docs error, and needs a
+  product/spec decision (return `idToken` too? have User Service accept either token type and
+  fall back to a GetUser call for `phone_number`?) rather than being silently decided here.
 - **moto_server is a Flask dev server** — under rapid concurrent local testing (e.g. hammering
   it with several curl calls back-to-back) it can be slow enough to trip a short client timeout.
   Not a bug in this tooling; give it a few seconds between rapid-fire manual requests, or raise

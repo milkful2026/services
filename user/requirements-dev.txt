@@ -6,3 +6,6 @@ moto[cognitoidp,events]==5.0.21
 responses==0.25.3
 aws-cdk-lib==2.170.0
 constructs>=10.0.0,<11.0.0
+# Only for services/local-dev/_lambda_local_server.py's unverified JWT
+# decode when running run_local.py — no production code imports this.
+PyJWT==2.10.1

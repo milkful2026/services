@@ -38,25 +38,17 @@ def _get_deps() -> dict:
         return _deps
 
     settings = get_settings()
-    otp_store = DynamoDbOtpStoreAdapter(
-        settings.otp_requests_table_name, settings.aws_region, endpoint_url=settings.aws_endpoint_url
-    )
+    otp_store = DynamoDbOtpStoreAdapter(settings.otp_requests_table_name, settings.aws_region)
     redis_client = build_redis_client(
         settings.redis_host, settings.redis_port, settings.redis_use_tls
     )
     rate_limiter = RedisRateLimiterAdapter(redis_client)
     send_lock = RedisLockAdapter(redis_client)
     cognito = CognitoAdapter(
-        settings.cognito_user_pool_id,
-        settings.cognito_client_id,
-        settings.aws_region,
-        endpoint_url=settings.aws_endpoint_url,
+        settings.cognito_user_pool_id, settings.cognito_client_id, settings.aws_region
     )
     publisher = EventBridgeNotificationPublisher(
-        settings.event_bus_name,
-        settings.event_source,
-        settings.aws_region,
-        endpoint_url=settings.aws_endpoint_url,
+        settings.event_bus_name, settings.event_source, settings.aws_region
     )
     otp_service = OtpService(
         otp_store=otp_store,

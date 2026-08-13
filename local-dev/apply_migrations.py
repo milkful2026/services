@@ -37,16 +37,18 @@ def _apply(service_dir: str, database: str) -> None:
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, dbname=database
     )
-    conn.autocommit = False
     try:
-        with conn.cursor() as cur:
+        # `with conn:` commits on clean exit and rolls back on exception —
+        # psycopg2 connections support this directly, so there's no need
+        # to hand-roll autocommit/commit/rollback bookkeeping (and no way
+        # to accidentally forget a commit on a future added write).
+        with conn, conn.cursor() as cur:
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "
                 "(filename VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
             )
             cur.execute("SELECT filename FROM schema_migrations")
             applied = {row[0] for row in cur.fetchall()}
-        conn.commit()
 
         for sql_file in sorted(migrations_dir.glob("*.sql")):
             if sql_file.name in applied:
@@ -54,15 +56,11 @@ def _apply(service_dir: str, database: str) -> None:
                 continue
             print(f"[{service_dir}] applying {sql_file.name}")
             sql = sql_file.read_text(encoding="utf-8")
-            with conn.cursor() as cur:
+            with conn, conn.cursor() as cur:
                 cur.execute(sql)
                 cur.execute(
                     "INSERT INTO schema_migrations (filename) VALUES (%s)", (sql_file.name,)
                 )
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
     finally:
         conn.close()
 

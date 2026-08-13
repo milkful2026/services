@@ -40,10 +40,7 @@ def _get_deps() -> dict:
 
     settings = get_settings()
     cognito = CognitoAdapter(
-        settings.cognito_user_pool_id,
-        settings.cognito_client_id,
-        settings.aws_region,
-        endpoint_url=settings.aws_endpoint_url,
+        settings.cognito_user_pool_id, settings.cognito_client_id, settings.aws_region
     )
     _deps = {"cognito": cognito}
     return _deps
