@@ -29,6 +29,15 @@ class NotServiceableError(UserServiceError):
     http_status = 422
 
 
+class UserNotFoundError(UserServiceError):
+    """JWT `sub` has no matching `users` row (spec MA-107 FR-2) — should
+    not happen in practice post-MA-1, but must be a clean 404, not a 500,
+    per that spec's own edge-case requirement."""
+
+    error_code = "USER_NOT_FOUND"
+    http_status = 404
+
+
 class ExternalServiceUnavailableError(UserServiceError):
     """Cognito, Inventory, or the DB unreachable after retries."""
 

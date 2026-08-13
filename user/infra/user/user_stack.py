@@ -122,11 +122,14 @@ class UserStack(Stack):
             handler="handlers.outbox_publisher_handler.handler",
             **common_lambda_kwargs,
         )
+        get_me_fn = lambda_.Function(
+            self, "GetMeFunction", handler="handlers.get_me_handler.handler", **common_lambda_kwargs
+        )
 
-        for fn in (register_fn, delivery_slots_fn, outbox_publisher_fn):
+        for fn in (register_fn, delivery_slots_fn, outbox_publisher_fn, get_me_fn):
             secret.grant_read(fn)
 
-        http_api = self._build_http_api(register_fn, delivery_slots_fn, cognito_client_id)
+        http_api = self._build_http_api(register_fn, delivery_slots_fn, get_me_fn, cognito_client_id)
         self._build_outbox_scheduler(outbox_publisher_fn)
 
     def _build_vpc(self) -> ec2.Vpc:
@@ -197,7 +200,11 @@ class UserStack(Stack):
         return role
 
     def _build_http_api(
-        self, register_fn: lambda_.Function, delivery_slots_fn: lambda_.Function, cognito_client_id: str
+        self,
+        register_fn: lambda_.Function,
+        delivery_slots_fn: lambda_.Function,
+        get_me_fn: lambda_.Function,
+        cognito_client_id: str,
     ) -> apigwv2.HttpApi:
         issuer = f"https://cognito-idp.{self.region}.amazonaws.com/{self._cognito_user_pool_id}"
         authorizer = apigwv2_authorizers.HttpJwtAuthorizer(
@@ -217,6 +224,12 @@ class UserStack(Stack):
             integration=apigwv2_integrations.HttpLambdaIntegration(
                 "DeliverySlotsIntegration", delivery_slots_fn
             ),
+            authorizer=authorizer,
+        )
+        http_api.add_routes(
+            path="/users/me",
+            methods=[apigwv2.HttpMethod.GET],
+            integration=apigwv2_integrations.HttpLambdaIntegration("GetMeIntegration", get_me_fn),
             authorizer=authorizer,
         )
         return http_api

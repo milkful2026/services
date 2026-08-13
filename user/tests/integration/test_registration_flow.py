@@ -8,6 +8,7 @@ import pytest
 import responses as responses_lib
 
 import handlers.delivery_slots_handler as delivery_slots_handler
+import handlers.get_me_handler as get_me_handler
 import handlers.outbox_publisher_handler as outbox_publisher_handler
 import handlers.register_handler as register_handler
 from adapters.cognito_attribute_adapter import CognitoAttributeAdapter
@@ -24,10 +25,12 @@ def _reset_handler_deps():
     register_handler._deps = None
     delivery_slots_handler._deps = None
     outbox_publisher_handler._deps = None
+    get_me_handler._deps = None
     yield
     register_handler._deps = None
     delivery_slots_handler._deps = None
     outbox_publisher_handler._deps = None
+    get_me_handler._deps = None
 
 
 @pytest.fixture
@@ -42,6 +45,7 @@ def wired_env(sqlite_engine, cognito_user_pool, event_bus):
     registration_service = RegistrationService(repository, inventory_client, cognito_attributes)
     register_handler._deps = {"registration_service": registration_service}
     delivery_slots_handler._deps = {"registration_service": registration_service}
+    get_me_handler._deps = {"registration_service": registration_service}
 
     publisher = EventBridgeOutboxPublisher(
         event_bus_name="default", event_source="user", region_name="ap-south-1"
@@ -154,3 +158,34 @@ def test_delivery_slots_reads_seeded_zone_slots(wired_env, sqlite_engine):
     assert response["statusCode"] == 200
     data = json.loads(response["body"])["data"]
     assert data == [{"id": "morning-6-8", "label": "Morning 6-8 AM", "available": True}]
+
+
+def _get_me_event(sub: str) -> dict:
+    return {
+        "headers": {"x-request-id": "corr-2"},
+        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": sub}}}},
+    }
+
+
+@responses_lib.activate
+def test_get_me_after_registration_returns_b2c_profile(wired_env):
+    _mock_inventory_serviceable(True)
+    register_response = register_handler.handler(_event(_VALID_BODY, sub="sub-me-1"), None)
+    user_id = json.loads(register_response["body"])["data"]["userId"]
+
+    response = get_me_handler.handler(_get_me_event("sub-me-1"), None)
+
+    assert response["statusCode"] == 200
+    data = json.loads(response["body"])["data"]
+    assert data["userId"] == user_id
+    assert data["name"] == "Priya Sharma"
+    assert data["mobile"] == "+919876543210"
+    assert data["accountType"] == "B2C"
+    assert data["defaultAddressId"]
+
+
+def test_get_me_for_unregistered_sub_returns_404(wired_env):
+    response = get_me_handler.handler(_get_me_event("never-registered-sub"), None)
+
+    assert response["statusCode"] == 404
+    assert json.loads(response["body"])["data"]["errorCode"] == "USER_NOT_FOUND"

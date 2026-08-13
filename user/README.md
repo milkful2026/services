@@ -4,8 +4,12 @@ Registration orchestration — persists customer profile, delivery
 address(es), preferred slot, and legal consents after OTP verification,
 then signals downstream services via `UserRegistered`. Implements
 [MA-1](https://milkfuldairyindia.atlassian.net/browse/MA-1) / backend
-story [MA-93](https://milkfuldairyindia.atlassian.net/browse/MA-93), per
-spec `specs/services/tasks/MA/MA-1/user-registration-api.md`.
+story [MA-93](https://milkfuldairyindia.atlassian.net/browse/MA-93) (spec
+`specs/services/tasks/MA/MA-1/user-registration-api.md`), and the
+account-type/profile-lookup piece of
+[MA-21](https://milkfuldairyindia.atlassian.net/browse/MA-21) / backend
+story [MA-107](https://milkfuldairyindia.atlassian.net/browse/MA-107)
+(spec `specs/services/tasks/MA/MA-21/user-account-type-profile.md`).
 
 Wallet auto-provision ([MA-100](https://milkfuldairyindia.atlassian.net/browse/MA-100))
 is out of scope — this service only publishes the event; nothing here
@@ -15,8 +19,9 @@ waits for a wallet to exist.
 
 | Method | Path | Spec | Auth |
 |--------|------|------|------|
-| POST | `/users/register` | FR-1 | Cognito JWT (API Gateway authorizer) |
-| GET | `/delivery/slots?zoneId=` | FR-2 | Cognito JWT |
+| POST | `/users/register` | MA-93 FR-1 | Cognito JWT (API Gateway authorizer) |
+| GET | `/delivery/slots?zoneId=` | MA-93 FR-2 | Cognito JWT |
+| GET | `/users/me` | MA-107 FR-2 | Cognito JWT |
 
 `sub` and `mobile` are read from the API Gateway JWT authorizer's
 verified claims — never trusted from the request body.
@@ -66,6 +71,9 @@ verified claims — never trusted from the request body.
    not silent. Scoped to `ExternalServiceUnavailableError` specifically
    (not a bare `except Exception`), so an actual bug in the adapter
    propagates loudly instead of being masked as a routine sync failure.
+8. **No B2B write path.** `account_type` defaults every row (existing
+   and new) to `B2C`; nothing in this service or spec sets `B2B` yet —
+   per MA-107's own deliberate scope limit, not an oversight.
 
 ## Local development
 
@@ -120,3 +128,6 @@ faked.
   same `cognito_sub` could still raise an `IntegrityError` on the unique
   constraint rather than gracefully returning the existing user — not
   handled, left as a known edge case.
+- B2B account-type assignment (decision #8) — no admin/onboarding path
+  exists yet; `GET /users/me` has something real to return the moment
+  one does, per MA-107's spec.

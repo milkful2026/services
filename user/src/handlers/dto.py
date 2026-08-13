@@ -8,7 +8,22 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from domain.exceptions import UserServiceError, ValidationError
-from domain.models import Address, Consent, DeliverySlot, RegistrationRequest, RegistrationResult
+from domain.models import (
+    Address,
+    Consent,
+    DeliverySlot,
+    RegistrationRequest,
+    RegistrationResult,
+    UserProfile,
+)
+
+
+def extract_jwt_claims(event: dict) -> dict:
+    """Verified claims from the API Gateway HTTP API JWT authorizer
+    (`requestContext.authorizer.jwt.claims`) — shared by every handler
+    that needs the caller's identity, never trusted from the request
+    body (services/README.md §5b)."""
+    return event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
 
 
 class AddressDto(BaseModel):
@@ -82,6 +97,16 @@ def serialize_registration_result(result: RegistrationResult) -> dict[str, Any]:
 
 def serialize_delivery_slots(slots: list[DeliverySlot]) -> list[dict[str, Any]]:
     return [{"id": s.id, "label": s.label, "available": s.available} for s in slots]
+
+
+def serialize_user_profile(profile: UserProfile) -> dict[str, Any]:
+    return {
+        "userId": profile.user_id,
+        "name": profile.name,
+        "mobile": profile.mobile,
+        "accountType": profile.account_type,
+        "defaultAddressId": profile.default_address_id,
+    }
 
 
 def success_response(data: Any, status_code: int = 200) -> dict[str, Any]:

@@ -1,7 +1,19 @@
 import pytest
 
-from domain.exceptions import ExternalServiceUnavailableError, NotServiceableError, ValidationError
-from domain.models import Address, Consent, DeliverySlot, RegistrationRequest, RegistrationResult
+from domain.exceptions import (
+    ExternalServiceUnavailableError,
+    NotServiceableError,
+    UserNotFoundError,
+    ValidationError,
+)
+from domain.models import (
+    Address,
+    Consent,
+    DeliverySlot,
+    RegistrationRequest,
+    RegistrationResult,
+    UserProfile,
+)
 from domain.registration_service import RegistrationService
 
 
@@ -11,14 +23,17 @@ class FakeUserRepository:
         result: RegistrationResult | None = None,
         slots: list[DeliverySlot] | None = None,
         existing: RegistrationResult | None = None,
+        profile: UserProfile | None = None,
     ):
         self.result = result or RegistrationResult(
             user_id="user-1", default_address_id="addr-1", is_new_user=True
         )
         self.slots = slots or []
         self.existing = existing
+        self.profile = profile
         self.register_calls: list[dict] = []
         self.get_by_cognito_sub_calls: list[str] = []
+        self.get_profile_by_sub_calls: list[str] = []
         self.correlation_id = ""
 
     def set_correlation_id(self, correlation_id: str) -> None:
@@ -34,6 +49,10 @@ class FakeUserRepository:
 
     def get_delivery_slots(self, zone_id: str):
         return self.slots
+
+    def get_profile_by_sub(self, cognito_sub: str):
+        self.get_profile_by_sub_calls.append(cognito_sub)
+        return self.profile
 
 
 class FakeInventoryClient:
@@ -272,3 +291,24 @@ def test_get_delivery_slots_delegates_to_repository(inventory, cognito):
     slots = service.get_delivery_slots("blr-central")
 
     assert slots == [DeliverySlot(id="morning-6-8", label="Morning 6-8 AM")]
+
+
+def test_get_my_profile_returns_profile_from_repository(inventory, cognito):
+    profile = UserProfile(
+        user_id="user-1", name="Priya", mobile="+919876543210", account_type="B2C", default_address_id="addr-1"
+    )
+    repo = FakeUserRepository(profile=profile)
+    service = RegistrationService(repo, inventory, cognito)
+
+    result = service.get_my_profile("sub-123")
+
+    assert result == profile
+    assert repo.get_profile_by_sub_calls == ["sub-123"]
+
+
+def test_get_my_profile_raises_not_found_when_repository_returns_none(inventory, cognito):
+    repo = FakeUserRepository(profile=None)
+    service = RegistrationService(repo, inventory, cognito)
+
+    with pytest.raises(UserNotFoundError):
+        service.get_my_profile("sub-does-not-exist")

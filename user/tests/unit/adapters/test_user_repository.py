@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from adapters.user_repository import SqlAlchemyUserRepository, users_table, zone_slots_table
 from domain.exceptions import ExternalServiceUnavailableError
@@ -200,6 +200,63 @@ def test_get_by_cognito_sub_finds_registered_user(repository):
     assert found.user_id == registered.user_id
     assert found.default_address_id == registered.default_address_id
     assert found.is_new_user is False
+
+
+def test_get_profile_by_sub_returns_none_when_absent(repository):
+    assert repository.get_profile_by_sub("does-not-exist") is None
+
+
+def test_get_profile_by_sub_returns_profile_defaulting_to_b2c(repository):
+    registered = repository.register(
+        cognito_sub="sub-1",
+        mobile="+919876543210",
+        name="Priya Sharma",
+        email=None,
+        addresses=[_address()],
+        preferred_slot_id=None,
+        consents=_consents(),
+        outbox_event_type="UserRegistered",
+        outbox_payload={},
+    )
+
+    profile = repository.get_profile_by_sub("sub-1")
+
+    assert profile is not None
+    assert profile.user_id == registered.user_id
+    assert profile.name == "Priya Sharma"
+    assert profile.mobile == "+919876543210"
+    assert profile.account_type == "B2C"
+    assert profile.default_address_id == registered.default_address_id
+
+
+def test_account_type_check_constraint_rejects_invalid_value(repository, sqlite_engine):
+    # Guards the CHECK (account_type IN ('B2C','B2B')) constraint itself
+    # (migrations/0002_add_account_type.sql / the CheckConstraint on
+    # users_table) — a typo in the IN-list or a migration that loosens
+    # it must fail a test, not ship silently.
+    with pytest.raises(IntegrityError):
+        with sqlite_engine.begin() as conn:
+            conn.execute(
+                users_table.insert().values(
+                    id=str(uuid.uuid4()),
+                    cognito_sub="sub-invalid",
+                    name="Priya",
+                    mobile="+919876543210",
+                    email=None,
+                    preferred_slot_id=None,
+                    account_type="B2X",
+                )
+            )
+
+
+def test_get_profile_by_sub_fails_closed_on_db_error(repository, sqlite_engine, monkeypatch):
+    def _raise(*args, **kwargs):
+        raise OperationalError("connect", {}, Exception("db down"))
+
+    monkeypatch.setattr(sqlite_engine, "connect", _raise)
+
+    with pytest.raises(ExternalServiceUnavailableError):
+        repository.get_profile_by_sub("sub-1")
 
 
 def test_register_fails_closed_on_db_error(repository, sqlite_engine, monkeypatch):
