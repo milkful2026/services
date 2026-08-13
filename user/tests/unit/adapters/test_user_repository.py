@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from adapters.user_repository import SqlAlchemyUserRepository, users_table, zone_slots_table
 from domain.exceptions import ExternalServiceUnavailableError
@@ -227,6 +227,26 @@ def test_get_profile_by_sub_returns_profile_defaulting_to_b2c(repository):
     assert profile.mobile == "+919876543210"
     assert profile.account_type == "B2C"
     assert profile.default_address_id == registered.default_address_id
+
+
+def test_account_type_check_constraint_rejects_invalid_value(repository, sqlite_engine):
+    # Guards the CHECK (account_type IN ('B2C','B2B')) constraint itself
+    # (migrations/0002_add_account_type.sql / the CheckConstraint on
+    # users_table) — a typo in the IN-list or a migration that loosens
+    # it must fail a test, not ship silently.
+    with pytest.raises(IntegrityError):
+        with sqlite_engine.begin() as conn:
+            conn.execute(
+                users_table.insert().values(
+                    id=str(uuid.uuid4()),
+                    cognito_sub="sub-invalid",
+                    name="Priya",
+                    mobile="+919876543210",
+                    email=None,
+                    preferred_slot_id=None,
+                    account_type="B2X",
+                )
+            )
 
 
 def test_get_profile_by_sub_fails_closed_on_db_error(repository, sqlite_engine, monkeypatch):

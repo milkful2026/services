@@ -11,7 +11,13 @@ import uuid
 from config.env import get_settings
 from domain.exceptions import UserServiceError
 from handlers.composition import build_registration_service
-from handlers.dto import error_response, serialize_user_profile, success_response, validation_error_response
+from handlers.dto import (
+    error_response,
+    extract_jwt_claims,
+    serialize_user_profile,
+    success_response,
+    validation_error_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +34,12 @@ def _get_deps() -> dict:
     return _deps
 
 
-def _extract_claims(event: dict) -> dict:
-    return event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
-
-
 def handler(event: dict, context) -> dict:
     deps = _get_deps()
     correlation_id = (event.get("headers") or {}).get("x-request-id", str(uuid.uuid4()))
     deps["registration_service"].set_correlation_id(correlation_id)
 
-    cognito_sub = _extract_claims(event).get("sub")
+    cognito_sub = extract_jwt_claims(event).get("sub")
     if not cognito_sub:
         return validation_error_response("Missing or invalid JWT claims")
 

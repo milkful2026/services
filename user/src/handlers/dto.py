@@ -18,6 +18,14 @@ from domain.models import (
 )
 
 
+def extract_jwt_claims(event: dict) -> dict:
+    """Verified claims from the API Gateway HTTP API JWT authorizer
+    (`requestContext.authorizer.jwt.claims`) — shared by every handler
+    that needs the caller's identity, never trusted from the request
+    body (services/README.md §5b)."""
+    return event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
+
+
 class AddressDto(BaseModel):
     lines: list[str]
     city: str

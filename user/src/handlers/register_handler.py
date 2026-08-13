@@ -19,6 +19,7 @@ from handlers.composition import build_registration_service
 from handlers.dto import (
     RegisterRequestDto,
     error_response,
+    extract_jwt_claims,
     serialize_registration_result,
     success_response,
     validation_error_response,
@@ -39,16 +40,12 @@ def _get_deps() -> dict:
     return _deps
 
 
-def _extract_claims(event: dict) -> dict:
-    return event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
-
-
 def handler(event: dict, context) -> dict:
     deps = _get_deps()
     correlation_id = (event.get("headers") or {}).get("x-request-id", str(uuid.uuid4()))
     deps["registration_service"].set_correlation_id(correlation_id)
 
-    claims = _extract_claims(event)
+    claims = extract_jwt_claims(event)
     cognito_sub = claims.get("sub")
     mobile = claims.get("phone_number")
     if not cognito_sub or not mobile:

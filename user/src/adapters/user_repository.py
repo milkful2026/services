@@ -117,23 +117,34 @@ class SqlAlchemyUserRepository:
     def set_correlation_id(self, correlation_id: str) -> None:
         self._correlation_id = correlation_id
 
+    @staticmethod
+    def _fetch_user_with_default_address(conn, cognito_sub: str):
+        """Shared by get_by_cognito_sub and get_profile_by_sub — both need
+        the same 'user row, then its default address row' read, just
+        mapped to different result types. Returns (user_row, default_row)
+        with user_row None if no such user exists."""
+        user_row = conn.execute(
+            select(users_table).where(users_table.c.cognito_sub == cognito_sub)
+        ).fetchone()
+        if user_row is None:
+            return None, None
+        default_row = conn.execute(
+            select(addresses_table).where(
+                addresses_table.c.user_id == user_row.id,
+                addresses_table.c.is_default.is_(True),
+            )
+        ).fetchone()
+        return user_row, default_row
+
     def get_by_cognito_sub(self, cognito_sub: str) -> RegistrationResult | None:
         """Cheap indexed read, no transaction — lets callers short-circuit
         a duplicate registration (skipping the Inventory call and Cognito
         sync entirely) before ever attempting `register()`."""
         try:
             with self._engine.connect() as conn:
-                existing = conn.execute(
-                    select(users_table).where(users_table.c.cognito_sub == cognito_sub)
-                ).fetchone()
-                if existing is None:
+                user_row, default_row = self._fetch_user_with_default_address(conn, cognito_sub)
+                if user_row is None:
                     return None
-                default_row = conn.execute(
-                    select(addresses_table).where(
-                        addresses_table.c.user_id == existing.id,
-                        addresses_table.c.is_default.is_(True),
-                    )
-                ).fetchone()
         except SQLAlchemyError as exc:
             logger.error(
                 "user_repository.get_by_cognito_sub failed",
@@ -144,7 +155,7 @@ class SqlAlchemyUserRepository:
             ) from exc
 
         return RegistrationResult(
-            user_id=existing.id,
+            user_id=user_row.id,
             default_address_id=default_row.id if default_row else "",
             is_new_user=False,
         )
@@ -154,17 +165,9 @@ class SqlAlchemyUserRepository:
         a client-supplied ID (services/README.md §5b)."""
         try:
             with self._engine.connect() as conn:
-                user_row = conn.execute(
-                    select(users_table).where(users_table.c.cognito_sub == cognito_sub)
-                ).fetchone()
+                user_row, default_row = self._fetch_user_with_default_address(conn, cognito_sub)
                 if user_row is None:
                     return None
-                default_row = conn.execute(
-                    select(addresses_table).where(
-                        addresses_table.c.user_id == user_row.id,
-                        addresses_table.c.is_default.is_(True),
-                    )
-                ).fetchone()
         except SQLAlchemyError as exc:
             logger.error(
                 "user_repository.get_profile_by_sub failed",
