@@ -46,9 +46,9 @@ class FakeOtpStore:
     def get(self, request_id):
         return self.records.get(request_id)
 
-    def get_active_by_mobile(self, mobile):
+    def get_active_by_mobile(self, mobile, purpose):
         for r in self.records.values():
-            if r.mobile == mobile and r.status.value == "ACTIVE":
+            if r.mobile == mobile and r.status.value == "ACTIVE" and r.purpose == purpose:
                 return r
         return None
 

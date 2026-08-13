@@ -1,10 +1,20 @@
-"""POST /v1/auth/otp/verify — thin Lambda entrypoint.
+"""POST /v1/auth/login/otp/verify — thin Lambda entrypoint (MA-21 FR-2).
 
-Per spec FR-2: on OTP success, create-or-confirm the Cognito user and
-issue tokens. Response shape matches the spec exactly (accessToken,
-refreshToken, expiresIn, isNewUser) — idToken is available on the
-TokenBundle but intentionally not added to the response since the spec
-doesn't ask for it.
+Unlike registration's otp_verify_handler, this calls `issue_tokens`
+directly (no AdminCreateUser/AdminConfirmSignUp — those are registration-
+only operations) since the user must already exist and be verified to
+have reached this point via login_otp_send_handler's gate. Response has
+no `isNewUser` field at all (always false by construction in this path —
+the spec omits the field rather than hardcoding it, to avoid clients
+branching on a value that can't vary here).
+
+Note: OTP verification itself doesn't check that the record's `purpose`
+is "LOGIN" specifically (verify_otp is purpose-agnostic — purpose only
+drives rate-limit/lock key isolation and SMS template selection, not an
+authorization boundary). A REGISTER-purpose OTP consumed via this
+endpoint still required actual possession of the code sent to that
+phone, so this isn't a security gap — just a design note worth being
+explicit about rather than silent on.
 """
 
 import json
@@ -67,10 +77,10 @@ def handler(event: dict, context) -> dict:
 
     try:
         deps["otp_service"].verify_otp(request.mobile, request.otp, request.request_id)
-        tokens, is_new_user = deps["cognito"].register_and_issue_tokens(request.mobile)
+        tokens = deps["cognito"].issue_tokens(request.mobile)
         # Only marked consumed once tokens actually issued — a transient
         # Cognito failure above must leave the OTP retryable rather than
-        # burning it for a registration that never completed. See
+        # burning it for a login that never completed. See
         # OtpService.verify_otp's docstring.
         deps["otp_service"].mark_otp_consumed(request.request_id)
 
@@ -79,12 +89,11 @@ def handler(event: dict, context) -> dict:
                 "accessToken": tokens.access_token,
                 "refreshToken": tokens.refresh_token,
                 "expiresIn": tokens.expires_in,
-                "isNewUser": is_new_user,
             }
         )
     except IdentityAuthError as exc:
         logger.info(
-            "otp_verify rejected",
+            "login_otp_verify rejected",
             extra={"correlationId": correlation_id, "errorCode": exc.error_code},
         )
         return error_response(exc)

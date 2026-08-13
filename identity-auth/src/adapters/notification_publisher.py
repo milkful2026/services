@@ -39,7 +39,12 @@ class EventBridgeNotificationPublisher:
         self._max_retries = max_retries
         self._backoff_base_seconds = backoff_base_seconds
 
-    def publish_otp_requested(self, mobile: str, otp: str, correlation_id: str) -> None:
+    def publish_otp_requested(
+        self, mobile: str, otp: str, correlation_id: str, purpose: str = "REGISTER"
+    ) -> None:
+        # template mirrors OtpRecord.purpose (register vs login) so
+        # Notification can pick the right SMS copy — spec MA-21 FR-1.
+        template = "login" if purpose == "LOGIN" else "registration"
         detail = {
             "eventId": str(uuid.uuid4()),
             "eventType": "identity.otp.requested",
@@ -47,7 +52,7 @@ class EventBridgeNotificationPublisher:
             "source": self._event_source,
             "timestamp": datetime.now(UTC).isoformat(),
             "correlationId": correlation_id,
-            "payload": {"mobile": mobile, "otp": otp},
+            "payload": {"mobile": mobile, "otp": otp, "template": template},
         }
 
         last_cause: str | None = None

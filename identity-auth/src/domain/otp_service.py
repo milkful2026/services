@@ -22,12 +22,23 @@ from domain.exceptions import (
 )
 from domain.models import OtpRecord, OtpStatus
 
+# Distinct prefixes per spec MA-21 FR-1: a user mid-registration and a
+# user attempting login on the same mobile must not exhaust each other's
+# rate-limit/lock budget. Unknown purposes fall back to the REGISTER
+# prefix rather than raising — this mirrors the DynamoDB record's own
+# "absence of purpose == REGISTER" back-compat default.
+_KEY_PREFIXES = {"REGISTER": "register:otp:", "LOGIN": "login:otp:"}
+
+
+def _key_prefix(purpose: str) -> str:
+    return _KEY_PREFIXES.get(purpose, _KEY_PREFIXES["REGISTER"])
+
 
 class OtpService:
     def __init__(
         self,
         otp_store: OtpStorePort,
-        rate_limiter: RateLimiterPort,
+        rate_limiter: RateLimiterPort | None = None,
         otp_length: int = 6,
         ttl_seconds: int = 300,
         resend_after_seconds: int = 30,
@@ -58,7 +69,7 @@ class OtpService:
         if self._send_lock is None:
             return self._request_otp_locked(mobile, purpose)
 
-        lock_key = f"register:otp:lock:{mobile}"
+        lock_key = f"{_key_prefix(purpose)}lock:{mobile}"
         if not self._send_lock.acquire(lock_key, self._send_lock_ttl_seconds):
             # Another request for this mobile is already inside the
             # check-then-act section below — without this, both could see
@@ -72,7 +83,7 @@ class OtpService:
             self._send_lock.release(lock_key)
 
     def _request_otp_locked(self, mobile: str, purpose: str) -> tuple[OtpRecord, str, bool]:
-        existing = self._otp_store.get_active_by_mobile(mobile)
+        existing = self._otp_store.get_active_by_mobile(mobile, purpose)
         now = int(time.time())
 
         if existing is not None and existing.ttl > now:
@@ -85,7 +96,16 @@ class OtpService:
         # Fresh send, or a resend after cooldown elapsed. Rate limit is
         # checked here, not on every duplicate-send lookup, so cooldown
         # polling doesn't itself burn rate-limit budget.
-        rate_limit_key = f"register:otp:{mobile}"
+        #
+        # rate_limiter is typed Optional purely so verify-only callers
+        # (e.g. login_otp_verify_handler) aren't forced to construct a
+        # Redis connection they'll never use — verify_otp()/
+        # mark_otp_consumed() never reach this method. request_otp()
+        # itself still requires a real one: intentionally left
+        # unconditional (no `is not None` guard) so a composition root
+        # that forgets to wire it fails loudly here instead of silently
+        # shipping with rate limiting disabled.
+        rate_limit_key = f"{_key_prefix(purpose)}{mobile}"
         self._rate_limiter.check_and_increment(
             rate_limit_key, self._rate_limit_max_requests, self._rate_limit_window_seconds
         )
@@ -120,6 +140,18 @@ class OtpService:
         self._otp_store.mark_status(request_id, OtpStatus.SEND_FAILED.value)
 
     def verify_otp(self, mobile: str, otp: str, request_id: str) -> OtpRecord:
+        """Checks the code is correct and still usable, but deliberately
+        does NOT mark it consumed — callers that still have a further
+        step that can itself fail (e.g. issuing Cognito tokens) must call
+        mark_otp_consumed() only after that step succeeds. Otherwise a
+        transient failure in that later step would burn the OTP for an
+        operation that never actually completed, forcing the caller to
+        restart the whole send/verify cycle. This narrows (rather than
+        eliminates) the window in which the same code could be replayed —
+        accepted since verify-then-act is one logical operation split
+        only for downstream-failure safety, and the window is bounded by
+        that downstream call's own latency.
+        """
         record = self._otp_store.get(request_id)
         if record is None or record.mobile != mobile:
             raise OtpRequestNotFoundError("No matching OTP request")
@@ -138,5 +170,7 @@ class OtpService:
                 raise OtpAttemptsExceededError("Maximum verification attempts exceeded")
             raise OtpInvalidError("Incorrect OTP")
 
-        self._otp_store.mark_status(request_id, OtpStatus.CONSUMED.value)
         return record
+
+    def mark_otp_consumed(self, request_id: str) -> None:
+        self._otp_store.mark_status(request_id, OtpStatus.CONSUMED.value)

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-import handlers.otp_verify_handler as otp_verify_handler
+import handlers.login_otp_verify_handler as login_otp_verify_handler
 from domain.exceptions import ExternalServiceUnavailableError
 from domain.models import OtpStatus, TokenBundle
 from domain.otp_service import OtpService
@@ -42,28 +42,27 @@ class FakeCognito:
         self.raise_on_issue = raise_on_issue
         self.calls = []
 
-    def register_and_issue_tokens(self, mobile: str):
-        self.calls.append(mobile)
+    def issue_tokens(self, username: str):
+        self.calls.append(username)
         if self.raise_on_issue:
             raise self.raise_on_issue
-        return (
-            TokenBundle(access_token="access-tok", refresh_token="refresh-tok", id_token="id-tok", expires_in=900),
-            True,
+        return TokenBundle(
+            access_token="access-tok", refresh_token="refresh-tok", id_token="id-tok", expires_in=900
         )
 
 
 @pytest.fixture(autouse=True)
 def _reset_deps():
-    otp_verify_handler._deps = None
+    login_otp_verify_handler._deps = None
     yield
-    otp_verify_handler._deps = None
+    login_otp_verify_handler._deps = None
 
 
 def _inject_deps(cognito=None):
     store = FakeOtpStore()
     otp_service = OtpService(otp_store=store, rate_limiter=NoOpRateLimiter())
     cognito = cognito or FakeCognito()
-    otp_verify_handler._deps = {"cognito": cognito, "otp_service": otp_service}
+    login_otp_verify_handler._deps = {"cognito": cognito, "otp_service": otp_service}
     return store, otp_service, cognito
 
 
@@ -71,11 +70,11 @@ def _event(body: dict) -> dict:
     return {"body": json.dumps(body), "headers": {"x-request-id": "test-corr-id"}}
 
 
-def test_verify_otp_success_returns_tokens():
+def test_login_verify_success_returns_tokens_without_is_new_user_field():
     store, otp_service, cognito = _inject_deps()
-    record, plaintext, _ = otp_service.request_otp("+919876543210")
+    record, plaintext, _ = otp_service.request_otp("+919876543210", purpose="LOGIN")
 
-    response = otp_verify_handler.handler(
+    response = login_otp_verify_handler.handler(
         _event({"mobile": "+919876543210", "otp": plaintext, "requestId": record.request_id}), None
     )
 
@@ -84,71 +83,85 @@ def test_verify_otp_success_returns_tokens():
     assert body["data"]["accessToken"] == "access-tok"
     assert body["data"]["refreshToken"] == "refresh-tok"
     assert body["data"]["expiresIn"] == 900
-    assert body["data"]["isNewUser"] is True
+    assert "isNewUser" not in body["data"]
     assert "idToken" not in body["data"]
     assert cognito.calls == ["+919876543210"]
 
 
-def test_verify_otp_wrong_code_returns_401():
-    _, otp_service, _ = _inject_deps()
-    record, _, _ = otp_service.request_otp("+919876543210")
+def test_login_verify_calls_issue_tokens_not_register(monkeypatch):
+    # issue_tokens must be called directly — never register_and_issue_tokens,
+    # which would AdminCreateUser a user that must already exist.
+    store, otp_service, cognito = _inject_deps()
+    assert not hasattr(cognito, "register_and_issue_tokens")
 
-    response = otp_verify_handler.handler(
+    record, plaintext, _ = otp_service.request_otp("+919876543210", purpose="LOGIN")
+    login_otp_verify_handler.handler(
+        _event({"mobile": "+919876543210", "otp": plaintext, "requestId": record.request_id}), None
+    )
+
+    assert cognito.calls == ["+919876543210"]
+
+
+def test_login_verify_wrong_code_returns_401():
+    _, otp_service, _ = _inject_deps()
+    record, _, _ = otp_service.request_otp("+919876543210", purpose="LOGIN")
+
+    response = login_otp_verify_handler.handler(
         _event({"mobile": "+919876543210", "otp": "000000", "requestId": record.request_id}), None
     )
 
     assert response["statusCode"] == 401
-    body = json.loads(response["body"])
-    assert body["data"]["errorCode"] == "OTP_INVALID"
+    assert json.loads(response["body"])["data"]["errorCode"] == "OTP_INVALID"
 
 
-def test_verify_otp_unknown_request_id_returns_400():
+def test_login_verify_unknown_request_id_returns_400():
     _inject_deps()
 
-    response = otp_verify_handler.handler(
+    response = login_otp_verify_handler.handler(
         _event({"mobile": "+919876543210", "otp": "123456", "requestId": "nope"}), None
     )
 
     assert response["statusCode"] == 400
-    body = json.loads(response["body"])
-    assert body["data"]["errorCode"] == "OTP_REQUEST_NOT_FOUND"
+    assert json.loads(response["body"])["data"]["errorCode"] == "OTP_REQUEST_NOT_FOUND"
 
 
-def test_verify_otp_malformed_body_returns_400():
+def test_login_verify_malformed_body_returns_400():
     _inject_deps()
 
-    response = otp_verify_handler.handler({"body": "not json", "headers": {}}, None)
+    response = login_otp_verify_handler.handler({"body": "not json", "headers": {}}, None)
 
     assert response["statusCode"] == 400
 
 
-def test_verify_otp_cognito_failure_propagates_as_503():
-    store, otp_service, _ = _inject_deps(cognito=FakeCognito(raise_on_issue=ExternalServiceUnavailableError("down")))
-    record, plaintext, _ = otp_service.request_otp("+919876543210")
+def test_login_verify_cognito_failure_propagates_as_503():
+    store, otp_service, _ = _inject_deps(
+        cognito=FakeCognito(raise_on_issue=ExternalServiceUnavailableError("down"))
+    )
+    record, plaintext, _ = otp_service.request_otp("+919876543210", purpose="LOGIN")
 
-    response = otp_verify_handler.handler(
+    response = login_otp_verify_handler.handler(
         _event({"mobile": "+919876543210", "otp": plaintext, "requestId": record.request_id}), None
     )
 
     assert response["statusCode"] == 503
 
 
-def test_verify_otp_cognito_failure_leaves_otp_retryable():
-    # A transient Cognito failure must not burn the OTP — the record
-    # must stay ACTIVE (not CONSUMED) so a retry with the same
-    # requestId/otp can still succeed once Cognito recovers.
+def test_login_verify_cognito_failure_leaves_otp_retryable():
+    # The bug this ordering fix targets: a transient Cognito failure must
+    # not burn the OTP — the record must stay ACTIVE (not CONSUMED) so a
+    # retry with the same requestId/otp can still succeed.
     failing_cognito = FakeCognito(raise_on_issue=ExternalServiceUnavailableError("down"))
     store, otp_service, _ = _inject_deps(cognito=failing_cognito)
-    record, plaintext, _ = otp_service.request_otp("+919876543210")
+    record, plaintext, _ = otp_service.request_otp("+919876543210", purpose="LOGIN")
 
-    first = otp_verify_handler.handler(
+    first = login_otp_verify_handler.handler(
         _event({"mobile": "+919876543210", "otp": plaintext, "requestId": record.request_id}), None
     )
     assert first["statusCode"] == 503
     assert store.records[record.request_id].status == OtpStatus.ACTIVE
 
     failing_cognito.raise_on_issue = None  # Cognito recovers
-    second = otp_verify_handler.handler(
+    second = login_otp_verify_handler.handler(
         _event({"mobile": "+919876543210", "otp": plaintext, "requestId": record.request_id}), None
     )
     assert second["statusCode"] == 200

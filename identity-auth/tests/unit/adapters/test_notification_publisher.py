@@ -46,9 +46,28 @@ def test_publish_otp_requested_uses_fixed_event_envelope(publisher, monkeypatch)
     assert detail["eventVersion"] == "1.0"
     assert detail["source"] == "identity-auth"
     assert detail["correlationId"] == "corr-1"
-    assert detail["payload"] == {"mobile": "+919876543210", "otp": "123456"}
+    assert detail["payload"] == {
+        "mobile": "+919876543210",
+        "otp": "123456",
+        "template": "registration",
+    }
     assert "eventId" in detail
     assert "timestamp" in detail
+
+
+def test_publish_otp_requested_login_purpose_uses_login_template(publisher, monkeypatch):
+    captured = {}
+
+    def _capture(**kwargs):
+        captured["entry"] = kwargs["Entries"][0]
+        return {"FailedEntryCount": 0, "Entries": [{"EventId": "evt-1"}]}
+
+    monkeypatch.setattr(publisher._client, "put_events", _capture)
+
+    publisher.publish_otp_requested("+919876543210", "123456", "corr-1", purpose="LOGIN")
+
+    detail = json.loads(captured["entry"]["Detail"])
+    assert detail["payload"]["template"] == "login"
 
 
 def test_publish_retries_then_raises_on_persistent_client_error(publisher, monkeypatch):

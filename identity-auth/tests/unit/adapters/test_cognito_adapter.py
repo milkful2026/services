@@ -17,6 +17,7 @@ from domain.exceptions import (
     ExternalServiceUnavailableError,
     InvalidRefreshTokenError,
     SocialAccountConflictError,
+    ValidationError,
 )
 
 
@@ -133,3 +134,44 @@ def test_register_and_issue_tokens_wraps_client_error(adapter, monkeypatch):
 
     with pytest.raises(ExternalServiceUnavailableError):
         adapter.register_and_issue_tokens("+919876543210")
+
+
+def test_revoke_token_calls_cognito_with_token_and_client_id(adapter, monkeypatch):
+    # moto does not implement RevokeToken at all (raises a raw
+    # NotImplementedError, not even a ClientError) — a harder gap than
+    # the "lenient" gaps documented elsewhere in this file. This verifies
+    # the adapter's own call shape via monkeypatch instead of relying on
+    # moto to execute the action; real behavior needs a human against
+    # real (or LocalStack) Cognito.
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(adapter._client, "revoke_token", _capture)
+
+    adapter.revoke_token("some-refresh-token")  # must not raise
+
+    assert captured == {"Token": "some-refresh-token", "ClientId": adapter._client_id}
+
+
+def test_revoke_token_malformed_token_raises_validation_error(adapter, monkeypatch):
+    def _raise(*args, **kwargs):
+        raise ClientError({"Error": {"Code": "InvalidParameterException"}}, "RevokeToken")
+
+    monkeypatch.setattr(adapter._client, "revoke_token", _raise)
+
+    with pytest.raises(ValidationError):
+        adapter.revoke_token("garbage")
+
+
+def test_revoke_token_other_client_error_does_not_raise(adapter, monkeypatch):
+    # Spec MA-21 FR-3: logout must not fail closed — any Cognito-side
+    # error other than a malformed token (e.g. already-revoked, expired,
+    # throttled) still results in a successful (204) logout.
+    def _raise(*args, **kwargs):
+        raise ClientError({"Error": {"Code": "TooManyRequestsException"}}, "RevokeToken")
+
+    monkeypatch.setattr(adapter._client, "revoke_token", _raise)
+
+    adapter.revoke_token("some-token")  # must not raise

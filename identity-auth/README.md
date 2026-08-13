@@ -1,24 +1,26 @@
 # Identity & Auth Service
 
-Cognito-backed OTP registration, optional Google/Apple social auth, and
-JWT issuance/refresh for Milkful's mobile app. Implements the
-**registration-flow** endpoints for [MA-1](https://milkfuldairyindia.atlassian.net/browse/MA-1)
-/ backend story [MA-92](https://milkfuldairyindia.atlassian.net/browse/MA-92),
-per spec `specs/services/tasks/MA/MA-1/identity-auth-registration.md`.
-
-MA-21's login-flow extension (distinct rate-limit keys, logout/RevokeToken,
-existing-user login branch) is **not** built here — see "Deferred / tech
-debt" below for what this build deliberately left room for but didn't
-implement.
+Cognito-backed OTP registration and login, optional Google/Apple social
+auth, and JWT issuance/refresh/revocation for Milkful's mobile app.
+Implements the **registration-flow** endpoints for
+[MA-1](https://milkfuldairyindia.atlassian.net/browse/MA-1) / backend story
+[MA-92](https://milkfuldairyindia.atlassian.net/browse/MA-92) (spec
+`specs/services/tasks/MA/MA-1/identity-auth-registration.md`), and the
+**login-flow** endpoints for
+[MA-21](https://milkfuldairyindia.atlassian.net/browse/MA-21) (spec
+`specs/services/tasks/MA/MA-21/identity-auth-login.md`).
 
 ## Endpoints
 
 | Method | Path | Spec | Auth |
 |--------|------|------|------|
-| POST | `/v1/auth/otp/send` | FR-1 | none (pre-auth) |
-| POST | `/v1/auth/otp/verify` | FR-2 | none (pre-auth) |
-| POST | `/v1/auth/social` | FR-3 | none (pre-auth) |
-| POST | `/v1/auth/token/refresh` | FR-4 | none (pre-auth) |
+| POST | `/v1/auth/otp/send` | MA-1 FR-1 | none (pre-auth) |
+| POST | `/v1/auth/otp/verify` | MA-1 FR-2 | none (pre-auth) |
+| POST | `/v1/auth/social` | MA-1 FR-3 | none (pre-auth) |
+| POST | `/v1/auth/token/refresh` | MA-1 FR-4 | none (pre-auth) |
+| POST | `/v1/auth/login/otp/send` | MA-21 FR-1 | none (pre-auth) |
+| POST | `/v1/auth/login/otp/verify` | MA-21 FR-2 | none (pre-auth) |
+| POST | `/v1/auth/logout` | MA-21 FR-3 | Cognito JWT |
 
 ## Architecture decisions flagged for review
 
@@ -82,6 +84,16 @@ here and in the PR description rather than silently assumed:
    `lastSentAt` to compute the resend cooldown) and to distinguish a
    locked record from one merely past its TTL but not yet deleted (DynamoDB
    TTL deletion isn't immediate).
+9. **`purpose` gates rate-limit/lock keys and the duplicate-send lookup,
+   not OTP verification itself.** `verify_otp` doesn't check that a
+   record's `purpose` matches the endpoint it was submitted to — a
+   REGISTER-purpose OTP could technically be consumed via
+   `/login/otp/verify` (or vice versa) if a client had that requestId.
+   This isn't a security gap (the OTP is still a correctly-hashed,
+   single-use, attempt-limited code sent to that specific phone —
+   `purpose` isolates rate-limit budgets and SMS templates, not
+   authorization), but it's a deliberate scope boundary worth being
+   explicit about rather than silent on.
 
 ## Local development
 
@@ -117,13 +129,16 @@ Redis**:
   `Template.from_stack` assertions against a real `cdk synth` — this
   needs Node.js (for the CDK CLI's JSII bridge) but no AWS account.
 
-**Known test-fidelity gap:** moto's `cognito-idp` mock has limited
+**Known test-fidelity gaps:** moto's `cognito-idp` mock has limited
 fidelity — tokens from `AdminInitiateAuth`/`InitiateAuth` are
-fake/unsigned-looking, and some admin APIs behave more leniently than
-real Cognito (e.g. password policy enforcement isn't fully emulated).
-`test_cognito_adapter.py` validates the adapter's boto3 call shape and
-control flow, not real Cognito token semantics — that needs a human
-against a real (or LocalStack) pool.
+fake/unsigned-looking, some admin APIs behave more leniently than real
+Cognito (e.g. password policy enforcement isn't fully emulated), and
+**`RevokeToken` isn't implemented at all** (moto raises a raw
+`NotImplementedError`, not even a `ClientError`). `test_cognito_adapter.py`
+and the login integration test verify `revoke_token`'s call shape via
+monkeypatch instead of exercising it through moto. None of this
+validates real Cognito token semantics — that needs a human against a
+real (or LocalStack) pool.
 
 ## What still needs a human
 
@@ -146,11 +161,13 @@ against a real (or LocalStack) pool.
 
 ## Deferred / tech debt
 
-- MA-21's `purpose` field (`"REGISTER" | "LOGIN"`) exists on
-  `OtpRecord`/the DynamoDB schema but nothing branches on it yet — this
-  build only ever writes `"REGISTER"`. Login-specific rate-limit keys,
-  the existing-user login branch, and logout/`RevokeToken` are MA-21
-  scope, not built here.
 - Social-to-mobile account linking (see flagged decision #3 above).
 - `partial_token` is a non-functional placeholder (see #3) pending the
   product decision on social/mobile merge UX.
+- "Log out everywhere" (revoking every device, not just the calling one)
+  is explicitly out of MA-21's scope per that spec's own risk register —
+  only per-device logout (`RevokeToken`) is built.
+- Real `RevokeToken` behavior (idempotency on an already-revoked token,
+  exact error codes for a malformed token) needs human verification
+  against real/LocalStack Cognito — moto doesn't implement the action at
+  all (see "Known test-fidelity gaps" above).

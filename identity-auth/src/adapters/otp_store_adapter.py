@@ -69,7 +69,7 @@ class DynamoDbOtpStoreAdapter:
         item = response.get("Item")
         return _from_item(item) if item else None
 
-    def get_active_by_mobile(self, mobile: str) -> OtpRecord | None:
+    def get_active_by_mobile(self, mobile: str, purpose: str) -> OtpRecord | None:
         try:
             response = self._table.query(
                 IndexName="mobile-index",
@@ -85,11 +85,16 @@ class DynamoDbOtpStoreAdapter:
             )
             raise ExternalServiceUnavailableError("Failed to query OTP requests") from exc
         items = response.get("Items", [])
+        # purpose is filtered here (not in the DynamoDB FilterExpression)
+        # so the same "absent purpose == REGISTER" default used by
+        # _from_item also governs matching, rather than duplicating that
+        # default logic as a second, harder-to-read DynamoDB expression.
+        items = [i for i in items if i.get("purpose", "REGISTER") == purpose]
         if not items:
             return None
-        # Defensive: should be at most one ACTIVE record per mobile by
-        # design (resend reuses the record in place); if more than one
-        # somehow exists, prefer the most recently sent.
+        # Defensive: should be at most one ACTIVE record per (mobile,
+        # purpose) by design (resend reuses the record in place); if more
+        # than one somehow exists, prefer the most recently sent.
         most_recent = max(items, key=lambda i: int(i["lastSentAt"]))
         return _from_item(most_recent)
 
