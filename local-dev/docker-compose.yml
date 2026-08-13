@@ -1,0 +1,36 @@
+services:
+  moto:
+    # Single moto_server process emulates Cognito, DynamoDB, SQS, and
+    # EventBridge all on one port — boto3 requests carry enough info
+    # (X-Amz-Target / action) for moto to route internally, so every
+    # service points AWS_ENDPOINT_URL at this one container.
+    image: motoserver/moto:latest
+    ports:
+      - "5000:5000"
+    environment:
+      MOTO_PORT: "5000"
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: milkful
+      POSTGRES_PASSWORD: milkful
+      POSTGRES_DB: postgres
+    volumes:
+      - ./init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+      - milkful-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U milkful"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  milkful-postgres-data:
