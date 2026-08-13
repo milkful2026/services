@@ -31,8 +31,9 @@ class EventBridgeNotificationPublisher:
         correlation_id: str = "",
         max_retries: int = 2,
         backoff_base_seconds: float = 0.2,
+        endpoint_url: str | None = None,
     ) -> None:
-        self._client = boto3.client("events", region_name=region_name)
+        self._client = boto3.client("events", region_name=region_name, endpoint_url=endpoint_url)
         self._event_bus_name = event_bus_name
         self._event_source = event_source
         self._correlation_id = correlation_id

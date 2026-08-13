@@ -47,8 +47,9 @@ class CognitoAttributeAdapter:
         correlation_id: str = "",
         max_retries: int = 2,
         backoff_base_seconds: float = 0.2,
+        endpoint_url: str | None = None,
     ) -> None:
-        self._client = boto3.client("cognito-idp", region_name=region_name)
+        self._client = boto3.client("cognito-idp", region_name=region_name, endpoint_url=endpoint_url)
         self._user_pool_id = user_pool_id
         self._correlation_id = correlation_id
         self._max_retries = max_retries

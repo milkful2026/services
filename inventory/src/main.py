@@ -27,6 +27,7 @@ def _run_consumer() -> None:
             queue_url=settings.zone_updated_queue_url,
             zone_cache=zone_cache,
             region_name=settings.aws_region,
+            endpoint_url=settings.aws_endpoint_url,
         )
         consumer.run_forever()
     except Exception:

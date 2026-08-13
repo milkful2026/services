@@ -25,7 +25,10 @@ def _get_deps() -> dict:
 
     settings = get_settings()
     cognito = CognitoAdapter(
-        settings.cognito_user_pool_id, settings.cognito_client_id, settings.aws_region
+        settings.cognito_user_pool_id,
+        settings.cognito_client_id,
+        settings.aws_region,
+        endpoint_url=settings.aws_endpoint_url,
     )
     token_verifier = SocialJwksAdapter(
         google_client_id=settings.google_client_id,

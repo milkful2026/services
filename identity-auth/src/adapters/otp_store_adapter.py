@@ -43,8 +43,16 @@ def _from_item(item: dict[str, Any]) -> OtpRecord:
 
 
 class DynamoDbOtpStoreAdapter:
-    def __init__(self, table_name: str, region_name: str, correlation_id: str = "") -> None:
-        self._table = boto3.resource("dynamodb", region_name=region_name).Table(table_name)
+    def __init__(
+        self,
+        table_name: str,
+        region_name: str,
+        correlation_id: str = "",
+        endpoint_url: str | None = None,
+    ) -> None:
+        self._table = boto3.resource(
+            "dynamodb", region_name=region_name, endpoint_url=endpoint_url
+        ).Table(table_name)
         self._correlation_id = correlation_id
 
     def put(self, record: OtpRecord) -> None:
