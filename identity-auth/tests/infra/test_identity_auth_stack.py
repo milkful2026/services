@@ -44,7 +44,7 @@ def test_otp_requests_table_has_correct_keys_and_ttl(template):
     )
 
 
-def test_four_registration_endpoint_lambdas_exist(template):
+def test_seven_endpoint_lambdas_exist(template):
     functions = template.find_resources("AWS::Lambda::Function")
     handlers = {
         props["Properties"].get("Handler")
@@ -56,14 +56,15 @@ def test_four_registration_endpoint_lambdas_exist(template):
         "handlers.otp_verify_handler.handler",
         "handlers.social_auth_handler.handler",
         "handlers.token_refresh_handler.handler",
+        "handlers.login_otp_send_handler.handler",
+        "handlers.login_otp_verify_handler.handler",
+        "handlers.logout_handler.handler",
     }
 
 
-def test_http_api_has_four_routes_with_no_authorizer(template):
-    template.resource_count_is("AWS::ApiGatewayV2::Route", 4)
+def test_http_api_has_seven_routes_only_logout_authorized(template):
+    template.resource_count_is("AWS::ApiGatewayV2::Route", 7)
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
-    for props in routes.values():
-        assert "AuthorizerId" not in props["Properties"]
 
     route_keys = {props["Properties"]["RouteKey"] for props in routes.values()}
     assert route_keys == {
@@ -71,7 +72,45 @@ def test_http_api_has_four_routes_with_no_authorizer(template):
         "POST /v1/auth/otp/verify",
         "POST /v1/auth/social",
         "POST /v1/auth/token/refresh",
+        "POST /v1/auth/login/otp/send",
+        "POST /v1/auth/login/otp/verify",
+        "POST /v1/auth/logout",
     }
+
+    for props in routes.values():
+        has_authorizer = "AuthorizerId" in props["Properties"]
+        if props["Properties"]["RouteKey"] == "POST /v1/auth/logout":
+            assert has_authorizer, "logout route must require the Cognito JWT authorizer"
+        else:
+            assert not has_authorizer, f"{props['Properties']['RouteKey']} must stay pre-auth"
+
+
+def test_logout_authorizer_is_a_cognito_user_pool_authorizer(template):
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Authorizer",
+        {"AuthorizerType": "JWT"},
+    )
+    template.resource_count_is("AWS::ApiGatewayV2::Authorizer", 1)
+
+
+def test_execution_role_can_revoke_tokens(template):
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": {
+                "Statement": Match.array_with(
+                    [
+                        Match.object_like(
+                            {
+                                "Action": Match.array_with(["cognito-idp:RevokeToken"]),
+                                "Resource": "*",
+                            }
+                        )
+                    ]
+                )
+            }
+        },
+    )
 
 
 def test_execution_role_scopes_cognito_admin_actions_to_the_pool(template):

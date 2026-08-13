@@ -30,6 +30,7 @@ import os
 
 from aws_cdk import Duration, RemovalPolicy, Stack
 from aws_cdk import aws_apigatewayv2 as apigwv2
+from aws_cdk import aws_apigatewayv2_authorizers as apigwv2_authorizers
 from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
 from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_dynamodb as dynamodb
@@ -101,8 +102,33 @@ class IdentityAuthStack(Stack):
             handler="handlers.token_refresh_handler.handler",
             **common_lambda_kwargs,
         )
+        login_otp_send_fn = lambda_.Function(
+            self,
+            "LoginOtpSendFunction",
+            handler="handlers.login_otp_send_handler.handler",
+            **common_lambda_kwargs,
+        )
+        login_otp_verify_fn = lambda_.Function(
+            self,
+            "LoginOtpVerifyFunction",
+            handler="handlers.login_otp_verify_handler.handler",
+            **common_lambda_kwargs,
+        )
+        logout_fn = lambda_.Function(
+            self, "LogoutFunction", handler="handlers.logout_handler.handler", **common_lambda_kwargs
+        )
 
-        http_api = self._build_http_api(otp_send_fn, otp_verify_fn, social_auth_fn, token_refresh_fn)
+        http_api = self._build_http_api(
+            otp_send_fn,
+            otp_verify_fn,
+            social_auth_fn,
+            token_refresh_fn,
+            login_otp_send_fn,
+            login_otp_verify_fn,
+            logout_fn,
+            user_pool,
+            app_client,
+        )
         self._build_waf(http_api)
         self._build_otp_requested_rule(event_bus_name)
 
@@ -224,8 +250,12 @@ class IdentityAuthStack(Stack):
         )
         role.add_to_policy(
             iam.PolicyStatement(
-                actions=["cognito-idp:InitiateAuth"],
-                resources=["*"],  # InitiateAuth (non-admin) does not support resource scoping
+                # Neither non-admin action supports resource-level scoping
+                # (same limitation as the Admin* actions above, but these
+                # two aren't Admin* so they don't even take a UserPoolId
+                # in their IAM resource context).
+                actions=["cognito-idp:InitiateAuth", "cognito-idp:RevokeToken"],
+                resources=["*"],
             )
         )
         role.add_to_policy(
@@ -242,23 +272,45 @@ class IdentityAuthStack(Stack):
         otp_verify_fn: lambda_.Function,
         social_auth_fn: lambda_.Function,
         token_refresh_fn: lambda_.Function,
+        login_otp_send_fn: lambda_.Function,
+        login_otp_verify_fn: lambda_.Function,
+        logout_fn: lambda_.Function,
+        user_pool: cognito.UserPool,
+        app_client: cognito.UserPoolClient,
     ) -> apigwv2.HttpApi:
-        # No default authorizer — these 4 routes are pre-auth by
-        # definition (spec §6: user isn't authenticated yet).
         http_api = apigwv2.HttpApi(self, "IdentityAuthHttpApi", api_name="identity-auth")
 
-        routes = [
+        # No authorizer — these 6 routes are all pre-auth by definition
+        # (spec §6 / MA-21 §6: user isn't authenticated yet at send/verify
+        # time, same as registration's OTP endpoints).
+        unauthenticated_routes = [
             ("/v1/auth/otp/send", otp_send_fn),
             ("/v1/auth/otp/verify", otp_verify_fn),
             ("/v1/auth/social", social_auth_fn),
             ("/v1/auth/token/refresh", token_refresh_fn),
+            ("/v1/auth/login/otp/send", login_otp_send_fn),
+            ("/v1/auth/login/otp/verify", login_otp_verify_fn),
         ]
-        for path, fn in routes:
+        for path, fn in unauthenticated_routes:
             http_api.add_routes(
                 path=path,
                 methods=[apigwv2.HttpMethod.POST],
                 integration=apigwv2_integrations.HttpLambdaIntegration(f"{fn.node.id}Integration", fn),
             )
+
+        # /auth/logout is the one authenticated route in this service —
+        # MA-21 §6 requires a Cognito authorizer (must be an
+        # authenticated request to log out of).
+        logout_authorizer = apigwv2_authorizers.HttpUserPoolAuthorizer(
+            "LogoutAuthorizer", user_pool, user_pool_clients=[app_client]
+        )
+        http_api.add_routes(
+            path="/v1/auth/logout",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=apigwv2_integrations.HttpLambdaIntegration("LogoutIntegration", logout_fn),
+            authorizer=logout_authorizer,
+        )
+
         return http_api
 
     def _build_waf(self, http_api: apigwv2.HttpApi) -> None:
