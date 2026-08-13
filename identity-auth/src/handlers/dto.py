@@ -89,3 +89,7 @@ def error_response(exc: IdentityAuthError) -> dict[str, Any]:
 
 def validation_error_response(message: str) -> dict[str, Any]:
     return error_response(ValidationError(message))
+
+
+def no_content_response() -> dict[str, Any]:
+    return {"statusCode": 204, "headers": {}, "body": ""}
