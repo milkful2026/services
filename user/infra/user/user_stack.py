@@ -20,9 +20,11 @@ silently decided):
    worth flagging more prominently in the PR that a real shared-VPC (or
    Transit Gateway / VPC peering) decision is overdue, not solving it
    here.
-4. **`DATABASE_URL` composition not wired** — same gap as MA-95's stack,
-   same reason (Aurora's generated secret has separate fields; ECS/Lambda
-   `Secret` injection is one-field-per-env-var).
+4. **`DATABASE_URL` composition.** Unlike MA-95's stack, this one composes
+   it directly: `SecretValue.unsafe_unwrap()` tokens for each of the
+   generated secret's discrete JSON fields (host/port/username/password/
+   dbname) are interpolated into a single f-string, which CDK resolves at
+   deploy time like any other token-bearing string.
 5. **Inventory reachability not wired** — `inventory_client_adapter`
    needs a real URL to Inventory's internal ALB, which lives in MA-95's
    own separate VPC. Passed as a placeholder env var here.
@@ -71,20 +73,27 @@ class UserStack(Stack):
         )
         db_security_group.add_ingress_rule(lambda_security_group, ec2.Port.tcp(5432), "Lambda -> Aurora")
 
+        # Composed directly from the generated secret's discrete JSON
+        # fields via SecretValue tokens (resolved at deploy time) — CDK
+        # supports interpolating these into an f-string like any other
+        # token, so the module docstring's point 4 gap is actually
+        # resolved here rather than left as a runtime-breaking placeholder.
+        secret = db_cluster.secret
+        db_username = secret.secret_value_from_json("username").unsafe_unwrap()
+        db_password = secret.secret_value_from_json("password").unsafe_unwrap()
+        db_host = secret.secret_value_from_json("host").unsafe_unwrap()
+        db_port = secret.secret_value_from_json("port").unsafe_unwrap()
+        db_name = secret.secret_value_from_json("dbname").unsafe_unwrap()
+
         common_env = {
             "USER_AWS_REGION": self.region,
             "USER_COGNITO_USER_POOL_ID": cognito_user_pool_id,
             "USER_INVENTORY_INTERNAL_BASE_URL": inventory_internal_base_url,
             "USER_EVENT_BUS_NAME": "default",
-            # Placeholder — see module docstring point 4.
-            "USER_DATABASE_URL": "postgresql+psycopg2://COMPOSE_FROM_USER_DB_*_SECRETS",
+            "USER_DATABASE_URL": (
+                f"postgresql+psycopg2://{db_username}:{db_password}@{db_host}:{db_port}/{db_name}"
+            ),
         }
-        # DB host/port/username are injected below via add_environment on
-        # each function using SecretValue tokens (resolved at deploy
-        # time) — never baked into a plain `environment` dict, since
-        # that's evaluated at synth time and can't hold a Secrets
-        # Manager-resolved value.
-        secret = db_cluster.secret
         common_lambda_kwargs = dict(
             runtime=lambda_.Runtime.PYTHON_3_12,
             code=lambda_.Code.from_asset(_SRC_DIR),
@@ -115,15 +124,6 @@ class UserStack(Stack):
         )
 
         for fn in (register_fn, delivery_slots_fn, outbox_publisher_fn):
-            # unsafe_unwrap() is CDK's documented mechanism for exactly
-            # this — embedding a Secrets Manager dynamic reference
-            # ({{resolve:secretsmanager:...}}) into a Lambda env var,
-            # resolved at deploy time, not baked in at synth time.
-            fn.add_environment("USER_DB_HOST", secret.secret_value_from_json("host").unsafe_unwrap())
-            fn.add_environment("USER_DB_PORT", secret.secret_value_from_json("port").unsafe_unwrap())
-            fn.add_environment(
-                "USER_DB_USERNAME", secret.secret_value_from_json("username").unsafe_unwrap()
-            )
             secret.grant_read(fn)
 
         http_api = self._build_http_api(register_fn, delivery_slots_fn, cognito_client_id)

@@ -77,6 +77,24 @@ def test_outbox_publisher_has_a_one_minute_schedule(template):
     )
 
 
+def test_database_url_is_composed_not_a_dead_placeholder(template):
+    # USER_DB_HOST/PORT/USERNAME env vars used to be injected separately
+    # but nothing ever read them (config.env.Settings has no such
+    # fields) — USER_DATABASE_URL itself must now be the real,
+    # secret-composed connection string instead.
+    functions = template.find_resources("AWS::Lambda::Function")
+    for props in functions.values():
+        env_vars = props["Properties"].get("Environment", {}).get("Variables", {})
+        if "USER_DATABASE_URL" not in env_vars:
+            continue
+        assert "USER_DB_HOST" not in env_vars
+        assert "USER_DB_PORT" not in env_vars
+        assert "USER_DB_USERNAME" not in env_vars
+        db_url = json.dumps(env_vars["USER_DATABASE_URL"])
+        assert "COMPOSE_FROM_USER_DB" not in db_url
+        assert "postgresql+psycopg2://" in db_url
+
+
 def test_execution_role_scopes_admin_update_user_attributes_to_pool_arn(template):
     # Same reasoning as the issuer test above — the pool ARN is built via
     # string interpolation and synthesizes as Fn::Join, not a plain

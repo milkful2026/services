@@ -49,19 +49,23 @@ verified claims — never trusted from the request body.
    provisioned their own VPC. This is the third time this pattern has
    repeated — worth an explicit shared-VPC (or peering / Transit
    Gateway) architecture decision soon, not solved here.
-5. **`DATABASE_URL` composition not wired**, same gap and same reason as
-   MA-95's stack (Aurora's generated secret has separate JSON fields;
-   Lambda `Secret`/env-var injection is one-field-at-a-time).
+5. **`DATABASE_URL` composition.** Unlike MA-95's stack, this one composes
+   it directly in `user_stack.py`: the generated secret's discrete JSON
+   fields (host/port/username/password/dbname) are interpolated via
+   `SecretValue.unsafe_unwrap()` tokens into a single f-string, which CDK
+   resolves at deploy time.
 6. **Inventory reachability is a placeholder URL.** `inventory_client_adapter`
    is correct and fully tested (via `responses`), but User Service's
    Lambda and Inventory's internal ALB live in separate,
    independently-provisioned VPCs — real connectivity needs the same
    shared-VPC/peering decision as point 4.
-7. **Cognito sync failure is swallowed, not raised**, after the DB
-   transaction already committed — registration itself (user/address/
+7. **A genuine Cognito sync failure is swallowed, not raised**, after the
+   DB transaction already committed — registration itself (user/address/
    consent persisted, outbox written) is what must not fail; a stale
    Cognito profile attribute is a lesser, recoverable problem. Logged,
-   not silent.
+   not silent. Scoped to `ExternalServiceUnavailableError` specifically
+   (not a bare `except Exception`), so an actual bug in the adapter
+   propagates loudly instead of being masked as a routine sync failure.
 
 ## Local development
 
@@ -103,7 +107,6 @@ faked.
 - Resolving the shared-VPC/peering question across MA-92/MA-95/MA-93
   (decision #4/#6) so this service can actually reach Aurora, Inventory,
   and (indirectly) Cognito's VPC endpoints if used.
-- Wiring real `DATABASE_URL` composition from the injected secrets.
 - Deciding how `zone_slots` gets populated/synced (decision #1).
 - Measuring the NFR "Register p95 < 1s" against a deployed environment.
 

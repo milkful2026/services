@@ -12,14 +12,10 @@ import logging
 import uuid
 
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import create_engine
 
-from adapters.cognito_attribute_adapter import CognitoAttributeAdapter
-from adapters.inventory_client_adapter import HttpInventoryClient
-from adapters.user_repository import SqlAlchemyUserRepository
 from config.env import get_settings
 from domain.exceptions import UserServiceError
-from domain.registration_service import RegistrationService
+from handlers.composition import build_registration_service
 from handlers.dto import (
     RegisterRequestDto,
     error_response,
@@ -39,15 +35,7 @@ def _get_deps() -> dict:
         return _deps
 
     settings = get_settings()
-    engine = create_engine(settings.database_url)
-    repository = SqlAlchemyUserRepository(engine)
-    inventory_client = HttpInventoryClient(
-        settings.inventory_internal_base_url, settings.inventory_request_timeout_seconds
-    )
-    cognito_attributes = CognitoAttributeAdapter(settings.cognito_user_pool_id, settings.aws_region)
-    registration_service = RegistrationService(repository, inventory_client, cognito_attributes)
-
-    _deps = {"registration_service": registration_service}
+    _deps = {"registration_service": build_registration_service(settings)}
     return _deps
 
 
@@ -58,6 +46,7 @@ def _extract_claims(event: dict) -> dict:
 def handler(event: dict, context) -> dict:
     deps = _get_deps()
     correlation_id = (event.get("headers") or {}).get("x-request-id", str(uuid.uuid4()))
+    deps["registration_service"].set_correlation_id(correlation_id)
 
     claims = _extract_claims(event)
     cognito_sub = claims.get("sub")
@@ -82,3 +71,8 @@ def handler(event: dict, context) -> dict:
             "register rejected", extra={"correlationId": correlation_id, "errorCode": exc.error_code}
         )
         return error_response(exc)
+    except Exception:
+        logger.exception(
+            "register: unexpected error", extra={"correlationId": correlation_id}
+        )
+        return error_response(UserServiceError("An unexpected error occurred"))

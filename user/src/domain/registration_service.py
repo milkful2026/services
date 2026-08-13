@@ -19,7 +19,7 @@ from adapters.interfaces import (
     InventoryClientPort,
     UserRepositoryPort,
 )
-from domain.exceptions import NotServiceableError, ValidationError
+from domain.exceptions import ExternalServiceUnavailableError, NotServiceableError, ValidationError
 from domain.models import Address, Consent, DeliverySlot, RegistrationRequest, RegistrationResult
 
 logger = logging.getLogger(__name__)
@@ -40,9 +40,27 @@ class RegistrationService:
         self._cognito_attributes = cognito_attributes
         self._correlation_id = correlation_id
 
+    def set_correlation_id(self, correlation_id: str) -> None:
+        """Cascades a per-request correlation ID to every collaborator —
+        this service and its adapters are constructed once and reused
+        across warm Lambda invocations, so the ID can't be baked in at
+        construction time."""
+        self._correlation_id = correlation_id
+        self._user_repository.set_correlation_id(correlation_id)
+        self._inventory_client.set_correlation_id(correlation_id)
+        self._cognito_attributes.set_correlation_id(correlation_id)
+
     def register(self, request: RegistrationRequest) -> RegistrationResult:
         _validate(request)
         default_address = _default_address(request.addresses)
+
+        # Cheap indexed lookup first — a duplicate/retried registration
+        # for an already-registered cognito_sub must not pay for an
+        # Inventory round-trip (with retries) or re-sync Cognito with
+        # this request's (possibly different, never-persisted) address.
+        existing = self._user_repository.get_by_cognito_sub(request.cognito_sub)
+        if existing is not None:
+            return existing
 
         # Must complete and pass BEFORE the DB transaction — a
         # non-serviceable address must never reach the database.
@@ -70,16 +88,27 @@ class RegistrationService:
             },
         )
 
+        if not result.is_new_user:
+            # Lost a concurrent-registration race (see
+            # user_repository.register's IntegrityError handling) — the
+            # winning call already synced Cognito with its own address;
+            # this request's data was never persisted, so it must not be
+            # synced either.
+            return result
+
         # Best-effort, after the DB transaction already committed: the
         # registration itself (user/address/consent persisted, outbox
-        # written) is the thing that must not fail here. A Cognito sync
-        # failure is logged, not raised — raising would give the client a
-        # false 500 for a registration that actually succeeded.
+        # written) is the thing that must not fail here. A genuine
+        # external-service failure is logged, not raised — raising would
+        # give the client a false 500 for a registration that actually
+        # succeeded. Anything else (a bug in the adapter) is left to
+        # propagate loudly rather than being masked as a routine sync
+        # failure.
         try:
             self._cognito_attributes.sync_profile_attributes(
                 request.cognito_sub, request.name, default_address.pincode
             )
-        except Exception:
+        except ExternalServiceUnavailableError:
             logger.error(
                 "cognito profile sync failed post-registration (non-fatal)",
                 extra={"correlationId": self._correlation_id, "userId": result.user_id},
@@ -102,8 +131,8 @@ def _validate(request: RegistrationRequest) -> None:
     if not address.pincode.isdigit() or len(address.pincode) != 6:
         raise ValidationError(f"Invalid pincode format: {address.pincode!r}")
 
-    consent_types = {c.type for c in request.consents}
-    missing = _MANDATORY_CONSENT_TYPES - consent_types
+    accepted_consent_types = {c.type for c in request.consents if c.accepted}
+    missing = _MANDATORY_CONSENT_TYPES - accepted_consent_types
     if missing:
         raise ValidationError(f"Missing mandatory consents: {sorted(missing)}")
 

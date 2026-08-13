@@ -8,14 +8,9 @@ direction even though this read path is simple.
 import logging
 import uuid
 
-from sqlalchemy import create_engine
-
-from adapters.cognito_attribute_adapter import CognitoAttributeAdapter
-from adapters.inventory_client_adapter import HttpInventoryClient
-from adapters.user_repository import SqlAlchemyUserRepository
 from config.env import get_settings
 from domain.exceptions import UserServiceError, ValidationError
-from domain.registration_service import RegistrationService
+from handlers.composition import build_registration_service
 from handlers.dto import error_response, serialize_delivery_slots, success_response
 
 logger = logging.getLogger(__name__)
@@ -29,21 +24,14 @@ def _get_deps() -> dict:
         return _deps
 
     settings = get_settings()
-    engine = create_engine(settings.database_url)
-    repository = SqlAlchemyUserRepository(engine)
-    inventory_client = HttpInventoryClient(
-        settings.inventory_internal_base_url, settings.inventory_request_timeout_seconds
-    )
-    cognito_attributes = CognitoAttributeAdapter(settings.cognito_user_pool_id, settings.aws_region)
-    registration_service = RegistrationService(repository, inventory_client, cognito_attributes)
-
-    _deps = {"registration_service": registration_service}
+    _deps = {"registration_service": build_registration_service(settings)}
     return _deps
 
 
 def handler(event: dict, context) -> dict:
     deps = _get_deps()
     correlation_id = (event.get("headers") or {}).get("x-request-id", str(uuid.uuid4()))
+    deps["registration_service"].set_correlation_id(correlation_id)
 
     zone_id = (event.get("queryStringParameters") or {}).get("zoneId")
     if not zone_id:
@@ -58,3 +46,8 @@ def handler(event: dict, context) -> dict:
             extra={"correlationId": correlation_id, "errorCode": exc.error_code},
         )
         return error_response(exc)
+    except Exception:
+        logger.exception(
+            "delivery_slots: unexpected error", extra={"correlationId": correlation_id}
+        )
+        return error_response(UserServiceError("An unexpected error occurred"))

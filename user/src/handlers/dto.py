@@ -93,6 +93,11 @@ def success_response(data: Any, status_code: int = 200) -> dict[str, Any]:
 
 
 def error_response(exc: UserServiceError) -> dict[str, Any]:
+    # `details` is spread AFTER the canonical keys are computed and
+    # filtered, not into them — an upstream error payload forwarded as
+    # `details` (e.g. Inventory's own {errorCode, message, ...}) must
+    # never silently overwrite this service's own error_code/message.
+    safe_details = {k: v for k, v in exc.details.items() if k not in ("errorCode", "message")}
     return {
         "statusCode": exc.http_status,
         "headers": {"Content-Type": "application/json"},
@@ -100,7 +105,7 @@ def error_response(exc: UserServiceError) -> dict[str, Any]:
             {
                 "requestId": str(uuid.uuid4()),
                 "status": "error",
-                "data": {"errorCode": exc.error_code, "message": exc.message, **exc.details},
+                "data": {"errorCode": exc.error_code, "message": exc.message, **safe_details},
             }
         ),
     }

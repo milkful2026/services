@@ -14,6 +14,10 @@ class FakeRegistrationService:
         )
         self.raises = raises
         self.calls = []
+        self.correlation_id = ""
+
+    def set_correlation_id(self, correlation_id: str) -> None:
+        self.correlation_id = correlation_id
 
     def register(self, request):
         self.calls.append(request)
@@ -78,7 +82,9 @@ def test_register_new_user_returns_201():
 
 
 def test_register_existing_user_returns_200_not_201():
-    _inject(result=RegistrationResult(user_id="user-1", default_address_id="addr-1", is_new_user=False))
+    _inject(
+        result=RegistrationResult(user_id="user-1", default_address_id="addr-1", is_new_user=False)
+    )
 
     response = register_handler.handler(_event(_VALID_BODY), None)
 
@@ -102,7 +108,9 @@ def test_register_malformed_body_returns_400():
         {
             "body": "not json",
             "headers": {},
-            "requestContext": {"authorizer": {"jwt": {"claims": {"sub": "s", "phone_number": "+91"}}}},
+            "requestContext": {
+                "authorizer": {"jwt": {"claims": {"sub": "s", "phone_number": "+91"}}}
+            },
         },
         None,
     )
@@ -124,3 +132,21 @@ def test_register_validation_error_from_service_returns_400():
     response = register_handler.handler(_event(_VALID_BODY), None)
 
     assert response["statusCode"] == 400
+
+
+def test_register_sets_correlation_id_from_header_on_service():
+    service = _inject()
+
+    register_handler.handler(_event(_VALID_BODY), None)
+
+    assert service.correlation_id == "corr-1"
+
+
+def test_register_unexpected_exception_returns_500_not_raw_traceback():
+    _inject(raises=RuntimeError("boom"))
+
+    response = register_handler.handler(_event(_VALID_BODY), None)
+
+    assert response["statusCode"] == 500
+    body = json.loads(response["body"])
+    assert body["status"] == "error"

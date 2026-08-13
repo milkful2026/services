@@ -12,6 +12,10 @@ class FakeRegistrationService:
         self.slots = slots or []
         self.raises = raises
         self.calls = []
+        self.correlation_id = ""
+
+    def set_correlation_id(self, correlation_id: str) -> None:
+        self.correlation_id = correlation_id
 
     def get_delivery_slots(self, zone_id):
         self.calls.append(zone_id)
@@ -69,3 +73,13 @@ def test_get_slots_service_unavailable_returns_503():
     )
 
     assert response["statusCode"] == 503
+
+
+def test_get_slots_unexpected_exception_returns_500():
+    _inject(raises=RuntimeError("boom"))
+
+    response = delivery_slots_handler.handler(
+        {"queryStringParameters": {"zoneId": "blr-central"}, "headers": {}}, None
+    )
+
+    assert response["statusCode"] == 500

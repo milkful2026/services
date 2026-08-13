@@ -5,16 +5,20 @@ to the account default bus, same reasoning as MA-92/MA-95's own adapters.
 
 import json
 import logging
-import time
 import uuid
 from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import ClientError
 
+from adapters.retry import call_with_retry
 from domain.exceptions import ExternalServiceUnavailableError
 
 logger = logging.getLogger(__name__)
+
+
+class _RetryablePublishError(Exception):
+    pass
 
 
 class EventBridgeOutboxPublisher:
@@ -34,6 +38,9 @@ class EventBridgeOutboxPublisher:
         self._max_retries = max_retries
         self._backoff_base_seconds = backoff_base_seconds
 
+    def set_correlation_id(self, correlation_id: str) -> None:
+        self._correlation_id = correlation_id
+
     def publish(self, event_type: str, payload: dict, correlation_id: str) -> None:
         detail = {
             "eventId": str(uuid.uuid4()),
@@ -45,8 +52,7 @@ class EventBridgeOutboxPublisher:
             "payload": payload,
         }
 
-        last_cause: str | None = None
-        for attempt in range(self._max_retries + 1):
+        def _attempt() -> None:
             try:
                 response = self._client.put_events(
                     Entries=[
@@ -58,23 +64,30 @@ class EventBridgeOutboxPublisher:
                         }
                     ]
                 )
-                if response.get("FailedEntryCount", 0) == 0:
-                    return
-                last_cause = str(response.get("Entries"))
-                logger.error(
-                    "outbox_event_publisher.put_events entry failed",
-                    extra={"correlationId": self._correlation_id, "entries": response.get("Entries")},
-                )
             except ClientError as exc:
-                last_cause = str(exc)
-                logger.error(
-                    "outbox_event_publisher.put_events failed",
-                    extra={"correlationId": self._correlation_id, "attempt": attempt, "error": last_cause},
-                )
+                raise _RetryablePublishError(str(exc)) from exc
+            if response.get("FailedEntryCount", 0) != 0:
+                raise _RetryablePublishError(str(response.get("Entries")))
 
-            if attempt < self._max_retries:
-                time.sleep(self._backoff_base_seconds * (2**attempt))
+        def _on_attempt_failure(exc: Exception, attempt: int) -> None:
+            logger.error(
+                "outbox_event_publisher.put_events failed",
+                extra={
+                    "correlationId": self._correlation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                },
+            )
 
-        raise ExternalServiceUnavailableError(
-            "Failed to publish event after retries", details={"cause": last_cause}
-        )
+        try:
+            call_with_retry(
+                _attempt,
+                max_retries=self._max_retries,
+                backoff_base_seconds=self._backoff_base_seconds,
+                retryable_exceptions=(_RetryablePublishError,),
+                on_attempt_failure=_on_attempt_failure,
+            )
+        except _RetryablePublishError as exc:
+            raise ExternalServiceUnavailableError(
+                "Failed to publish event after retries", details={"cause": str(exc)}
+            ) from exc

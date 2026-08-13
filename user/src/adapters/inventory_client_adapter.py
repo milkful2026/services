@@ -9,14 +9,18 @@ provisions its own dedicated VPC.
 """
 
 import logging
-import time
 
 import requests
 from requests.exceptions import RequestException
 
+from adapters.retry import call_with_retry
 from domain.exceptions import ExternalServiceUnavailableError, ValidationError
 
 logger = logging.getLogger(__name__)
+
+
+class _RetryableInventoryError(Exception):
+    pass
 
 
 class HttpInventoryClient:
@@ -34,12 +38,14 @@ class HttpInventoryClient:
         self._backoff_base_seconds = backoff_base_seconds
         self._correlation_id = correlation_id
 
+    def set_correlation_id(self, correlation_id: str) -> None:
+        self._correlation_id = correlation_id
+
     def check_serviceability(self, pincode: str, lat: float, lng: float) -> bool:
         url = f"{self._base_url}/v1/internal/serviceability/check"
         params = {"pincode": pincode, "lat": lat, "lng": lng}
 
-        last_cause: str | None = None
-        for attempt in range(self._max_retries + 1):
+        def _attempt() -> bool:
             try:
                 response = requests.get(
                     url,
@@ -48,28 +54,36 @@ class HttpInventoryClient:
                     headers={"x-correlation-id": self._correlation_id},
                 )
             except RequestException as exc:
-                last_cause = str(exc)
-                logger.error(
-                    "inventory_client.check_serviceability request failed",
-                    extra={"correlationId": self._correlation_id, "attempt": attempt, "error": last_cause},
-                )
-            else:
-                if response.status_code == 200:
-                    return bool(response.json()["data"]["serviceable"])
-                if response.status_code == 400:
-                    raise ValidationError(
-                        "Inventory rejected pincode/coordinates",
-                        details=response.json().get("data", {}),
-                    )
-                last_cause = f"Inventory returned HTTP {response.status_code}"
-                logger.error(
-                    "inventory_client.check_serviceability non-200 response",
-                    extra={"correlationId": self._correlation_id, "status": response.status_code},
-                )
+                raise _RetryableInventoryError(str(exc)) from exc
 
-            if attempt < self._max_retries:
-                time.sleep(self._backoff_base_seconds * (2**attempt))
+            if response.status_code == 200:
+                return bool(response.json()["data"]["serviceable"])
+            if response.status_code == 400:
+                raise ValidationError(
+                    "Inventory rejected pincode/coordinates",
+                    details=response.json().get("data", {}),
+                )
+            raise _RetryableInventoryError(f"Inventory returned HTTP {response.status_code}")
 
-        raise ExternalServiceUnavailableError(
-            "Inventory serviceability check failed after retries", details={"cause": last_cause}
-        )
+        def _on_attempt_failure(exc: Exception, attempt: int) -> None:
+            logger.error(
+                "inventory_client.check_serviceability request failed",
+                extra={
+                    "correlationId": self._correlation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                },
+            )
+
+        try:
+            return call_with_retry(
+                _attempt,
+                max_retries=self._max_retries,
+                backoff_base_seconds=self._backoff_base_seconds,
+                retryable_exceptions=(_RetryableInventoryError,),
+                on_attempt_failure=_on_attempt_failure,
+            )
+        except _RetryableInventoryError as exc:
+            raise ExternalServiceUnavailableError(
+                "Inventory serviceability check failed after retries", details={"cause": str(exc)}
+            ) from exc

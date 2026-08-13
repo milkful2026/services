@@ -11,10 +11,24 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, Column, Float, ForeignKey, MetaData, String, Table, select, update
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    MetaData,
+    String,
+    Table,
+    func,
+    select,
+    update,
+)
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from adapters.retry import call_with_retry
 from domain.exceptions import ExternalServiceUnavailableError
 from domain.models import Address, Consent, DeliverySlot, RegistrationResult
 
@@ -67,6 +81,11 @@ outbox_events_table = Table(
     Column("type", String(64), nullable=False),
     Column("payload", JSON, nullable=False),
     Column("published_at", String(64), nullable=True),
+    # Matches migrations/0001's created_at + idx_outbox_events_unpublished
+    # partial index — needed so get_unpublished_outbox_events can actually
+    # guarantee oldest-first delivery instead of relying on unspecified
+    # scan order.
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
 zone_slots_table = Table(
@@ -89,6 +108,41 @@ class SqlAlchemyUserRepository:
     def __init__(self, engine: Engine, correlation_id: str = "") -> None:
         self._engine = engine
         self._correlation_id = correlation_id
+
+    def set_correlation_id(self, correlation_id: str) -> None:
+        self._correlation_id = correlation_id
+
+    def get_by_cognito_sub(self, cognito_sub: str) -> RegistrationResult | None:
+        """Cheap indexed read, no transaction — lets callers short-circuit
+        a duplicate registration (skipping the Inventory call and Cognito
+        sync entirely) before ever attempting `register()`."""
+        try:
+            with self._engine.connect() as conn:
+                existing = conn.execute(
+                    select(users_table).where(users_table.c.cognito_sub == cognito_sub)
+                ).fetchone()
+                if existing is None:
+                    return None
+                default_row = conn.execute(
+                    select(addresses_table).where(
+                        addresses_table.c.user_id == existing.id,
+                        addresses_table.c.is_default.is_(True),
+                    )
+                ).fetchone()
+        except SQLAlchemyError as exc:
+            logger.error(
+                "user_repository.get_by_cognito_sub failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise ExternalServiceUnavailableError(
+                "Failed to look up existing registration"
+            ) from exc
+
+        return RegistrationResult(
+            user_id=existing.id,
+            default_address_id=default_row.id if default_row else "",
+            is_new_user=False,
+        )
 
     def register(
         self,
@@ -176,6 +230,20 @@ class SqlAlchemyUserRepository:
                         published_at=None,
                     )
                 )
+        except IntegrityError as exc:
+            # A concurrent registration for the same cognito_sub committed
+            # first (the pre-check above and this INSERT aren't atomic
+            # with each other). Per the idempotency contract this Port
+            # documents, that must resolve to the existing row, not a 503.
+            logger.info(
+                "user_repository.register lost a concurrent-registration race,"
+                " returning the existing row",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            existing_result = self.get_by_cognito_sub(cognito_sub)
+            if existing_result is not None:
+                return existing_result
+            raise ExternalServiceUnavailableError("Failed to persist registration") from exc
         except SQLAlchemyError as exc:
             logger.error(
                 "user_repository.register failed",
@@ -211,6 +279,7 @@ class SqlAlchemyUserRepository:
                 rows = conn.execute(
                     select(outbox_events_table)
                     .where(outbox_events_table.c.published_at.is_(None))
+                    .order_by(outbox_events_table.c.created_at)
                     .limit(limit)
                 ).fetchall()
         except SQLAlchemyError as exc:
@@ -226,16 +295,37 @@ class SqlAlchemyUserRepository:
         ]
 
     def mark_outbox_published(self, event_id: str) -> None:
-        try:
+        def _attempt() -> None:
             with self._engine.begin() as conn:
                 conn.execute(
                     update(outbox_events_table)
                     .where(outbox_events_table.c.id == event_id)
                     .values(published_at=datetime.now(UTC).isoformat())
                 )
-        except SQLAlchemyError as exc:
+
+        def _on_attempt_failure(exc: Exception, attempt: int) -> None:
             logger.error(
-                "user_repository.mark_outbox_published failed",
-                extra={"correlationId": self._correlation_id, "error": str(exc)},
+                "user_repository.mark_outbox_published failed, retrying",
+                extra={
+                    "correlationId": self._correlation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                },
             )
+
+        try:
+            # Retried here specifically because the caller already
+            # published this event to EventBridge — a transient failure
+            # marking it published (as opposed to failing to publish in
+            # the first place) risks a duplicate re-delivery on the next
+            # scheduled run, so it's worth a few quick attempts before
+            # giving up.
+            call_with_retry(
+                _attempt,
+                max_retries=2,
+                backoff_base_seconds=0.1,
+                retryable_exceptions=(SQLAlchemyError,),
+                on_attempt_failure=_on_attempt_failure,
+            )
+        except SQLAlchemyError as exc:
             raise ExternalServiceUnavailableError("Failed to mark outbox event published") from exc

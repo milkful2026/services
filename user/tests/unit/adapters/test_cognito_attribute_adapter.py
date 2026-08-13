@@ -38,16 +38,23 @@ def test_sync_profile_attributes_updates_existing_user(pool_with_default_pincode
         UserAttributes=[{"Name": "phone_number", "Value": "+919876543210"}],
         MessageAction="SUPPRESS",
     )
-    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")["UserAttributes"]
+    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")[
+        "UserAttributes"
+    ]
     cognito_sub = next(a["Value"] for a in user_attrs if a["Name"] == "sub")
 
     adapter = CognitoAttributeAdapter(user_pool_id=pool_id, region_name="ap-south-1")
     adapter.sync_profile_attributes(cognito_sub, "Priya Sharma", "560001")
 
-    updated_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")["UserAttributes"]
+    updated_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")[
+        "UserAttributes"
+    ]
     values = {a["Name"]: a["Value"] for a in updated_attrs}
     assert values["name"] == "Priya Sharma"
     assert values["custom:default_pincode"] == "560001"
+
+
+_FAKE_UUID_SUB = "11111111-2222-3333-4444-555555555555"
 
 
 def test_sync_profile_attributes_no_matching_user_is_a_noop(pool_with_default_pincode_attribute):
@@ -55,10 +62,12 @@ def test_sync_profile_attributes_no_matching_user_is_a_noop(pool_with_default_pi
         user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
     )
 
-    adapter.sync_profile_attributes("does-not-exist-sub", "Priya Sharma", "560001")  # must not raise
+    adapter.sync_profile_attributes(_FAKE_UUID_SUB, "Priya Sharma", "560001")  # must not raise
 
 
-def test_sync_profile_attributes_wraps_list_users_client_error(pool_with_default_pincode_attribute, monkeypatch):
+def test_sync_profile_attributes_wraps_list_users_client_error(
+    pool_with_default_pincode_attribute, monkeypatch
+):
     adapter = CognitoAttributeAdapter(
         user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
     )
@@ -69,7 +78,26 @@ def test_sync_profile_attributes_wraps_list_users_client_error(pool_with_default
     monkeypatch.setattr(adapter._client, "list_users", _raise)
 
     with pytest.raises(ExternalServiceUnavailableError):
-        adapter.sync_profile_attributes("sub-1", "Priya", "560001")
+        adapter.sync_profile_attributes(_FAKE_UUID_SUB, "Priya", "560001")
+
+
+def test_sync_profile_attributes_rejects_non_uuid_sub_without_querying_cognito(
+    pool_with_default_pincode_attribute, monkeypatch
+):
+    # A sub that could break out of the ListUsers Filter string (or is
+    # otherwise not the UUID shape Cognito always assigns) must be
+    # rejected outright, not interpolated into the filter.
+    adapter = CognitoAttributeAdapter(
+        user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
+    )
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("list_users must not be called for a non-UUID sub")
+
+    monkeypatch.setattr(adapter._client, "list_users", _fail_if_called)
+
+    with pytest.raises(ExternalServiceUnavailableError):
+        adapter.sync_profile_attributes('sub" OR "1"="1', "Priya", "560001")
 
 
 def test_moto_does_not_enforce_schema_for_undefined_custom_attributes(cognito_user_pool):
@@ -91,7 +119,9 @@ def test_moto_does_not_enforce_schema_for_undefined_custom_attributes(cognito_us
         UserAttributes=[{"Name": "phone_number", "Value": "+919876543210"}],
         MessageAction="SUPPRESS",
     )
-    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")["UserAttributes"]
+    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")[
+        "UserAttributes"
+    ]
     cognito_sub = next(a["Value"] for a in user_attrs if a["Name"] == "sub")
 
     adapter = CognitoAttributeAdapter(user_pool_id=pool_id, region_name="ap-south-1")
