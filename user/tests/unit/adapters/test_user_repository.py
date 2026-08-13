@@ -202,6 +202,43 @@ def test_get_by_cognito_sub_finds_registered_user(repository):
     assert found.is_new_user is False
 
 
+def test_get_profile_by_sub_returns_none_when_absent(repository):
+    assert repository.get_profile_by_sub("does-not-exist") is None
+
+
+def test_get_profile_by_sub_returns_profile_defaulting_to_b2c(repository):
+    registered = repository.register(
+        cognito_sub="sub-1",
+        mobile="+919876543210",
+        name="Priya Sharma",
+        email=None,
+        addresses=[_address()],
+        preferred_slot_id=None,
+        consents=_consents(),
+        outbox_event_type="UserRegistered",
+        outbox_payload={},
+    )
+
+    profile = repository.get_profile_by_sub("sub-1")
+
+    assert profile is not None
+    assert profile.user_id == registered.user_id
+    assert profile.name == "Priya Sharma"
+    assert profile.mobile == "+919876543210"
+    assert profile.account_type == "B2C"
+    assert profile.default_address_id == registered.default_address_id
+
+
+def test_get_profile_by_sub_fails_closed_on_db_error(repository, sqlite_engine, monkeypatch):
+    def _raise(*args, **kwargs):
+        raise OperationalError("connect", {}, Exception("db down"))
+
+    monkeypatch.setattr(sqlite_engine, "connect", _raise)
+
+    with pytest.raises(ExternalServiceUnavailableError):
+        repository.get_profile_by_sub("sub-1")
+
+
 def test_register_fails_closed_on_db_error(repository, sqlite_engine, monkeypatch):
     def _raise(*args, **kwargs):
         raise OperationalError("begin", {}, Exception("db down"))

@@ -3,7 +3,7 @@ only, never on SQLAlchemy/requests/boto3 directly."""
 
 from typing import Protocol
 
-from domain.models import Address, Consent, DeliverySlot, RegistrationResult
+from domain.models import Address, Consent, DeliverySlot, RegistrationResult, UserProfile
 
 
 class UserRepositoryPort(Protocol):
@@ -13,6 +13,11 @@ class UserRepositoryPort(Protocol):
         """Cheap indexed read, no transaction. Returns None if no user
         exists yet for this cognito_sub — callers use this to short-circuit
         a duplicate registration before ever calling register()."""
+        ...
+
+    def get_profile_by_sub(self, cognito_sub: str) -> UserProfile | None:
+        """Spec MA-107 FR-2 — resolved by the JWT `sub` claim only. None
+        if no matching row (caller maps this to 404, not 500)."""
         ...
 
     def register(

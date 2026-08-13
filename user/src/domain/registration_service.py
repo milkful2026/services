@@ -19,8 +19,20 @@ from adapters.interfaces import (
     InventoryClientPort,
     UserRepositoryPort,
 )
-from domain.exceptions import ExternalServiceUnavailableError, NotServiceableError, ValidationError
-from domain.models import Address, Consent, DeliverySlot, RegistrationRequest, RegistrationResult
+from domain.exceptions import (
+    ExternalServiceUnavailableError,
+    NotServiceableError,
+    UserNotFoundError,
+    ValidationError,
+)
+from domain.models import (
+    Address,
+    Consent,
+    DeliverySlot,
+    RegistrationRequest,
+    RegistrationResult,
+    UserProfile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +130,12 @@ class RegistrationService:
 
     def get_delivery_slots(self, zone_id: str) -> list[DeliverySlot]:
         return self._user_repository.get_delivery_slots(zone_id)
+
+    def get_my_profile(self, cognito_sub: str) -> UserProfile:
+        profile = self._user_repository.get_profile_by_sub(cognito_sub)
+        if profile is None:
+            raise UserNotFoundError("No profile found for this account")
+        return profile
 
 
 def _validate(request: RegistrationRequest) -> None:

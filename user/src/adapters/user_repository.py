@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -30,7 +31,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from adapters.retry import call_with_retry
 from domain.exceptions import ExternalServiceUnavailableError
-from domain.models import Address, Consent, DeliverySlot, RegistrationResult
+from domain.models import Address, Consent, DeliverySlot, RegistrationResult, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,10 @@ users_table = Table(
     Column("mobile", String(20), nullable=False),
     Column("email", String(255), nullable=True),
     Column("preferred_slot_id", String(64), nullable=True),
+    # Added by migrations/0002_add_account_type.sql — spec MA-107 FR-1.
+    # No write path sets "B2B" yet; register() always inserts "B2C".
+    Column("account_type", String(16), nullable=False, default="B2C"),
+    CheckConstraint("account_type IN ('B2C', 'B2B')", name="ck_users_account_type"),
 )
 
 addresses_table = Table(
@@ -142,6 +147,37 @@ class SqlAlchemyUserRepository:
             user_id=existing.id,
             default_address_id=default_row.id if default_row else "",
             is_new_user=False,
+        )
+
+    def get_profile_by_sub(self, cognito_sub: str) -> UserProfile | None:
+        """Spec MA-107 FR-2 — resolved by the JWT `sub` claim only, never
+        a client-supplied ID (services/README.md §5b)."""
+        try:
+            with self._engine.connect() as conn:
+                user_row = conn.execute(
+                    select(users_table).where(users_table.c.cognito_sub == cognito_sub)
+                ).fetchone()
+                if user_row is None:
+                    return None
+                default_row = conn.execute(
+                    select(addresses_table).where(
+                        addresses_table.c.user_id == user_row.id,
+                        addresses_table.c.is_default.is_(True),
+                    )
+                ).fetchone()
+        except SQLAlchemyError as exc:
+            logger.error(
+                "user_repository.get_profile_by_sub failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise ExternalServiceUnavailableError("Failed to load profile") from exc
+
+        return UserProfile(
+            user_id=user_row.id,
+            name=user_row.name,
+            mobile=user_row.mobile,
+            account_type=user_row.account_type,
+            default_address_id=default_row.id if default_row else "",
         )
 
     def register(
