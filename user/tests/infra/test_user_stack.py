@@ -28,7 +28,7 @@ def template() -> Template:
     return Template.from_stack(stack)
 
 
-def test_three_lambdas_exist_for_the_three_handlers(template):
+def test_four_lambdas_exist_for_the_four_handlers(template):
     functions = template.find_resources("AWS::Lambda::Function")
     handlers = {
         props["Properties"].get("Handler")
@@ -39,6 +39,7 @@ def test_three_lambdas_exist_for_the_three_handlers(template):
         "handlers.register_handler.handler",
         "handlers.delivery_slots_handler.handler",
         "handlers.outbox_publisher_handler.handler",
+        "handlers.get_me_handler.handler",
     }
 
 
@@ -49,14 +50,14 @@ def test_aurora_serverless_v2_cluster(template):
     )
 
 
-def test_both_routes_have_jwt_authorizer_attached(template):
+def test_all_three_routes_have_jwt_authorizer_attached(template):
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 2
+    assert len(routes) == 3
     for props in routes.values():
         assert props["Properties"].get("AuthorizerId") is not None
 
     route_keys = {props["Properties"]["RouteKey"] for props in routes.values()}
-    assert route_keys == {"POST /users/register", "GET /delivery/slots"}
+    assert route_keys == {"POST /users/register", "GET /delivery/slots", "GET /users/me"}
 
 
 def test_jwt_authorizer_references_cognito_issuer(template):
