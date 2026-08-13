@@ -36,6 +36,18 @@ class UserExistsError(IdentityAuthError):
         super().__init__(message, details={"redirect": "login"})
 
 
+class UserNotFoundError(IdentityAuthError):
+    """No Cognito user (or none phone_number_verified) for a login OTP
+    send — client should redirect to signup, the mirror-image of
+    UserExistsError's redirect-to-login."""
+
+    error_code = "USER_NOT_FOUND"
+    http_status = 404
+
+    def __init__(self, message: str = "No verified account for this mobile number") -> None:
+        super().__init__(message, details={"redirect": "signup"})
+
+
 class OtpRequestNotFoundError(IdentityAuthError):
     error_code = "OTP_REQUEST_NOT_FOUND"
     http_status = 400

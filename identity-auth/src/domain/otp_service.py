@@ -22,6 +22,17 @@ from domain.exceptions import (
 )
 from domain.models import OtpRecord, OtpStatus
 
+# Distinct prefixes per spec MA-21 FR-1: a user mid-registration and a
+# user attempting login on the same mobile must not exhaust each other's
+# rate-limit/lock budget. Unknown purposes fall back to the REGISTER
+# prefix rather than raising — this mirrors the DynamoDB record's own
+# "absence of purpose == REGISTER" back-compat default.
+_KEY_PREFIXES = {"REGISTER": "register:otp:", "LOGIN": "login:otp:"}
+
+
+def _key_prefix(purpose: str) -> str:
+    return _KEY_PREFIXES.get(purpose, _KEY_PREFIXES["REGISTER"])
+
 
 class OtpService:
     def __init__(
@@ -58,7 +69,7 @@ class OtpService:
         if self._send_lock is None:
             return self._request_otp_locked(mobile, purpose)
 
-        lock_key = f"register:otp:lock:{mobile}"
+        lock_key = f"{_key_prefix(purpose)}lock:{mobile}"
         if not self._send_lock.acquire(lock_key, self._send_lock_ttl_seconds):
             # Another request for this mobile is already inside the
             # check-then-act section below — without this, both could see
@@ -72,7 +83,7 @@ class OtpService:
             self._send_lock.release(lock_key)
 
     def _request_otp_locked(self, mobile: str, purpose: str) -> tuple[OtpRecord, str, bool]:
-        existing = self._otp_store.get_active_by_mobile(mobile)
+        existing = self._otp_store.get_active_by_mobile(mobile, purpose)
         now = int(time.time())
 
         if existing is not None and existing.ttl > now:
@@ -85,7 +96,7 @@ class OtpService:
         # Fresh send, or a resend after cooldown elapsed. Rate limit is
         # checked here, not on every duplicate-send lookup, so cooldown
         # polling doesn't itself burn rate-limit budget.
-        rate_limit_key = f"register:otp:{mobile}"
+        rate_limit_key = f"{_key_prefix(purpose)}{mobile}"
         self._rate_limiter.check_and_increment(
             rate_limit_key, self._rate_limit_max_requests, self._rate_limit_window_seconds
         )

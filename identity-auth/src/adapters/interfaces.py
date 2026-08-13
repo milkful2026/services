@@ -13,7 +13,11 @@ from domain.models import OtpRecord, TokenBundle
 class OtpStorePort(Protocol):
     def put(self, record: OtpRecord) -> None: ...
     def get(self, request_id: str) -> OtpRecord | None: ...
-    def get_active_by_mobile(self, mobile: str) -> OtpRecord | None: ...
+    def get_active_by_mobile(self, mobile: str, purpose: str) -> OtpRecord | None:
+        """Scoped by purpose ("REGISTER" | "LOGIN") — a mobile with an
+        active registration OTP and a login attempt for that same mobile
+        must never be conflated into one "duplicate send" (spec MA-21)."""
+        ...
     def increment_attempts(self, request_id: str) -> int: ...
     def mark_status(self, request_id: str, status: str) -> None: ...
 
@@ -64,6 +68,11 @@ class CognitoPort(Protocol):
 
     def refresh_tokens(self, refresh_token: str) -> TokenBundle: ...
 
+    def revoke_token(self, refresh_token: str) -> None:
+        """Per-device logout (spec MA-21 FR-3) — revokes only the given
+        refresh token, never every session for the user."""
+        ...
+
 
 class SocialTokenVerifierPort(Protocol):
     def verify(self, provider: str, id_token: str) -> dict:
@@ -72,4 +81,9 @@ class SocialTokenVerifierPort(Protocol):
 
 
 class EventPublisherPort(Protocol):
-    def publish_otp_requested(self, mobile: str, otp: str, correlation_id: str) -> None: ...
+    def publish_otp_requested(
+        self, mobile: str, otp: str, correlation_id: str, purpose: str = "REGISTER"
+    ) -> None:
+        """`purpose` selects the SMS template (spec MA-21 FR-1:
+        template: "login" vs the registration default)."""
+        ...

@@ -23,6 +23,7 @@ from domain.exceptions import (
     ExternalServiceUnavailableError,
     InvalidRefreshTokenError,
     SocialAccountConflictError,
+    ValidationError,
 )
 from domain.models import TokenBundle
 
@@ -249,3 +250,23 @@ class CognitoAdapter:
             id_token=result["IdToken"],
             expires_in=result["ExpiresIn"],
         )
+
+    def revoke_token(self, refresh_token: str) -> None:
+        """Revokes only the given refresh token (per-device logout) —
+        never AdminUserGlobalSignOut, which would end every session and
+        violate the "concurrent sessions allowed" product decision (spec
+        MA-21 FR-3). Per that same FR, logout must not fail closed: an
+        already-revoked/expired token, or any other Cognito-side error
+        revoking it, still results in a 204 to the client — only a
+        genuinely malformed token is a real client error (400).
+        """
+        try:
+            self._client.revoke_token(Token=refresh_token, ClientId=self._client_id)
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            if error_code == "InvalidParameterException":
+                raise ValidationError("Malformed refresh token") from exc
+            logger.warning(
+                "cognito_adapter.revoke_token non-fatal error (logout still succeeds)",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )

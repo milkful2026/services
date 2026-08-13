@@ -29,9 +29,9 @@ class FakeOtpStore:
     def get(self, request_id: str) -> OtpRecord | None:
         return self.records.get(request_id)
 
-    def get_active_by_mobile(self, mobile: str) -> OtpRecord | None:
+    def get_active_by_mobile(self, mobile: str, purpose: str) -> OtpRecord | None:
         for r in self.records.values():
-            if r.mobile == mobile and r.status == OtpStatus.ACTIVE:
+            if r.mobile == mobile and r.status == OtpStatus.ACTIVE and r.purpose == purpose:
                 return r
         return None
 
@@ -90,6 +90,32 @@ def test_request_otp_generates_six_digit_code_and_hashes_it(service, store):
 def test_request_otp_uses_rate_limit_key_scoped_to_registration(service, limiter):
     service.request_otp("+919876543210")
     assert limiter.calls == ["register:otp:+919876543210"]
+
+
+def test_request_otp_login_purpose_uses_isolated_rate_limit_key(service, limiter):
+    service.request_otp("+919876543210", purpose="LOGIN")
+    assert limiter.calls == ["login:otp:+919876543210"]
+
+
+def test_request_otp_login_and_register_counters_are_independent(store, limiter):
+    service = OtpService(otp_store=store, rate_limiter=limiter)
+
+    # Same mobile, both purposes — a user mid-registration and a login
+    # attempt on the same number must not share rate-limit budget (spec
+    # MA-21 FR-1). Each purpose gets its own ACTIVE record too, since
+    # get_active_by_mobile's caller-side gating (find_verified_sub_by_phone)
+    # means the two flows are mutually exclusive for a given mobile in
+    # practice, but the rate-limit key isolation is what this test checks.
+    service.request_otp("+919876543210", purpose="REGISTER")
+    service.request_otp("+919876543210", purpose="LOGIN")
+
+    assert limiter.calls == ["register:otp:+919876543210", "login:otp:+919876543210"]
+
+
+def test_request_otp_login_purpose_persists_on_the_record(service, store):
+    record, _, _ = service.request_otp("+919876543210", purpose="LOGIN")
+
+    assert store.records[record.request_id].purpose == "LOGIN"
 
 
 def test_request_otp_within_resend_cooldown_returns_same_request_and_skips_rate_limit(
@@ -256,3 +282,12 @@ def test_request_otp_raises_when_lock_already_held(store, limiter):
 
     # A rejected concurrent request must not have consumed rate-limit budget.
     assert limiter.calls == []
+
+
+def test_request_otp_login_purpose_uses_isolated_lock_key(store, limiter):
+    lock = FakeLock()
+    service = OtpService(otp_store=store, rate_limiter=limiter, send_lock=lock)
+
+    service.request_otp("+919876543210", purpose="LOGIN")
+
+    assert lock.acquire_calls == ["login:otp:lock:+919876543210"]
