@@ -97,6 +97,8 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
 | `apply_migrations.py` | Runs each service's real `migrations/*.sql` against its local Postgres database, tracked in a `schema_migrations` table so re-runs only apply new files. |
 | `seed_inventory_zones.py` | Inserts one serviceability zone (pincode prefix `5600`) directly via SQL — there's no admin/write API for zones (MA-95 is read-only), so this is the only local option. Upserts, safe to re-run. |
 | `seed_user_zone_slots.py` | Inserts matching delivery slots into User Service's own `zone_slots` table (same `blr-central` zone id as above) — a separate table from Inventory's, not synced to it in any environment (see `user/README.md`'s flagged decision #1). Upserts, safe to re-run. |
+| `_db.py` | Shared local-Postgres connection settings/helper used by `seed_inventory_zones.py` and `seed_user_zone_slots.py`, plus a friendly-error wrapper for "Postgres isn't up yet" / "migrations haven't been applied yet". |
+| `_zone_seed_data.py` | Shared zone/slot fixture data used by `seed_inventory_zones.py` and `seed_user_zone_slots.py`, so the two independently-seeded tables can't drift out of sync with each other. |
 | `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. |
 | `peek_otp.py` | Local-only OTP visibility, since there's no real SMS provider to read the code from. |
 | `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's `main.py` carries a small inline duplicate since `local-dev/` isn't shipped in its container image. |
@@ -131,5 +133,7 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
   `curl --max-time`.
 - **Inventory's own local run (and `seed_inventory_zones.py`/`seed_user_zone_slots.py`) hasn't
   been exercised against a live Postgres container** — same root cause as the Docker-availability
-  gap above. Both seed scripts' SQL was written against the real, already-tested migration
-  schemas, but neither was run against an actual Postgres instance in this sandbox.
+  gap above. Both seed scripts' SQL was written against the real, already-tested
+  `inventory/migrations/0001_serviceability_zones.sql` and
+  `user/migrations/0001_users_addresses_consents.sql` schemas, but neither was run against an
+  actual Postgres instance in this sandbox.
