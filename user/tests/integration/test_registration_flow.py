@@ -78,12 +78,41 @@ _VALID_BODY = {
 }
 
 
-def _event(body: dict, sub="sub-1", mobile="+919876543210") -> dict:
+def _event(body: dict, sub: str) -> dict:
     return {
         "body": json.dumps(body),
         "headers": {"x-request-id": "corr-1"},
-        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": sub, "phone_number": mobile}}}},
+        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": sub}}}},
     }
+
+
+def _register_cognito_user(cognito_user_pool: dict, mobile: str = "+919876543210") -> tuple[str, str]:
+    # register_handler no longer trusts a phone_number JWT claim (access
+    # tokens never carry one — see cognito_attribute_adapter.py's module
+    # docstring); it resolves mobile server-side via Cognito instead, so
+    # these tests need a real Cognito user (and its real, moto-assigned
+    # sub) for that lookup to find anything.
+    #
+    # Returns (sub, resolved_mobile) rather than assuming resolved_mobile
+    # == mobile: moto has its own fidelity gap here (documented in
+    # test_cognito_attribute_adapter.py) where it always assigns a random
+    # UUID as Username instead of honoring UsernameAttributes=
+    # ["phone_number"] the way real Cognito does, so under moto
+    # get_mobile_by_sub actually resolves to that UUID, not the phone
+    # number passed to admin_create_user. Capturing the real, moto-actual
+    # Username here keeps this test asserting ground truth instead of a
+    # value moto can't actually produce.
+    client = cognito_user_pool["client"]
+    pool_id = cognito_user_pool["pool_id"]
+    client.admin_create_user(
+        UserPoolId=pool_id,
+        Username=mobile,
+        UserAttributes=[{"Name": "phone_number", "Value": mobile}],
+        MessageAction="SUPPRESS",
+    )
+    user = client.admin_get_user(UserPoolId=pool_id, Username=mobile)
+    sub = next(a["Value"] for a in user["UserAttributes"] if a["Name"] == "sub")
+    return sub, user["Username"]
 
 
 def _mock_inventory_serviceable(serviceable: bool = True) -> None:
@@ -95,10 +124,11 @@ def _mock_inventory_serviceable(serviceable: bool = True) -> None:
 
 
 @responses_lib.activate
-def test_full_registration_happy_path_and_outbox_publish(wired_env):
+def test_full_registration_happy_path_and_outbox_publish(wired_env, cognito_user_pool):
     _mock_inventory_serviceable(True)
+    sub, _ = _register_cognito_user(cognito_user_pool)
 
-    response = register_handler.handler(_event(_VALID_BODY), None)
+    response = register_handler.handler(_event(_VALID_BODY, sub=sub), None)
 
     assert response["statusCode"] == 201
     data = json.loads(response["body"])["data"]
@@ -115,12 +145,13 @@ def test_full_registration_happy_path_and_outbox_publish(wired_env):
 
 
 @responses_lib.activate
-def test_duplicate_registration_is_idempotent(wired_env):
+def test_duplicate_registration_is_idempotent(wired_env, cognito_user_pool):
     _mock_inventory_serviceable(True)
     _mock_inventory_serviceable(True)
+    sub, _ = _register_cognito_user(cognito_user_pool)
 
-    first = register_handler.handler(_event(_VALID_BODY), None)
-    second = register_handler.handler(_event(_VALID_BODY), None)
+    first = register_handler.handler(_event(_VALID_BODY, sub=sub), None)
+    second = register_handler.handler(_event(_VALID_BODY, sub=sub), None)
 
     assert first["statusCode"] == 201
     assert second["statusCode"] == 200
@@ -134,10 +165,11 @@ def test_duplicate_registration_is_idempotent(wired_env):
 
 
 @responses_lib.activate
-def test_non_serviceable_address_returns_422_and_writes_nothing(wired_env):
+def test_non_serviceable_address_returns_422_and_writes_nothing(wired_env, cognito_user_pool):
     _mock_inventory_serviceable(False)
+    sub, _ = _register_cognito_user(cognito_user_pool)
 
-    response = register_handler.handler(_event(_VALID_BODY), None)
+    response = register_handler.handler(_event(_VALID_BODY, sub=sub), None)
 
     assert response["statusCode"] == 422
     assert wired_env.get_unpublished_outbox_events(limit=10) == []
@@ -168,18 +200,23 @@ def _get_me_event(sub: str) -> dict:
 
 
 @responses_lib.activate
-def test_get_me_after_registration_returns_b2c_profile(wired_env):
+def test_get_me_after_registration_returns_b2c_profile(wired_env, cognito_user_pool):
     _mock_inventory_serviceable(True)
-    register_response = register_handler.handler(_event(_VALID_BODY, sub="sub-me-1"), None)
+    sub, resolved_mobile = _register_cognito_user(cognito_user_pool)
+    register_response = register_handler.handler(_event(_VALID_BODY, sub=sub), None)
     user_id = json.loads(register_response["body"])["data"]["userId"]
 
-    response = get_me_handler.handler(_get_me_event("sub-me-1"), None)
+    response = get_me_handler.handler(_get_me_event(sub), None)
 
     assert response["statusCode"] == 200
     data = json.loads(response["body"])["data"]
     assert data["userId"] == user_id
     assert data["name"] == "Priya Sharma"
-    assert data["mobile"] == "+919876543210"
+    # Not asserted against the literal "+919876543210" passed to
+    # _register_cognito_user — see that helper's docstring for why (moto
+    # fidelity gap: Username, which get_mobile_by_sub reads as "mobile",
+    # is never actually set to the phone number under moto).
+    assert data["mobile"] == resolved_mobile
     assert data["accountType"] == "B2C"
     assert data["defaultAddressId"]
 

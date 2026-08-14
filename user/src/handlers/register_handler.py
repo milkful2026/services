@@ -1,10 +1,19 @@
 """POST /users/register — thin Lambda entrypoint (FR-1).
 
-`sub` and `mobile` are extracted from the API Gateway HTTP API JWT
-authorizer's verified claims (`requestContext.authorizer.jwt.claims`),
-never trusted from the request body — per spec §5b and the spec's own
-explicit requirement that the registering user's identity comes from the
-verified JWT claim.
+`sub` is extracted from the API Gateway HTTP API JWT authorizer's
+verified claims (`requestContext.authorizer.jwt.claims`), never trusted
+from the request body — per spec §5b and the spec's own explicit
+requirement that the registering user's identity comes from the verified
+JWT claim.
+
+`mobile` is *not* read from a JWT claim (a `phone_number` claim, which
+the original implementation relied on, since spec §FR-1 explicitly
+authorizes this endpoint with a Cognito *access* token, and access tokens
+never carry profile attributes — only ID tokens do). It's instead
+resolved server-side from Cognito via `sub`
+(`registration_service.resolve_mobile`) — see
+adapters/cognito_attribute_adapter.py's module docstring for the full
+story of why.
 """
 
 import json
@@ -47,8 +56,7 @@ def handler(event: dict, context) -> dict:
 
     claims = extract_jwt_claims(event)
     cognito_sub = claims.get("sub")
-    mobile = claims.get("phone_number")
-    if not cognito_sub or not mobile:
+    if not cognito_sub:
         return validation_error_response("Missing or invalid JWT claims")
 
     try:
@@ -57,9 +65,9 @@ def handler(event: dict, context) -> dict:
     except (json.JSONDecodeError, PydanticValidationError) as exc:
         return validation_error_response(str(exc))
 
-    domain_request = request_dto.to_domain(cognito_sub, mobile)
-
     try:
+        mobile = deps["registration_service"].resolve_mobile(cognito_sub)
+        domain_request = request_dto.to_domain(cognito_sub, mobile)
         result = deps["registration_service"].register(domain_request)
         status_code = 201 if result.is_new_user else 200
         return success_response(serialize_registration_result(result), status_code=status_code)

@@ -48,7 +48,11 @@ def _generate_password(length: int = 32) -> str:
 
 class CognitoAdapter:
     def __init__(
-        self, user_pool_id: str, client_id: str, region_name: str, correlation_id: str = ""
+        self,
+        user_pool_id: str,
+        client_id: str,
+        region_name: str,
+        correlation_id: str = "",
     ) -> None:
         self._client = boto3.client("cognito-idp", region_name=region_name)
         self._user_pool_id = user_pool_id
