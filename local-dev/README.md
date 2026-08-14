@@ -27,6 +27,9 @@ python bootstrap.py               # creates Cognito pool/client, DynamoDB table,
                                    # writes identity-auth/.env.local, user/.env.local,
                                    # inventory/.env.local (gitignored, regenerated every run)
 python apply_migrations.py        # applies each service's real migrations/*.sql to Postgres
+python seed_inventory_zones.py    # seeds one zone (pincode 560001) — no admin API exists for
+                                   # this, so without it every registration call gets rejected
+                                   # as not-serviceable
 ```
 
 `bootstrap.py` and `apply_migrations.py` are safe to re-run. `docker compose down -v` clears
@@ -88,6 +91,7 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
 | `docker-compose.yml` | `moto_server` (all of Cognito/DynamoDB/SQS/EventBridge on one port), `postgres` (two databases, `milkful_user` + `milkful_inventory`, via `init-databases.sql`), `redis` |
 | `bootstrap.py` | Creates the Cognito pool/client, `otp_requests` DynamoDB table, `zone-updated`(+DLQ) and `otp-requested-debug` SQS queues, and the EventBridge rules routing to them — the direct-boto3 equivalent of what `cdk deploy` provisions for real. Writes each service's `.env.local`. |
 | `apply_migrations.py` | Runs each service's real `migrations/*.sql` against its local Postgres database, tracked in a `schema_migrations` table so re-runs only apply new files. |
+| `seed_inventory_zones.py` | Inserts one serviceability zone (pincode prefix `5600`) directly via SQL — there's no admin/write API for zones (MA-95 is read-only), so this is the only local option. Upserts, safe to re-run. |
 | `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. |
 | `peek_otp.py` | Local-only OTP visibility, since there's no real SMS provider to read the code from. |
 | `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's `main.py` carries a small inline duplicate since `local-dev/` isn't shipped in its container image. |
@@ -120,7 +124,7 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
   it with several curl calls back-to-back) it can be slow enough to trip a short client timeout.
   Not a bug in this tooling; give it a few seconds between rapid-fire manual requests, or raise
   `curl --max-time`.
-- **Inventory's own local run isn't yet exercised end-to-end here** (no serviceability zones
-  seeded) — `apply_migrations.py` creates the schema, but nothing seeds `serviceability_zones`,
-  so User Service's registration call to Inventory will get a 404/empty result until some rows
-  exist. Manual `INSERT` or a seed script is a natural next step, not done here.
+- **Inventory's own local run (and `seed_inventory_zones.py`) hasn't been exercised against a
+  live Postgres container** — same root cause as the Docker-availability gap above. The seed
+  script's SQL was written against the real, already-tested `migrations/0001_serviceability_zones.sql`
+  schema, but wasn't run against an actual Postgres instance in this sandbox.
