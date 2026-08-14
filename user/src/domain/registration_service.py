@@ -62,6 +62,18 @@ class RegistrationService:
         self._inventory_client.set_correlation_id(correlation_id)
         self._cognito_attributes.set_correlation_id(correlation_id)
 
+    def resolve_mobile(self, cognito_sub: str) -> str:
+        """Server-side lookup, not a JWT claim — see
+        cognito_attribute_adapter.py's module docstring for why: the spec
+        authorizes /users/register with a Cognito access token, and
+        access tokens never carry phone_number."""
+        mobile = self._cognito_attributes.get_mobile_by_sub(cognito_sub)
+        if mobile is None:
+            raise ExternalServiceUnavailableError(
+                "Could not resolve this account's mobile number"
+            )
+        return mobile
+
     def register(self, request: RegistrationRequest) -> RegistrationResult:
         _validate(request)
         default_address = _default_address(request.addresses)

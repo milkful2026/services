@@ -60,8 +60,7 @@ curl -X POST localhost:8001/v1/auth/otp/verify \
   -d '{"mobile": "+919876543210", "otp": "<code>", "requestId": "<from send response>"}'
 # -> accessToken, refreshToken, isNewUser: true
 
-# 2. Call User Service's register endpoint (needs a Bearer token carrying a phone_number
-#    claim — see "Known gaps" below for why accessToken doesn't currently work here)
+# 2. Call User Service's register endpoint
 curl -X POST localhost:8002/users/register -H "Authorization: Bearer <accessToken>" -d '{...}'
 
 # 3. Log in again later
@@ -71,7 +70,7 @@ curl -X POST localhost:8001/v1/auth/login/otp/verify \
   -d '{"mobile": "+919876543210", "otp": "<code>", "requestId": "<from send response>"}'
 # -> accessToken, refreshToken (no isNewUser)
 
-curl localhost:8002/users/me -H "Authorization: Bearer <accessToken>"   # same gap as step 2
+curl localhost:8002/users/me -H "Authorization: Bearer <accessToken>"
 
 # 4. Log out
 curl -X POST localhost:8001/v1/auth/logout -H "Authorization: Bearer <accessToken>" \
@@ -91,8 +90,8 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
 | `apply_migrations.py` | Runs each service's real `migrations/*.sql` against its local Postgres database, tracked in a `schema_migrations` table so re-runs only apply new files. |
 | `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. |
 | `peek_otp.py` | Local-only OTP visibility, since there's no real SMS provider to read the code from. |
-| `config/env.py`'s `env_file` | Each service's `Settings` now also reads a local `.env.local` (via `pydantic-settings`' `env_file`) if one exists — silently ignored when absent, so deployed environments (which never have this file) are unaffected. |
-| `aws_endpoint_url` | New optional setting on all three services; threaded into every `boto3.client(...)`/`boto3.resource(...)` call. `None` (the default, and the only value ever set in a real deployment) means "use real AWS"; `bootstrap.py` sets it to `http://localhost:5000` in the generated `.env.local` files. |
+| `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's `main.py` carries a small inline duplicate since `local-dev/` isn't shipped in its container image. |
+| `AWS_ENDPOINT_URL` | The standard, unprefixed env var botocore already reads natively — no application code needed. `bootstrap.py` writes it into each generated `.env.local`, pointing at `http://localhost:5000`; unset in every real deployment, so behavior there is unaffected. |
 
 ## Known gaps
 
@@ -107,17 +106,16 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
   the `Authorization: Bearer` header via PyJWT's `verify_signature=False` mode, without checking
   its signature — real API Gateway's Cognito JWT authorizer verifies it first. Fine for a
   developer's own machine; this must never be treated as equivalent to the real authorizer.
-- **`/users/register` and `/users/me` need a `phone_number` claim that `accessToken` doesn't
-  carry.** identity-auth's `/v1/auth/otp/verify` and `/v1/auth/login/otp/verify` only ever return
-  `accessToken`/`refreshToken` (never `idToken` — an existing, deliberate spec decision: "idToken
-  is available on the TokenBundle but intentionally not added to the response since the spec
-  doesn't ask for it"). Cognito access tokens never carry custom/profile attributes regardless of
-  pool config, so following steps 2 and 5 above exactly as written gets a 400
-  `Missing or invalid JWT claims` from User Service. This wasn't caught earlier because this half
-  of the flow was never exercised end-to-end before (see the Docker-availability gap above) — it's
-  a real gap in the identity-auth ↔ user-service contract, not just a docs error, and needs a
-  product/spec decision (return `idToken` too? have User Service accept either token type and
-  fall back to a GetUser call for `phone_number`?) rather than being silently decided here.
+- **moto doesn't honor `UsernameAttributes=["phone_number"]`.** Real Cognito, with this pool's
+  actual config, sets `Username` to the literal value passed to `AdminCreateUser` — identity-auth's
+  `cognito_adapter.py` and User Service's `cognito_attribute_adapter.get_mobile_by_sub` both
+  depend on this (Username *is* the mobile number). moto instead always assigns a random UUID as
+  Username (reusing it as `sub` too) regardless of `UsernameAttributes`. Practical effect locally:
+  `GET /users/me`'s `mobile` field (and anywhere else mobile is resolved via Cognito) will show
+  that UUID, not a real-looking phone number, when run against moto_server — cosmetic only, the
+  actual resolution logic is correct and verified against real Cognito's documented behavior (see
+  `user/tests/unit/adapters/test_cognito_attribute_adapter.py`, which stubs around this gap rather
+  than relying on moto to reproduce it).
 - **moto_server is a Flask dev server** — under rapid concurrent local testing (e.g. hammering
   it with several curl calls back-to-back) it can be slow enough to trip a short client timeout.
   Not a bug in this tooling; give it a few seconds between rapid-fire manual requests, or raise

@@ -3,21 +3,30 @@ import json
 import pytest
 
 import handlers.register_handler as register_handler
-from domain.exceptions import NotServiceableError, ValidationError
+from domain.exceptions import ExternalServiceUnavailableError, NotServiceableError, ValidationError
 from domain.models import RegistrationResult
 
 
 class FakeRegistrationService:
-    def __init__(self, result=None, raises=None):
+    def __init__(self, result=None, raises=None, mobile="+919876543210", resolve_mobile_raises=None):
         self.result = result or RegistrationResult(
             user_id="user-1", default_address_id="addr-1", is_new_user=True
         )
         self.raises = raises
+        self.mobile = mobile
+        self.resolve_mobile_raises = resolve_mobile_raises
         self.calls = []
+        self.resolve_mobile_calls = []
         self.correlation_id = ""
 
     def set_correlation_id(self, correlation_id: str) -> None:
         self.correlation_id = correlation_id
+
+    def resolve_mobile(self, cognito_sub: str) -> str:
+        self.resolve_mobile_calls.append(cognito_sub)
+        if self.resolve_mobile_raises:
+            raise self.resolve_mobile_raises
+        return self.mobile
 
     def register(self, request):
         self.calls.append(request)
@@ -33,8 +42,10 @@ def _reset_deps():
     register_handler._deps = None
 
 
-def _inject(result=None, raises=None):
-    service = FakeRegistrationService(result=result, raises=raises)
+def _inject(result=None, raises=None, mobile="+919876543210", resolve_mobile_raises=None):
+    service = FakeRegistrationService(
+        result=result, raises=raises, mobile=mobile, resolve_mobile_raises=resolve_mobile_raises
+    )
     register_handler._deps = {"registration_service": service}
     return service
 
@@ -60,11 +71,11 @@ _VALID_BODY = {
 }
 
 
-def _event(body: dict, sub: str = "sub-1", mobile: str = "+919876543210") -> dict:
+def _event(body: dict, sub: str = "sub-1") -> dict:
     return {
         "body": json.dumps(body),
         "headers": {"x-request-id": "corr-1"},
-        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": sub, "phone_number": mobile}}}},
+        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": sub}}}},
     }
 
 
@@ -108,14 +119,29 @@ def test_register_malformed_body_returns_400():
         {
             "body": "not json",
             "headers": {},
-            "requestContext": {
-                "authorizer": {"jwt": {"claims": {"sub": "s", "phone_number": "+91"}}}
-            },
+            "requestContext": {"authorizer": {"jwt": {"claims": {"sub": "s"}}}},
         },
         None,
     )
 
     assert response["statusCode"] == 400
+
+
+def test_register_mobile_resolution_failure_returns_503():
+    _inject(resolve_mobile_raises=ExternalServiceUnavailableError("cognito down"))
+
+    response = register_handler.handler(_event(_VALID_BODY), None)
+
+    assert response["statusCode"] == 503
+
+
+def test_register_resolves_mobile_via_cognito_before_calling_register():
+    service = _inject(mobile="+919876543210")
+
+    register_handler.handler(_event(_VALID_BODY, sub="sub-42"), None)
+
+    assert service.resolve_mobile_calls == ["sub-42"]
+    assert service.calls[0].mobile == "+919876543210"
 
 
 def test_register_not_serviceable_returns_422():

@@ -80,9 +80,11 @@ class FakeInventoryClient:
 
 
 class FakeCognitoAttributes:
-    def __init__(self, raises: Exception | None = None):
+    def __init__(self, raises: Exception | None = None, mobile: str | None = "+919876543210"):
         self.raises = raises
+        self.mobile = mobile
         self.calls: list[tuple] = []
+        self.mobile_lookup_calls: list[str] = []
         self.correlation_id = ""
 
     def set_correlation_id(self, correlation_id: str) -> None:
@@ -92,6 +94,10 @@ class FakeCognitoAttributes:
         self.calls.append((cognito_sub, name, default_pincode))
         if self.raises:
             raise self.raises
+
+    def get_mobile_by_sub(self, cognito_sub: str) -> str | None:
+        self.mobile_lookup_calls.append(cognito_sub)
+        return self.mobile
 
 
 def _valid_request(**overrides) -> RegistrationRequest:
@@ -137,6 +143,23 @@ def cognito():
 @pytest.fixture
 def service(repo, inventory, cognito):
     return RegistrationService(repo, inventory, cognito)
+
+
+def test_resolve_mobile_delegates_to_cognito_lookup(service, cognito):
+    cognito.mobile = "+919876543210"
+
+    mobile = service.resolve_mobile("sub-123")
+
+    assert mobile == "+919876543210"
+    assert cognito.mobile_lookup_calls == ["sub-123"]
+
+
+def test_resolve_mobile_raises_when_cognito_has_no_matching_user(repo, inventory):
+    cognito = FakeCognitoAttributes(mobile=None)
+    service = RegistrationService(repo, inventory, cognito)
+
+    with pytest.raises(ExternalServiceUnavailableError):
+        service.resolve_mobile("sub-123")
 
 
 def test_register_success_calls_inventory_repo_and_cognito_in_order(

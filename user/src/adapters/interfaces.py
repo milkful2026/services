@@ -72,6 +72,8 @@ class CognitoAttributePort(Protocol):
     def sync_profile_attributes(self, cognito_sub: str, name: str, default_pincode: str) -> None:
         ...
 
+    def get_mobile_by_sub(self, cognito_sub: str) -> str | None: ...
+
 
 class OutboxEventPublisherPort(Protocol):
     """Used only by the separate outbox_publisher_handler Lambda — never

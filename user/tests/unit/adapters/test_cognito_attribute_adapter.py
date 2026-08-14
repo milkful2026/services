@@ -57,6 +57,59 @@ def test_sync_profile_attributes_updates_existing_user(pool_with_default_pincode
 _FAKE_UUID_SUB = "11111111-2222-3333-4444-555555555555"
 
 
+def test_get_mobile_by_sub_returns_the_username(pool_with_default_pincode_attribute, monkeypatch):
+    # Can't demonstrate this against a real moto-created user (see
+    # test_moto_ignores_username_attributes_and_always_assigns_a_uuid
+    # below) — stubbed the same way
+    # test_sync_profile_attributes_wraps_list_users_client_error stubs
+    # list_users for scenarios moto's fidelity can't reach.
+    adapter = CognitoAttributeAdapter(
+        user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
+    )
+    monkeypatch.setattr(
+        adapter._client,
+        "list_users",
+        lambda **kwargs: {"Users": [{"Username": "+919876543210"}]},
+    )
+
+    assert adapter.get_mobile_by_sub(_FAKE_UUID_SUB) == "+919876543210"
+
+
+def test_moto_ignores_username_attributes_and_always_assigns_a_uuid(
+    pool_with_default_pincode_attribute,
+):
+    """Documents a moto fidelity gap discovered while adding
+    get_mobile_by_sub: real Cognito, with UsernameAttributes=
+    ["phone_number"] (this pool's actual config — see identity-auth's
+    cognito_adapter.py, whose whole design depends on Username literally
+    becoming the value passed to AdminCreateUser), sets Username to that
+    value. moto instead always assigns a random UUID as Username
+    (reusing the same UUID as `sub`) regardless of UsernameAttributes,
+    so a moto-created user can never demonstrate Username == mobile —
+    see the stubbed test above for how get_mobile_by_sub is actually
+    verified instead."""
+    client = pool_with_default_pincode_attribute["client"]
+    pool_id = pool_with_default_pincode_attribute["pool_id"]
+    client.admin_create_user(
+        UserPoolId=pool_id,
+        Username="+919876543210",
+        UserAttributes=[{"Name": "phone_number", "Value": "+919876543210"}],
+        MessageAction="SUPPRESS",
+    )
+
+    user = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")
+
+    assert user["Username"] != "+919876543210"
+
+
+def test_get_mobile_by_sub_returns_none_for_no_matching_user(pool_with_default_pincode_attribute):
+    adapter = CognitoAttributeAdapter(
+        user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
+    )
+
+    assert adapter.get_mobile_by_sub(_FAKE_UUID_SUB) is None
+
+
 def test_sync_profile_attributes_no_matching_user_is_a_noop(pool_with_default_pincode_attribute):
     adapter = CognitoAttributeAdapter(
         user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
