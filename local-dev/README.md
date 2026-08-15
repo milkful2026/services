@@ -113,6 +113,17 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
   the AWS-facing half is proven; the Postgres-backed half (User Service register/get_me,
   Inventory serviceability) is implemented the same way but wasn't exercised against a live
   Postgres container. Worth a real run-through on a machine with Docker Desktop actually running.
+- **`moto[server]` must be a recent version (>=5.2.2) if you're running it standalone instead of
+  via `docker compose`** (e.g. because Docker isn't available, same fallback used while building
+  and testing MA-21's login flow this session). `moto[server]==5.0.21` has a real bug where
+  `list_users` with *any* `Filter` — used by `find_verified_sub_by_phone` (identity-auth's login
+  gate) and `cognito_attribute_adapter`'s sub-lookup (User Service) — always returns empty, even
+  for users that demonstrably exist (confirmed via unfiltered `list_users`). This makes login
+  fail with a spurious `USER_NOT_FOUND` for an account that was just registered. Upgrading to
+  `moto[server]==5.2.2` fixed it outright — full register → login → logout verified working
+  end-to-end afterward. **Not a risk for the documented `docker compose up` path**, which already
+  pulls `motoserver/moto:latest`; this only bites a manual non-Docker fallback with a stale
+  cached install.
 - **JWT claims aren't verified, only decoded.** `_lambda_local_server.py` decodes whatever's in
   the `Authorization: Bearer` header via PyJWT's `verify_signature=False` mode, without checking
   its signature — real API Gateway's Cognito JWT authorizer verifies it first. Fine for a
