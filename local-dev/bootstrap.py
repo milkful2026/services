@@ -227,6 +227,34 @@ def bootstrap_sqs_and_eventbridge() -> str:
     return queue_url
 
 
+def bootstrap_stock_changed_queue() -> str:
+    """MA-116 FR-5 / MA-118 FR-6's agreed `StockChanged` contract — wired
+    the same way as `zone-updated` above (EventBridge -> per-consumer SQS
+    + DLQ). No real producer exists yet (Inventory's reserve/commit/
+    release, MA-118, is spec'd but not implemented) — this provisions
+    Catalog's consumer side of the contract now so it's provable via a
+    directly-published test event ahead of that landing."""
+    sqs = boto3.client("sqs", **_creds)
+    events = boto3.client("events", **_creds)
+
+    _dlq_url, dlq_arn = _get_or_create_queue(sqs, "stock-changed-dlq")
+    queue_url, queue_arn = _get_or_create_queue(
+        sqs,
+        "stock-changed",
+        Attributes={
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
+        },
+    )
+    _wire_rule(
+        events,
+        "StockChangedRule",
+        {"source": ["inventory"], "detail-type": ["inventory.stock.changed"]},
+        "stock-changed-target",
+        queue_arn,
+    )
+    return queue_url
+
+
 def _write_env_file(service_dir: str, values: dict[str, str]) -> None:
     path = _SERVICES_DIR / service_dir / ".env.local"
     lines = [f"{key}={value}" for key, value in values.items()]
@@ -238,6 +266,7 @@ def main() -> None:
     pool_id, client_id = bootstrap_cognito()
     table_name = bootstrap_dynamodb()
     queue_url = bootstrap_sqs_and_eventbridge()
+    stock_changed_queue_url = bootstrap_stock_changed_queue()
 
     # AWS_ENDPOINT_URL (unprefixed): the standard env var name botocore
     # itself reads natively — written once per service's .env.local so
@@ -283,6 +312,27 @@ def main() -> None:
             "INVENTORY_REDIS_PORT": str(REDIS_PORT),
             "INVENTORY_REDIS_USE_TLS": "false",
             "INVENTORY_ZONE_UPDATED_QUEUE_URL": queue_url,
+            # Local dev only — see handlers/app.py's comment. The Flutter
+            # web build runs on a different localhost port than this
+            # service, so the browser blocks every call as cross-origin
+            # without this. Read directly from os.environ there (not
+            # through config.env.Settings) to avoid forcing eager
+            # Settings validation at module-import time.
+            "INVENTORY_CORS_ALLOW_ALL": "true",
+        },
+    )
+    _write_env_file(
+        "catalog",
+        {
+            "CATALOG_DATABASE_URL": (
+                f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/milkful_catalog"
+            ),
+            "CATALOG_AWS_REGION": REGION,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "CATALOG_STOCK_CHANGED_QUEUE_URL": stock_changed_queue_url,
+            # Local dev only — see inventory's identical entry above for
+            # why (Flutter web's browser-origin CORS block).
+            "CATALOG_CORS_ALLOW_ALL": "true",
         },
     )
     print("\nDone. Next: python apply_migrations.py, then start each service.")
