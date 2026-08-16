@@ -19,6 +19,16 @@ class ProductNotFoundError(CatalogError):
     http_status = 404
 
 
+class InvalidRequestError(CatalogError):
+    """A malformed query param (unrecognized `sort`, non-numeric `price`
+    filter bound) — a 400, not a 500; kept distinct from ProductNotFoundError
+    since it means the request itself is wrong, not that it correctly
+    referred to something absent."""
+
+    error_code = "INVALID_REQUEST"
+    http_status = 400
+
+
 class ServiceUnavailableError(CatalogError):
     """DB unreachable — fail closed, matching Inventory's own NFR
     convention (never silently return an empty/stale list)."""

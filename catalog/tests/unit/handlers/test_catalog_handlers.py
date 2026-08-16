@@ -180,6 +180,26 @@ def test_search_with_no_params_passes_none_filters_and_sort(client):
     assert sort is None
 
 
+def test_search_invalid_sort_maps_to_400_with_error_envelope(client):
+    _override(FakeCatalogService())
+
+    response = client.get("/search", params={"sort": "bogus"})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["data"]["errorCode"] == "INVALID_REQUEST"
+
+
+def test_search_invalid_price_filter_maps_to_400_with_error_envelope(client):
+    _override(FakeCatalogService())
+
+    response = client.get("/search", params={"filters": "price:abc-100"})
+
+    assert response.status_code == 400
+    assert response.json()["data"]["errorCode"] == "INVALID_REQUEST"
+
+
 def test_healthz_ok(client):
     response = client.get("/healthz")
 

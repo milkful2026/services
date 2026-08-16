@@ -24,12 +24,14 @@ contract is proven ahead of that landing, not blocked on it.
 
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 
 import boto3
 from botocore.exceptions import ClientError
 
 from domain.catalog_service import CatalogService
+from domain.exceptions import CatalogError
+from domain.models import StockState
 
 logger = logging.getLogger(__name__)
 
@@ -83,19 +85,38 @@ class StockChangedConsumer:
             event_id = payload["eventId"]
             product_id = payload["productId"]
             stock_state = payload["stockState"]
+            if stock_state not in set(StockState):
+                raise ValueError(f"unknown stockState: {stock_state!r}")
             available_from_raw = payload.get("availableFrom")
             available_from = (
                 date.fromisoformat(available_from_raw) if available_from_raw else None
             )
+            occurred_at = datetime.fromisoformat(payload["occurredAt"])
             self._catalog_service.apply_stock_change(
                 product_id=product_id,
                 event_id=event_id,
                 stock_state=stock_state,
                 available_from=available_from,
+                occurred_at=occurred_at,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.error(
                 "stock_changed_consumer failed to process message — left for retry/DLQ",
+                extra={
+                    "correlationId": correlation_id,
+                    "messageId": message.get("MessageId"),
+                    "error": str(exc),
+                },
+            )
+            return
+        except CatalogError as exc:
+            # A transient failure applying the change (e.g. the DB blipped)
+            # — not a malformed message. Left in-queue for SQS's own
+            # redelivery/DLQ instead of re-raising, which would otherwise
+            # propagate through poll_once()'s loop and kill run_forever's
+            # background thread over what's often a momentary error.
+            logger.error(
+                "stock_changed_consumer failed to apply stock change — left for retry/DLQ",
                 extra={
                     "correlationId": correlation_id,
                     "messageId": message.get("MessageId"),

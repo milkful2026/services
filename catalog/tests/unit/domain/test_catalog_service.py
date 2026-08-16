@@ -30,8 +30,12 @@ class FakeProductRepository:
         self.search_calls.append((query, filters, sort))
         return self.search_results
 
-    def apply_stock_change(self, product_id, event_id, stock_state, available_from):
-        self.stock_change_calls.append((product_id, event_id, stock_state, available_from))
+    def apply_stock_change(
+        self, product_id, event_id, stock_state, available_from, occurred_at=None
+    ):
+        self.stock_change_calls.append(
+            (product_id, event_id, stock_state, available_from, occurred_at)
+        )
         return self.apply_stock_change_returns
 
 
@@ -104,4 +108,4 @@ def test_apply_stock_change_delegates_and_returns_repository_result():
     result = service.apply_stock_change("cow-milk", "evt-1", "OUT_OF_STOCK", None)
 
     assert result is False
-    assert repo.stock_change_calls == [("cow-milk", "evt-1", "OUT_OF_STOCK", None)]
+    assert repo.stock_change_calls == [("cow-milk", "evt-1", "OUT_OF_STOCK", None, None)]

@@ -1,6 +1,7 @@
 """Abstract adapter interfaces (Protocols). Domain code depends on these
 only, never on SQLAlchemy/boto3 directly."""
 
+from datetime import datetime
 from typing import Protocol
 
 from domain.models import Category, Product, SearchFilters, SortOrder
@@ -27,8 +28,11 @@ class ProductRepositoryPort(Protocol):
         event_id: str,
         stock_state: str,
         available_from,
+        occurred_at: datetime | None = None,
     ) -> bool:
         """Returns False (no-op) if `event_id` was already applied to this
-        product — MA-116 FR-5's idempotency guarantee against SQS
-        redelivery. Returns True if the update was actually applied."""
+        product, or if `occurred_at` is not after the last-applied event's
+        own timestamp (a stale, out-of-order redelivery) — MA-116 FR-5's
+        idempotency guarantee against SQS redelivery. Returns True if the
+        update was actually applied."""
         ...

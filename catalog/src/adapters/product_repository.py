@@ -19,11 +19,15 @@ either side depends on.
 """
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 
 from sqlalchemy import (
     Boolean,
     Column,
     Date,
+    DateTime,
     ForeignKey,
     Integer,
     MetaData,
@@ -32,6 +36,7 @@ from sqlalchemy import (
     Table,
     Text,
     and_,
+    func,
     or_,
     select,
 )
@@ -45,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 metadata = MetaData()
 
+# Column-for-column compatible with migrations/0001_products_categories.sql
+# and migrations/0002_stock_change_ordering.sql — see that file's own
+# header comment for why this must be kept in sync by hand.
 categories_table = Table(
     "categories",
     metadata,
@@ -52,6 +60,7 @@ categories_table = Table(
     Column("name", String(255), nullable=False),
     Column("icon_name", String(64), nullable=False),
     Column("sort_order", Integer, nullable=False, default=0),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
 products_table = Table(
@@ -72,6 +81,19 @@ products_table = Table(
     Column("stock_state", String(16), nullable=False, default=StockState.IN_STOCK.value),
     Column("available_from", Date, nullable=True),
     Column("last_stock_event_id", String(64), nullable=True),
+    # The StockChanged event's own `occurredAt` — lets apply_stock_change
+    # detect an out-of-order (but distinct-event-id) redelivery, which
+    # last_stock_event_id equality alone can't catch. Nullable since
+    # 0001's rows predate this column.
+    Column("last_stock_event_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    ),
 )
 
 
@@ -86,39 +108,45 @@ class SqlAlchemyProductRepository:
         self._engine = engine
         self._correlation_id = correlation_id
 
-    def get_categories(self) -> list[Category]:
+    @contextmanager
+    def _db_operation(self, operation: str, failure_message: str) -> Iterator[None]:
+        """Every DB-touching method wraps its query in this: same
+        log-then-translate-to-ServiceUnavailableError shape everywhere,
+        rather than five near-identical try/except blocks that could each
+        independently drift."""
         try:
+            yield
+        except SQLAlchemyError as exc:
+            logger.error(
+                f"product_repository.{operation} failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise ServiceUnavailableError(failure_message) from exc
+
+    def get_categories(self) -> list[Category]:
+        with self._db_operation("get_categories", "Failed to load categories"):
             with self._engine.connect() as conn:
                 rows = conn.execute(
                     select(categories_table).order_by(categories_table.c.sort_order)
                 ).fetchall()
-        except SQLAlchemyError as exc:
-            self._log_failure("get_categories", exc)
-            raise ServiceUnavailableError("Failed to load categories") from exc
         return [_row_to_category(row) for row in rows]
 
     def get_products(self, category_id: str) -> list[Product]:
-        try:
+        with self._db_operation("get_products", "Failed to load products"):
             with self._engine.connect() as conn:
                 rows = conn.execute(
                     select(products_table)
                     .where(products_table.c.category_id == category_id)
                     .order_by(products_table.c.name)
                 ).fetchall()
-        except SQLAlchemyError as exc:
-            self._log_failure("get_products", exc)
-            raise ServiceUnavailableError("Failed to load products") from exc
         return [_row_to_product(row) for row in rows]
 
     def get_product(self, product_id: str) -> Product | None:
-        try:
+        with self._db_operation("get_product", "Failed to load product"):
             with self._engine.connect() as conn:
                 row = conn.execute(
                     select(products_table).where(products_table.c.id == product_id)
                 ).fetchone()
-        except SQLAlchemyError as exc:
-            self._log_failure("get_product", exc)
-            raise ServiceUnavailableError("Failed to load product") from exc
         return None if row is None else _row_to_product(row)
 
     def search(
@@ -158,22 +186,13 @@ class SqlAlchemyProductRepository:
         elif sort == SortOrder.PRICE_DESC:
             stmt = stmt.order_by(products_table.c.price_b2c.desc())
         elif sort == SortOrder.NEWEST:
-            # No `created_at` in this table's Core definition (unused by
-            # any other query) — id is a uuid, not sortable by recency, so
-            # newest-first isn't actually derivable from this schema yet.
-            # Falls back to name order rather than a wrong-looking recency
-            # sort; flagged as a real gap, not silently ignored.
-            logger.warning("search: 'newest' sort requested but no recency column exists yet")
-            stmt = stmt.order_by(products_table.c.name)
+            stmt = stmt.order_by(products_table.c.created_at.desc())
         else:
             stmt = stmt.order_by(products_table.c.name)
 
-        try:
+        with self._db_operation("search", "Search failed"):
             with self._engine.connect() as conn:
                 rows = conn.execute(stmt).fetchall()
-        except SQLAlchemyError as exc:
-            self._log_failure("search", exc)
-            raise ServiceUnavailableError("Search failed") from exc
         return [_row_to_product(row) for row in rows]
 
     def apply_stock_change(
@@ -182,12 +201,15 @@ class SqlAlchemyProductRepository:
         event_id: str,
         stock_state: str,
         available_from,
+        occurred_at: datetime | None = None,
     ) -> bool:
-        try:
+        with self._db_operation("apply_stock_change", "Failed to apply stock change"):
             with self._engine.begin() as conn:
                 row = conn.execute(
                     select(
-                        products_table.c.id, products_table.c.last_stock_event_id
+                        products_table.c.id,
+                        products_table.c.last_stock_event_id,
+                        products_table.c.last_stock_event_at,
                     ).where(products_table.c.id == product_id)
                 ).fetchone()
                 if row is None:
@@ -202,6 +224,26 @@ class SqlAlchemyProductRepository:
                         extra={"correlationId": self._correlation_id, "eventId": event_id},
                     )
                     return False
+                # A *distinct* event_id can still be a stale, out-of-order
+                # redelivery (SQS gives no ordering guarantee) — event_id
+                # equality alone can't catch that, only occurredAt can.
+                # Both timestamps missing (e.g. old rows/events predating
+                # this column) falls through to applying it, matching the
+                # previous equality-only behavior.
+                if (
+                    occurred_at is not None
+                    and row.last_stock_event_at is not None
+                    and _as_aware_utc(occurred_at) <= _as_aware_utc(row.last_stock_event_at)
+                ):
+                    logger.info(
+                        "apply_stock_change: stale/out-of-order event, dropped",
+                        extra={
+                            "correlationId": self._correlation_id,
+                            "eventId": event_id,
+                            "productId": product_id,
+                        },
+                    )
+                    return False
                 conn.execute(
                     products_table.update()
                     .where(products_table.c.id == product_id)
@@ -209,18 +251,20 @@ class SqlAlchemyProductRepository:
                         stock_state=stock_state,
                         available_from=available_from,
                         last_stock_event_id=event_id,
+                        last_stock_event_at=occurred_at,
                     )
                 )
                 return True
-        except SQLAlchemyError as exc:
-            self._log_failure("apply_stock_change", exc)
-            raise ServiceUnavailableError("Failed to apply stock change") from exc
 
-    def _log_failure(self, operation: str, exc: Exception) -> None:
-        logger.error(
-            f"product_repository.{operation} failed",
-            extra={"correlationId": self._correlation_id, "error": str(exc)},
-        )
+
+def _as_aware_utc(value: datetime) -> datetime:
+    """SQLite (this repo's test double for Aurora — see this module's own
+    docstring) doesn't preserve tzinfo through a round trip even for
+    `DateTime(timezone=True)` columns, unlike real Postgres. Everything
+    this service ever writes here is UTC, so a naive value read back is
+    treated as UTC rather than left ambiguous — makes the comparison in
+    apply_stock_change work the same against either database."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _row_to_category(row) -> Category:

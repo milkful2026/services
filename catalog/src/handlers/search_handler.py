@@ -6,6 +6,7 @@ exact contract MA-115's mobile client builds via
 from fastapi import APIRouter, Depends, Query
 
 from domain.catalog_service import CatalogService
+from domain.exceptions import InvalidRequestError
 from domain.models import SearchFilters, SortOrder
 from handlers.dependencies import get_catalog_service
 from handlers.dto import serialize_product, success_envelope
@@ -54,7 +55,14 @@ def search(
     sort: str | None = Query(None),
     service: CatalogService = Depends(get_catalog_service),
 ):
-    parsed_filters = _parse_filters(filters) if filters else None
-    parsed_sort = SortOrder(sort) if sort else None
+    # Both raise a bare ValueError on a malformed value (bad `sort`, a
+    # non-numeric `price` bound) — translated into InvalidRequestError so
+    # app.py's CatalogError handler returns a clean 400 in the documented
+    # envelope instead of falling through to FastAPI's default bare 500.
+    try:
+        parsed_filters = _parse_filters(filters) if filters else None
+        parsed_sort = SortOrder(sort) if sort else None
+    except ValueError as exc:
+        raise InvalidRequestError(f"Invalid search query parameters: {exc}") from exc
     products = service.search(q, parsed_filters, parsed_sort)
     return success_envelope({"products": [serialize_product(p) for p in products]})

@@ -1,17 +1,26 @@
 import json
 import logging
+from datetime import UTC, datetime
 
 import pytest
 
 from adapters.stock_changed_consumer import StockChangedConsumer
+from domain.exceptions import ServiceUnavailableError
+
+_OCCURRED_AT = datetime(2026, 8, 16, 10, 0, 0, tzinfo=UTC)
 
 
 class FakeCatalogService:
     def __init__(self):
         self.calls: list[tuple] = []
+        self.raises: Exception | None = None
 
-    def apply_stock_change(self, product_id, event_id, stock_state, available_from):
-        self.calls.append((product_id, event_id, stock_state, available_from))
+    def apply_stock_change(
+        self, product_id, event_id, stock_state, available_from, occurred_at=None
+    ):
+        if self.raises is not None:
+            raise self.raises
+        self.calls.append((product_id, event_id, stock_state, available_from, occurred_at))
         return True
 
 
@@ -47,7 +56,7 @@ def test_poll_once_applies_the_stock_change(sqs_queue, consumer, catalog_service
     processed = consumer.poll_once(wait_time_seconds=0)
 
     assert processed == 1
-    assert catalog_service.calls == [("cow-milk", "evt-1", "OUT_OF_STOCK", None)]
+    assert catalog_service.calls == [("cow-milk", "evt-1", "OUT_OF_STOCK", None, _OCCURRED_AT)]
 
 
 def test_poll_once_parses_available_from_date(sqs_queue, consumer, catalog_service):
@@ -58,6 +67,15 @@ def test_poll_once_parses_available_from_date(sqs_queue, consumer, catalog_servi
     from datetime import date
 
     assert catalog_service.calls[0][3] == date(2026, 9, 1)
+
+
+def test_poll_once_rejects_an_unknown_stock_state(sqs_queue, consumer, catalog_service):
+    _send_stock_changed(sqs_queue, stockState="BOGUS_STATE")
+
+    processed = consumer.poll_once(wait_time_seconds=0)
+
+    assert processed == 1
+    assert catalog_service.calls == []
 
 
 def test_poll_once_deletes_message_after_processing(sqs_queue, consumer):
@@ -97,6 +115,22 @@ def test_invalid_available_from_date_is_rejected_not_applied(sqs_queue, consumer
     _send_stock_changed(sqs_queue, availableFrom="not-a-date")
 
     processed = consumer.poll_once(wait_time_seconds=0)
+
+    assert processed == 1
+    assert catalog_service.calls == []
+
+
+def test_a_transient_apply_failure_is_left_in_queue_not_raised(
+    sqs_queue, consumer, catalog_service
+):
+    # A ServiceUnavailableError (e.g. a momentary DB blip applying the
+    # change) must not propagate out of poll_once — that would kill
+    # run_forever's background thread over what's often transient. The
+    # message stays in-queue for SQS's own redelivery/DLQ instead.
+    catalog_service.raises = ServiceUnavailableError("db blip")
+    _send_stock_changed(sqs_queue)
+
+    processed = consumer.poll_once(wait_time_seconds=0)  # must not raise
 
     assert processed == 1
     assert catalog_service.calls == []

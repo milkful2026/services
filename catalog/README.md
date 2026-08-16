@@ -34,9 +34,8 @@ matches every other service in this repo's own local-dev shim, which decodes-not
    MA-116 owns, so the mobile client and this service agree on behavior regardless of what's
    underneath. Swapping to real OpenSearch later is a repository-adapter change, not a contract
    change.
-   - **Concrete gap from this:** `sort=newest` currently falls back to name-order — there's no
-     recency column in the Postgres schema, since the Aurora-only implementation never needed one
-     for price sort. Logged as a warning at runtime, not silently wrong.
+   - `sort=newest` orders by `created_at desc` (added in migration `0001`/`0002` review follow-up —
+     see decision #4 below for the schema fix that closed this gap).
 2. **`is_veg`/`is_organic` live on `products`, not a separate attributes table.** Two independent
    booleons (a product can be organic-but-not-veg-labeled, or vice versa, in a dairy context) —
    added jointly with MA-117 during SDD review after that spec flagged the schema gap.
@@ -44,14 +43,23 @@ matches every other service in this repo's own local-dev shim, which decodes-not
    every endpoint always returns `price_b2c` in the `price` field (MA-116 FR-4) until a caller can
    signal B2B intent — MA-116's own Open Question Q2, still unresolved, no B2B-aware caller exists
    yet (MA-21's mobile spec also explicitly limited B2B to "indicator only").
-4. **`StockChanged` idempotency via a stored `last_stock_event_id`**, not a separate dedup table —
-   simplest mechanism that satisfies MA-116 FR-5's "a redelivered duplicate must not corrupt state"
-   requirement, given exactly one field needs tracking (this service's own stock-state mirror,
-   not a general-purpose event log).
-5. **Single Fargate deployable** handles both the HTTP API and the `StockChanged` SQS consumer (a
+4. **`StockChanged` idempotency via a stored `last_stock_event_id` + `last_stock_event_at`**, not a
+   separate dedup table. `last_stock_event_id` alone only catches an exact redelivery (same
+   `eventId` twice) — since SQS here is a standard, non-FIFO queue, a *distinct* event can still
+   arrive out of order, so `apply_stock_change` also compares the incoming event's own `occurredAt`
+   against the last-applied one's and drops anything not strictly newer. Still just two fields on
+   the product row, not a general-purpose event log.
+5. **`created_at`/`updated_at` on both tables, `onupdate=func.now()` on `products.updated_at`** —
+   present in the SQLAlchemy Core mapping (not just the migration) so they're actually queryable;
+   `updated_at` bumps automatically on any `products` UPDATE via SQLAlchemy Core's own `onupdate`,
+   no explicit `SET` needed in `apply_stock_change`'s statement.
+6. **Single Fargate deployable** handles both the HTTP API and the `StockChanged` SQS consumer (a
    background thread in the same process, `src/main.py`) — mirrors Inventory's own
    `src/main.py` structure exactly (same "nothing here calls for a two-deployable split" reasoning).
-6. **No CDK/infra stack.** Unlike `inventory/infra/`, this pass has no `infra/` directory — building
+   A DB error applying one event is caught and left in-queue for SQS's own redelivery/DLQ rather
+   than killing the consumer thread; only truly unexpected exceptions reach `main.py`'s top-level
+   handler, which flips `/healthz` to 503.
+7. **No CDK/infra stack.** Unlike `inventory/infra/`, this pass has no `infra/` directory — building
    one wasn't needed to prove out and locally run/test the service, and an untested CDK stack isn't
    worth the surface area. Flagged as follow-up work, not an oversight.
 
@@ -92,14 +100,15 @@ Fully offline — **no AWS credentials, no Docker, no real Postgres**:
   shim yet — see `services/local-dev/README.md`'s own "JWT claims aren't verified" known gap).
 - A real OpenSearch index, if/when `GET /search`'s current Postgres-direct implementation stops
   being good enough (flagged decision #1).
-- CDK/infra stack (flagged decision #6) — provisioning, `cdk bootstrap`/`deploy`, ECR image
+- CDK/infra stack (flagged decision #7) — provisioning, `cdk bootstrap`/`deploy`, ECR image
   pipeline, none of which exist for this service yet.
 - Confirming Inventory's real `StockChanged` publisher (once MA-95/MA-118 is implemented) actually
   matches the payload contract this service's consumer expects (`FR-5`/`FR-6` in the two specs) —
-  proven so far only against a manually-published test event, not a real producer.
-- A `newest` sort that's actually newest (flagged decision #1's concrete gap) — needs a
-  `created_at`-equivalent column and a decision on what "newest" means for a seeded/admin-authored
-  catalog (row insertion time? an explicit publish date?).
+  proven so far only against a manually-published test event, not a real producer. In particular,
+  whether it sends `occurredAt` as the event's true origination time (not, say, a publish-retry
+  time) — `apply_stock_change`'s ordering check (decision #4) depends on that being accurate.
+- A retry-with-backoff for `apply_stock_change`'s transient DB failures (decision #6) — currently a
+  failed apply is just left for SQS's own redelivery/DLQ, no in-process retry.
 
 ## Deferred / tech debt
 

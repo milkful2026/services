@@ -33,17 +33,17 @@ def serialize_product(product: Product) -> dict[str, Any]:
     }
 
 
-def success_envelope(data: dict[str, Any]) -> dict[str, Any]:
+def success_envelope(data: dict[str, Any] | list[Any]) -> dict[str, Any]:
     return {"requestId": str(uuid.uuid4()), "status": "success", "data": data}
 
 
-def success_list_envelope(data: list[Any]) -> dict[str, Any]:
-    """`/categories`'s `data` is a bare array — matches the mobile client's
-    `ApiClient.requestList` (see its own docstring: the same bare-array
-    convention `/delivery/slots` already uses elsewhere in this
-    platform), unlike every other endpoint here which wraps its list in a
-    named object key (`{"products": [...]}`)."""
-    return {"requestId": str(uuid.uuid4()), "status": "success", "data": data}
+# `/categories`'s `data` is a bare array — matches the mobile client's
+# `ApiClient.requestList` (see its own docstring: the same bare-array
+# convention `/delivery/slots` already uses elsewhere in this platform),
+# unlike every other endpoint here which wraps its list in a named object
+# key (`{"products": [...]}`). Named separately at call sites purely to
+# document that distinction — the wrapper itself is identical either way.
+success_list_envelope = success_envelope
 
 
 def error_envelope(

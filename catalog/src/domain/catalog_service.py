@@ -3,6 +3,8 @@ StockChanged application (MA-116 FR-5). Thin — most of the actual query
 logic lives in the repository adapter; this layer's job is validating
 inputs and translating "not found" into the right domain exception."""
 
+from datetime import datetime
+
 from adapters.interfaces import ProductRepositoryPort
 from domain.exceptions import ProductNotFoundError
 from domain.models import Category, Product, SearchFilters, SortOrder
@@ -38,14 +40,16 @@ class CatalogService:
         event_id: str,
         stock_state: str,
         available_from,
+        occurred_at: datetime | None = None,
     ) -> bool:
         """MA-116 FR-5. Unknown productId is deliberately a silent no-op,
         not an error — per this service's own spec's Edge Cases table:
         "could be a race with product creation, or a productId typo
         upstream", not worth failing the whole consumer over. Returns
         whether the update was actually applied (False for a redelivered
-        duplicate `event_id` or an unknown product), purely so the SQS
-        consumer can log a clearer message — not otherwise acted on."""
+        duplicate `event_id`, a stale out-of-order `occurred_at`, or an
+        unknown product), purely so the SQS consumer can log a clearer
+        message — not otherwise acted on."""
         return self._repository.apply_stock_change(
-            product_id, event_id, stock_state, available_from
+            product_id, event_id, stock_state, available_from, occurred_at
         )

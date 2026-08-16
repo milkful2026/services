@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime
 
 from adapters.product_repository import SqlAlchemyProductRepository
 from domain.models import SearchFilters, SortOrder, StockState
@@ -117,6 +117,17 @@ def test_search_sort_price_asc_and_desc(sqlite_engine):
     assert [p.id for p in desc] == ["pricey", "mid", "cheap"]
 
 
+def test_search_sort_newest_orders_by_created_at_desc(sqlite_engine):
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine, id="old", created_at=datetime(2026, 1, 1, tzinfo=UTC))
+    seed_product(sqlite_engine, id="new", created_at=datetime(2026, 6, 1, tzinfo=UTC))
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    results = repo.search(None, None, SortOrder.NEWEST)
+
+    assert [p.id for p in results] == ["new", "old"]
+
+
 def test_apply_stock_change_updates_state(sqlite_engine):
     seed_category(sqlite_engine)
     seed_product(sqlite_engine)
@@ -139,8 +150,7 @@ def test_apply_stock_change_is_idempotent_on_duplicate_event_id(sqlite_engine):
         "cow-milk", event_id="evt-1", stock_state="OUT_OF_STOCK", available_from=None
     )
 
-    # Same eventId redelivered — must not re-apply (and, in a real
-    # scenario, must not overwrite a *newer* state with a stale replay).
+    # Same eventId redelivered — must not re-apply.
     applied_again = repo.apply_stock_change(
         "cow-milk", event_id="evt-1", stock_state="IN_STOCK", available_from=None
     )
@@ -148,6 +158,63 @@ def test_apply_stock_change_is_idempotent_on_duplicate_event_id(sqlite_engine):
     assert applied_again is False
     product = repo.get_product("cow-milk")
     assert product.stock_state == StockState.OUT_OF_STOCK
+
+
+def test_apply_stock_change_rejects_a_stale_out_of_order_event(sqlite_engine):
+    # A *distinct* eventId can still be a stale, out-of-order redelivery
+    # (SQS gives no ordering guarantee) — must not overwrite a newer state
+    # with one that occurred earlier, even though its eventId is new.
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+    newer = datetime(2026, 8, 16, 10, 0, 0, tzinfo=UTC)
+    older = datetime(2026, 8, 16, 9, 0, 0, tzinfo=UTC)
+    repo.apply_stock_change(
+        "cow-milk",
+        event_id="evt-2",
+        stock_state="OUT_OF_STOCK",
+        available_from=None,
+        occurred_at=newer,
+    )
+
+    applied_late = repo.apply_stock_change(
+        "cow-milk",
+        event_id="evt-1",
+        stock_state="IN_STOCK",
+        available_from=None,
+        occurred_at=older,
+    )
+
+    assert applied_late is False
+    product = repo.get_product("cow-milk")
+    assert product.stock_state == StockState.OUT_OF_STOCK
+
+
+def test_apply_stock_change_accepts_a_later_event_after_an_earlier_one(sqlite_engine):
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+    earlier = datetime(2026, 8, 16, 9, 0, 0, tzinfo=UTC)
+    later = datetime(2026, 8, 16, 10, 0, 0, tzinfo=UTC)
+    repo.apply_stock_change(
+        "cow-milk",
+        event_id="evt-1",
+        stock_state="OUT_OF_STOCK",
+        available_from=None,
+        occurred_at=earlier,
+    )
+
+    applied = repo.apply_stock_change(
+        "cow-milk",
+        event_id="evt-2",
+        stock_state="IN_STOCK",
+        available_from=None,
+        occurred_at=later,
+    )
+
+    assert applied is True
+    product = repo.get_product("cow-milk")
+    assert product.stock_state == StockState.IN_STOCK
 
 
 def test_apply_stock_change_for_unknown_product_is_a_noop(sqlite_engine):
