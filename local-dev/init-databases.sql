@@ -3,3 +3,4 @@
 -- cluster in real deployments.
 CREATE DATABASE milkful_user;
 CREATE DATABASE milkful_inventory;
+CREATE DATABASE milkful_catalog;

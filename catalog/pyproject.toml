@@ -1,0 +1,20 @@
+[project]
+name = "catalog"
+version = "0.1.0"
+description = "Milkful Catalog service — product & category data + search API (MA-94)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]

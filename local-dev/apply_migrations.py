@@ -25,6 +25,7 @@ _SERVICES_DIR = Path(__file__).resolve().parent.parent
 _TARGETS = [
     ("user", "milkful_user"),
     ("inventory", "milkful_inventory"),
+    ("catalog", "milkful_catalog"),
 ]
 
 

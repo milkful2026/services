@@ -1,7 +1,8 @@
 # Local development environment
 
-Runs registration ([MA-1](https://milkfuldairyindia.atlassian.net/browse/MA-1)) and
-login ([MA-21](https://milkfuldairyindia.atlassian.net/browse/MA-21)) end-to-end on your own
+Runs registration ([MA-1](https://milkfuldairyindia.atlassian.net/browse/MA-1)),
+login ([MA-21](https://milkfuldairyindia.atlassian.net/browse/MA-21)), and product catalog
+browsing ([MA-22](https://milkfuldairyindia.atlassian.net/browse/MA-22)) end-to-end on your own
 machine, with no real AWS account and no deploy. AWS is stood in for by
 [`moto_server`](https://github.com/getmoto/moto) (Cognito, DynamoDB, SQS, EventBridge — one
 process, one port); Postgres and Redis are the real thing, just local containers.
@@ -14,7 +15,8 @@ them the way API Gateway would.
 
 - Docker Desktop running (`docker ps` should succeed)
 - Each service's own venv set up per its README (`identity-auth/README.md`, `user/README.md`,
-  `inventory/README.md`) — `python -m venv .venv && pip install -r requirements-dev.txt` in each
+  `inventory/README.md`, `catalog/README.md`) — `python -m venv .venv && pip install -r
+  requirements-dev.txt` in each
 - From this directory: `pip install -r requirements.txt` (boto3, psycopg2-binary — used by
   `bootstrap.py`/`apply_migrations.py`/`peek_otp.py`, not by the services themselves)
 
@@ -34,6 +36,10 @@ python seed_user_zone_slots.py    # seeds matching delivery slots in User Servic
                                    # zone_slots table — without it, GET /delivery/slots
                                    # returns empty and the Flutter app's slot screen has
                                    # nothing to select
+python seed_catalog_products.py   # seeds 5 categories + 8 products — no admin/write API
+                                   # exists for the catalog either, so without it the
+                                   # Flutter app's Home/catalog screen has nothing to
+                                   # browse
 ```
 
 `bootstrap.py` and `apply_migrations.py` are safe to re-run. `docker compose down -v` clears
@@ -51,6 +57,9 @@ cd user && python run_local_outbox_publisher.py       # polls outbox every 5s (s
                                                        # real rate(1 minute) EventBridge Schedule)
 cd inventory && python src/main.py                    # :8000 — this one's a real FastAPI app
                                                        # already; no shim needed
+cd catalog && python src/main.py                      # :8003 — products/categories/search;
+                                                       # also a real FastAPI app, same as
+                                                       # inventory, no shim needed
 ```
 
 ## Exercising registration + login
@@ -88,17 +97,54 @@ Verified end-to-end against a real `moto_server` process while building this: re
 send/verify, login send/verify, and logout (including the documented `revoke_token` moto
 fidelity gap — see `identity-auth/README.md` — handled gracefully, still returns 204).
 
+## Exercising the catalog
+
+No auth needed — these are all read endpoints. `filters` is repeated per facet
+(`category:{id}`, `price:{min}-{max}`, `veg:true`, `organic:true`); OpenSearch isn't stood up
+locally (or anywhere yet — see Known gaps), so `GET /search` runs the same query directly
+against this service's own Postgres table instead.
+
+```bash
+curl localhost:8003/categories
+curl "localhost:8003/products?categoryId=milk"
+curl localhost:8003/products/cow-milk
+curl "localhost:8003/search?q=cow"
+curl "localhost:8003/search?filters=category:milk&filters=veg:true&sort=price_asc"
+```
+
+`StockChanged` (published by Inventory once MA-95's reserve/commit/release lands — spec'd, not
+yet implemented) is consumed live by a background thread in the same process. To exercise it
+manually before that exists, publish directly to the local queue:
+
+```bash
+python -c "
+import json, boto3
+sqs = boto3.client('sqs', region_name='us-east-1', endpoint_url='http://localhost:5000',
+                    aws_access_key_id='local', aws_secret_access_key='local')
+queue_url = sqs.get_queue_url(QueueName='stock-changed')['QueueUrl']
+sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({
+    'correlationId': 'manual-test',
+    'payload': {'eventId': 'evt-1', 'productId': 'cow-milk', 'availableQuantity': 0,
+                'stockState': 'OUT_OF_STOCK', 'availableFrom': None,
+                'occurredAt': '2026-01-01T00:00:00Z'},
+}))
+"
+curl localhost:8003/products/cow-milk   # stockState should now read OUT_OF_STOCK
+```
+
 ## How this fits together
 
 | Piece | What it does |
 |---|---|
-| `docker-compose.yml` | `moto_server` (all of Cognito/DynamoDB/SQS/EventBridge on one port), `postgres` (two databases, `milkful_user` + `milkful_inventory`, via `init-databases.sql`), `redis` |
-| `bootstrap.py` | Creates the Cognito pool/client, `otp_requests` DynamoDB table, `zone-updated`(+DLQ) and `otp-requested-debug` SQS queues, and the EventBridge rules routing to them — the direct-boto3 equivalent of what `cdk deploy` provisions for real. Writes each service's `.env.local`. |
+| `docker-compose.yml` | `moto_server` (all of Cognito/DynamoDB/SQS/EventBridge on one port), `postgres` (three databases, `milkful_user` + `milkful_inventory` + `milkful_catalog`, via `init-databases.sql`), `redis` |
+| `bootstrap.py` | Creates the Cognito pool/client, `otp_requests` DynamoDB table, `zone-updated`/`otp-requested-debug`/`stock-changed` SQS queues (each with a DLQ where applicable), and the EventBridge rules routing to them — the direct-boto3 equivalent of what `cdk deploy` provisions for real. Writes each service's `.env.local`. |
 | `apply_migrations.py` | Runs each service's real `migrations/*.sql` against its local Postgres database, tracked in a `schema_migrations` table so re-runs only apply new files. |
 | `seed_inventory_zones.py` | Inserts one serviceability zone (pincode prefix `5600`) directly via SQL — there's no admin/write API for zones (MA-95 is read-only), so this is the only local option. Upserts, safe to re-run. |
 | `seed_user_zone_slots.py` | Inserts matching delivery slots into User Service's own `zone_slots` table (same `blr-central` zone id as above) — a separate table from Inventory's, not synced to it in any environment (see `user/README.md`'s flagged decision #1). Upserts, safe to re-run. |
-| `_db.py` | Shared local-Postgres connection settings/helper used by `seed_inventory_zones.py` and `seed_user_zone_slots.py`, plus a friendly-error wrapper for "Postgres isn't up yet" / "migrations haven't been applied yet". |
+| `seed_catalog_products.py` | Inserts 5 categories + 8 products directly via SQL — same "no admin/write API yet" reasoning as the zone/slot seeds above (MA-42's territory). Upserts, safe to re-run. |
+| `_db.py` | Shared local-Postgres connection settings/helper used by every `seed_*.py` script, plus a friendly-error wrapper for "Postgres isn't up yet" / "migrations haven't been applied yet". |
 | `_zone_seed_data.py` | Shared zone/slot fixture data used by `seed_inventory_zones.py` and `seed_user_zone_slots.py`, so the two independently-seeded tables can't drift out of sync with each other. |
+| `_catalog_seed_data.py` | Shared category/product fixture data used by `seed_catalog_products.py` — category ids/icon names match the Flutter catalog screen's own icon-mapping switch exactly. |
 | `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. |
 | `peek_otp.py` | Local-only OTP visibility, since there's no real SMS provider to read the code from. |
 | `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's `main.py` carries a small inline duplicate since `local-dev/` isn't shipped in its container image. |
@@ -148,3 +194,17 @@ fidelity gap — see `identity-auth/README.md` — handled gracefully, still ret
   `inventory/migrations/0001_serviceability_zones.sql` and
   `user/migrations/0001_users_addresses_consents.sql` schemas, but neither was run against an
   actual Postgres instance in this sandbox.
+- **Catalog's `GET /search` runs directly against Postgres (`ILIKE` + `WHERE` + `ORDER BY`), not
+  real OpenSearch.** MA-117's own spec flags OpenSearch as the single biggest implementation risk
+  in that whole spec set — no local-dev emulation precedent exists for it anywhere in this repo.
+  This same-database implementation satisfies the documented API *contract* (same request params,
+  same response shape) so both sides of the Catalog↔mobile contract agree on behavior; swapping the
+  query engine underneath to real OpenSearch later doesn't change that contract. One concrete gap
+  from this: `sort=newest` currently falls back to name-order, since there's no recency column in
+  the Postgres schema today (never added — the Aurora-only implementation didn't need one for
+  price sort, and this was noticed only when writing this deviation note).
+- **Catalog's `StockChanged` consumer has no real producer yet** — Inventory's reserve/commit/
+  release (MA-95/MA-118) is spec'd but not implemented, so nothing publishes this event in normal
+  operation. The consumer itself is implemented and tested (unit tests with a mocked SQS queue,
+  plus a real manual publish against the local `moto_server` queue — see "Exercising the catalog"
+  above) against the payload contract both specs agreed on, ahead of the producer landing.
