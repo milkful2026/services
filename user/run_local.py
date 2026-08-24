@@ -30,12 +30,14 @@ load_env_file(_SERVICE_DIR / ".env.local")
 
 import handlers.delivery_slots_handler as delivery_slots_handler  # noqa: E402
 import handlers.get_me_handler as get_me_handler  # noqa: E402
+import handlers.internal_address_state_handler as internal_address_state_handler  # noqa: E402
 import handlers.register_handler as register_handler  # noqa: E402
 
 ROUTES = {
     ("POST", "/users/register"): register_handler.handler,
     ("GET", "/delivery/slots"): delivery_slots_handler.handler,
     ("GET", "/users/me"): get_me_handler.handler,
+    ("GET", "/v1/internal/users/address-state"): internal_address_state_handler.handler,
 }
 
 if __name__ == "__main__":

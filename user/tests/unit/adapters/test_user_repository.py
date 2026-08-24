@@ -227,6 +227,28 @@ def test_get_profile_by_sub_returns_profile_defaulting_to_b2c(repository):
     assert profile.mobile == "+919876543210"
     assert profile.account_type == "B2C"
     assert profile.default_address_id == registered.default_address_id
+    assert profile.default_address_state == "Karnataka"
+
+
+def test_get_profile_by_sub_returns_null_state_when_no_default_address(repository):
+    registered = repository.register(
+        cognito_sub="sub-2",
+        mobile="+919876543211",
+        name="Amit Rao",
+        email=None,
+        addresses=[_address(is_default=False)],
+        preferred_slot_id=None,
+        consents=_consents(),
+        outbox_event_type="UserRegistered",
+        outbox_payload={},
+    )
+
+    profile = repository.get_profile_by_sub("sub-2")
+
+    assert profile is not None
+    assert registered.default_address_id == ""
+    assert profile.default_address_id == ""
+    assert profile.default_address_state is None
 
 
 def test_account_type_check_constraint_rejects_invalid_value(repository, sqlite_engine):

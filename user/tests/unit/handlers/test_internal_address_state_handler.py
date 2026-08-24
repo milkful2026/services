@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-import handlers.get_me_handler as get_me_handler
+import handlers.internal_address_state_handler as internal_address_state_handler
 from domain.exceptions import ExternalServiceUnavailableError, UserNotFoundError
 from domain.models import UserProfile
 
@@ -33,41 +33,36 @@ class FakeRegistrationService:
 
 @pytest.fixture(autouse=True)
 def _reset_deps():
-    get_me_handler._deps = None
+    internal_address_state_handler._deps = None
     yield
-    get_me_handler._deps = None
+    internal_address_state_handler._deps = None
 
 
 def _inject(profile=None, raises=None):
     service = FakeRegistrationService(profile=profile, raises=raises)
-    get_me_handler._deps = {"registration_service": service}
+    internal_address_state_handler._deps = {"registration_service": service}
     return service
 
 
-def _event(sub: str | None = "sub-123") -> dict:
-    claims = {"sub": sub} if sub else {}
-    return {"headers": {"x-request-id": "corr-1"}, "requestContext": {"authorizer": {"jwt": {"claims": claims}}}}
+def _event(cognito_sub: str | None = "sub-123") -> dict:
+    return {
+        "headers": {"x-request-id": "corr-1"},
+        "queryStringParameters": {"cognitoSub": cognito_sub} if cognito_sub else {},
+    }
 
 
-def test_get_me_success_returns_profile():
+def test_success_returns_default_address_state():
     service = _inject()
 
-    response = get_me_handler.handler(_event(), None)
+    response = internal_address_state_handler.handler(_event(), None)
 
     assert response["statusCode"] == 200
     data = json.loads(response["body"])["data"]
-    assert data == {
-        "userId": "user-1",
-        "name": "Priya Sharma",
-        "mobile": "+919876543210",
-        "accountType": "B2C",
-        "defaultAddressId": "addr-1",
-        "defaultAddressState": "Karnataka",
-    }
+    assert data == {"defaultAddressState": "Karnataka"}
     assert service.calls == ["sub-123"]
 
 
-def test_get_me_no_default_address_returns_null_state():
+def test_no_default_address_returns_null_state():
     profile = UserProfile(
         user_id="user-2",
         name="Amit Rao",
@@ -76,44 +71,43 @@ def test_get_me_no_default_address_returns_null_state():
         default_address_id="",
         default_address_state=None,
     )
-    service = _inject(profile=profile)
+    _inject(profile=profile)
 
-    response = get_me_handler.handler(_event(), None)
+    response = internal_address_state_handler.handler(_event(), None)
 
     data = json.loads(response["body"])["data"]
-    assert data["defaultAddressId"] == ""
-    assert data["defaultAddressState"] is None
-    assert service.calls == ["sub-123"]
+    assert data == {"defaultAddressState": None}
 
 
-def test_get_me_missing_jwt_claims_returns_400():
+def test_missing_cognito_sub_query_param_returns_400():
     _inject()
 
-    response = get_me_handler.handler(_event(sub=None), None)
+    response = internal_address_state_handler.handler(_event(cognito_sub=None), None)
 
     assert response["statusCode"] == 400
+    assert json.loads(response["body"])["data"]["errorCode"] == "VALIDATION_ERROR"
 
 
-def test_get_me_no_matching_user_returns_404():
+def test_no_matching_user_returns_404():
     _inject(raises=UserNotFoundError("No profile found for this account"))
 
-    response = get_me_handler.handler(_event(), None)
+    response = internal_address_state_handler.handler(_event(), None)
 
     assert response["statusCode"] == 404
     assert json.loads(response["body"])["data"]["errorCode"] == "USER_NOT_FOUND"
 
 
-def test_get_me_db_unavailable_returns_503():
+def test_db_unavailable_returns_503():
     _inject(raises=ExternalServiceUnavailableError("db down"))
 
-    response = get_me_handler.handler(_event(), None)
+    response = internal_address_state_handler.handler(_event(), None)
 
     assert response["statusCode"] == 503
 
 
-def test_get_me_unexpected_exception_returns_500():
+def test_unexpected_exception_returns_500():
     _inject(raises=RuntimeError("boom"))
 
-    response = get_me_handler.handler(_event(), None)
+    response = internal_address_state_handler.handler(_event(), None)
 
     assert response["statusCode"] == 500
