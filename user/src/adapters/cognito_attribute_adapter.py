@@ -15,9 +15,23 @@ repo-wide (same note as MA-92's cognito_adapter.py). Two responsibilities:
 
 Both are keyed by `sub` (a real, filterable standard ListUsers attribute
 — unlike custom attributes, see MA-92's cognito_adapter.py for that
-distinction) since this service only has the JWT's `sub` claim. Username
-IS the mobile number for this pool (UsernameAttributes=[phone_number],
-per identity-auth's cognito_adapter.py — the two services share one pool).
+distinction) since this service only has the JWT's `sub` claim.
+
+`Username` is NOT the mobile number, despite this pool having
+UsernameAttributes=[phone_number]. Confirmed against real AWS Cognito's
+documented behavior (and moto, which deliberately mirrors it — see
+moto.cognitoidp.models.CognitoIdpBackend.admin_create_user's own
+comment): when UsernameAttributes includes phone_number, Cognito stores
+the supplied value in the `phone_number` attribute but always assigns a
+separate, persistent GUID as the actual `Username` (the same GUID also
+returned as `sub`). So `get_mobile_by_sub` must read the `phone_number`
+attribute out of ListUsers' `Attributes`, never `Username` — an earlier
+version of this adapter conflated the two, which worked against nothing
+but a mistaken assumption and would silently write Cognito's GUID into
+`users.mobile` (VARCHAR(20)) in any real deployment, not just under
+moto. `sync_profile_attributes` still needs the real `Username` (the
+GUID) to identify the user in AdminUpdateUserAttributes — that part was
+already correct and is unchanged.
 
 **Cross-stack schema dependency, flagged not fixed here**:
 `custom:default_pincode` must exist in the Cognito User Pool's schema —
@@ -69,12 +83,23 @@ class CognitoAttributeAdapter:
         self._correlation_id = correlation_id
 
     def get_mobile_by_sub(self, cognito_sub: str) -> str | None:
-        return self._find_username_by_sub(cognito_sub)
+        user = self._find_user_by_sub(cognito_sub)
+        if user is None:
+            return None
+        for attr in user.get("Attributes", []):
+            if attr.get("Name") == "phone_number":
+                return attr.get("Value")
+        logger.error(
+            "cognito_attribute_adapter: user found for sub but has no phone_number attribute",
+            extra={"correlationId": self._correlation_id, "cognitoSub": cognito_sub},
+        )
+        return None
 
     def sync_profile_attributes(self, cognito_sub: str, name: str, default_pincode: str) -> None:
-        username = self._find_username_by_sub(cognito_sub)
-        if username is None:
+        user = self._find_user_by_sub(cognito_sub)
+        if user is None:
             return
+        username = user["Username"]
 
         def _on_attempt_failure(exc: Exception, attempt: int) -> None:
             logger.error(
@@ -104,7 +129,7 @@ class CognitoAttributeAdapter:
         except ClientError as exc:
             raise self._wrap("admin_update_user_attributes", exc) from exc
 
-    def _find_username_by_sub(self, cognito_sub: str) -> str | None:
+    def _find_user_by_sub(self, cognito_sub: str) -> dict | None:
         if not _SUB_PATTERN.match(cognito_sub):
             logger.error(
                 "cognito_attribute_adapter: cognito_sub is not UUID-shaped, refusing to filter",
@@ -142,7 +167,7 @@ class CognitoAttributeAdapter:
                 extra={"correlationId": self._correlation_id, "cognitoSub": cognito_sub},
             )
             return None
-        return users[0]["Username"]
+        return users[0]
 
     def _wrap(self, operation: str, exc: ClientError) -> ExternalServiceUnavailableError:
         logger.error(
