@@ -60,6 +60,9 @@ cd inventory && python src/main.py                    # :8000 — this one's a r
 cd catalog && python src/main.py                      # :8003 — products/categories/search;
                                                        # also a real FastAPI app, same as
                                                        # inventory, no shim needed
+cd pricing-offer && python src/main.py                # :8005 — pricing/quote; no bootstrap
+                                                       # step needed — no DB/AWS at all, just
+                                                       # calls catalog's GET /products/{id}
 ```
 
 ## Exercising registration + login
@@ -130,6 +133,33 @@ sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({
 }))
 "
 curl localhost:8003/products/cow-milk   # stockState should now read OUT_OF_STOCK
+```
+
+## Exercising pricing
+
+No auth needed. Requires `catalog` (and its seeded products) to already be up — every quote calls
+`GET /products/{id}` on it directly. `deliveryState` is required (rejected with a 400 if missing)
+but not otherwise used — see `pricing-offer/README.md`'s own "Scope" section for the full list of
+what this build deliberately doesn't implement (no Offers, no HSN/GST-driven tax rate, no Redis).
+
+```bash
+curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d '{
+  "items": [{"productId": "cow-milk", "quantity": 1, "frequency": "ONE_TIME"}],
+  "deliveryState": "Karnataka"
+}'
+# -> basePrice/taxAmount/taxRate/deliveryFee/netPayable, monthlyEstimate: null
+
+curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d '{
+  "items": [{"productId": "cow-milk", "quantity": 1, "frequency": "DAILY"}],
+  "deliveryState": "Karnataka"
+}'
+# -> same fields, plus a populated monthlyEstimate (net payable per delivery x ~30)
+
+curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d '{
+  "items": [{"productId": "no-such-product", "quantity": 1, "frequency": "ONE_TIME"}],
+  "deliveryState": "Karnataka"
+}'
+# -> 404, errorCode: PRODUCT_PRICING_UNKNOWN
 ```
 
 ## How this fits together
