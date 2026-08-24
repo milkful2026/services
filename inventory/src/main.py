@@ -25,7 +25,13 @@ def _load_local_env_file() -> None:
     # app-construction rather than checked per-request), so the env
     # file must be loaded before `from handlers.app import app` ever
     # executes, not after.
-    path = Path(__file__).resolve().parents[1] / ".env.local"
+    #
+    # ENV_LOCAL_PATH overrides the default path so the containerized
+    # version of this service can read .env.local from a shared docker
+    # volume (written by the "bootstrap" compose service) instead of
+    # this file's own directory — unset, and this is unchanged from a
+    # native/host run.
+    path = Path(os.environ.get("ENV_LOCAL_PATH", str(Path(__file__).resolve().parents[1] / ".env.local")))
     if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()

@@ -10,12 +10,13 @@ Tracks applied filenames in a `schema_migrations` table per database, so
 re-running after adding a new migration file only applies the new one.
 """
 
+import os
 import sys
 from pathlib import Path
 
 import psycopg2
 
-DB_HOST = "localhost"
+DB_HOST = os.environ.get("LOCAL_DEV_DB_HOST", "localhost")
 DB_PORT = 5432
 DB_USER = "milkful"
 DB_PASSWORD = "milkful"

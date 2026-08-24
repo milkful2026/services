@@ -9,6 +9,11 @@ services:
       - "5000:5000"
     environment:
       MOTO_PORT: "5000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
 
   postgres:
     image: postgres:16-alpine
@@ -32,5 +37,96 @@ services:
     ports:
       - "6379:6379"
 
+  # One-shot provisioning step — the containerized equivalent of running
+  # bootstrap.py / apply_migrations.py / seed_*.py by hand. Runs once
+  # moto+postgres are healthy, writes each service's .env.local into a
+  # shared docker volume (not a host bind-mount — see Dockerfile.bootstrap
+  # and bootstrap.py's LOCAL_DEV_ENV_OUTPUT_ROOT for why), then exits.
+  # moto's in-memory state (and this provisioning) only lasts as long as
+  # the containers do — `docker compose down` (not just `stop`) wipes it,
+  # and the next `up` re-runs this from scratch.
+  bootstrap:
+    build:
+      context: ..
+      dockerfile: local-dev/Dockerfile.bootstrap
+    depends_on:
+      moto:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      LOCAL_DEV_AWS_ENDPOINT_URL: http://moto:5000
+      LOCAL_DEV_DB_HOST: postgres
+      LOCAL_DEV_REDIS_HOST: redis
+      LOCAL_DEV_INVENTORY_HTTP_URL: http://inventory:8000
+      LOCAL_DEV_ENV_OUTPUT_ROOT: /shared
+    volumes:
+      - identity-auth-env:/shared/identity-auth
+      - user-env:/shared/user
+      - inventory-env:/shared/inventory
+      - catalog-env:/shared/catalog
+
+  identity-auth:
+    build:
+      context: ..
+      dockerfile: identity-auth/Dockerfile
+    ports:
+      - "8001:8001"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    environment:
+      ENV_LOCAL_PATH: /shared/identity-auth/.env.local
+    volumes:
+      - identity-auth-env:/shared/identity-auth
+
+  user:
+    build:
+      context: ..
+      dockerfile: user/Dockerfile
+    ports:
+      - "8002:8002"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/user/.env.local
+    volumes:
+      - user-env:/shared/user
+
+  inventory:
+    build:
+      context: ../inventory
+    ports:
+      - "8000:8000"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    environment:
+      ENV_LOCAL_PATH: /shared/inventory/.env.local
+    volumes:
+      - inventory-env:/shared/inventory
+
+  catalog:
+    build:
+      context: ../catalog
+    ports:
+      - "8003:8003"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/catalog/.env.local
+    volumes:
+      - catalog-env:/shared/catalog
+
 volumes:
   milkful-postgres-data:
+  identity-auth-env:
+  user-env:
+  inventory-env:
+  catalog-env:

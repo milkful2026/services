@@ -14,17 +14,59 @@ them the way API Gateway would.
 ## Prerequisites
 
 - Docker Desktop running (`docker ps` should succeed)
-- Each service's own venv set up per its README (`identity-auth/README.md`, `user/README.md`,
-  `inventory/README.md`, `catalog/README.md`) — `python -m venv .venv && pip install -r
-  requirements-dev.txt` in each
-- From this directory: `pip install -r requirements.txt` (boto3, psycopg2-binary — used by
-  `bootstrap.py`/`apply_migrations.py`/`peek_otp.py`, not by the services themselves)
 
-## One-time-per-session setup
+That's the only prerequisite for the all-Docker path below. The native (non-Docker) path further
+down additionally needs each service's own venv set up per its README (`identity-auth/README.md`,
+`user/README.md`, `inventory/README.md`, `catalog/README.md`) — `python -m venv .venv && pip
+install -r requirements-dev.txt` in each — and, from this directory, `pip install -r
+requirements.txt` (boto3, psycopg2-binary — used by `bootstrap.py`/`apply_migrations.py`/
+`peek_otp.py`, not by the services themselves).
+
+## Option A: everything in Docker (recommended)
 
 ```bash
 cd services/local-dev
-docker compose up -d              # moto_server :5000, postgres :5432, redis :6379
+docker compose up -d
+```
+
+One command brings up the whole stack: `moto_server` (:5000), Postgres (:5432), Redis (:6379),
+a one-shot `bootstrap` container that waits for those to be healthy and then runs
+`bootstrap.py` + `apply_migrations.py` + all three `seed_*.py` scripts, and finally the four app
+services — identity-auth (:8001), user (:8002), inventory (:8000), catalog (:8003) — each built
+from its own `Dockerfile` (`identity-auth/Dockerfile`, `user/Dockerfile`, `catalog/Dockerfile`;
+`inventory/Dockerfile` already existed, it's also inventory's real production image).
+
+`bootstrap`'s output (`.env.local` per service, with `moto`/`postgres`/`redis`/`inventory`
+container hostnames instead of `localhost`) is written into a shared docker volume per service,
+not a host bind-mount — see `bootstrap.py`'s `LOCAL_DEV_ENV_OUTPUT_ROOT` and each app's
+`ENV_LOCAL_PATH` env var. This sidesteps a real race: a host bind-mount of a file that doesn't
+exist yet turns into an empty directory the moment the app container starts, before `bootstrap`
+ever gets a chance to write the real file into it.
+
+Same caveat as the native path: `moto_server` is in-memory, so `docker compose down` (not just
+`stop`) — or a moto container restart — wipes Cognito/DynamoDB/SQS state. The next `docker
+compose up -d` re-runs `bootstrap` from scratch automatically; you don't need to do anything by
+hand. `docker compose down -v` additionally drops the Postgres data volume.
+
+**Not containerized**: `user/run_local_outbox_publisher.py` and `peek_otp.py` are one-off
+dev-only scripts, not long-running services — run those two natively (own venv) alongside the
+Docker stack, same as before:
+
+```bash
+cd user && python run_local_outbox_publisher.py       # polls outbox every 5s (stands in for the
+                                                       # real rate(1 minute) EventBridge Schedule)
+```
+
+## Option B: native (no service containers)
+
+Everything below this point (bootstrap/migrations/seeds, exercising the API, the architecture
+table) applies to both options identically — Option A just runs the same scripts inside
+containers instead of your own shell. Use this path if you want to edit a service's code and see
+it live without rebuilding an image.
+
+```bash
+cd services/local-dev
+docker compose up -d moto postgres redis   # just the infra, not the app services
 python bootstrap.py               # creates Cognito pool/client, DynamoDB table, SQS queues —
                                    # writes identity-auth/.env.local, user/.env.local,
                                    # inventory/.env.local (gitignored, regenerated every run)
@@ -45,8 +87,6 @@ python seed_catalog_products.py   # seeds 5 categories + 8 products — no admin
 `bootstrap.py` and `apply_migrations.py` are safe to re-run. `docker compose down -v` clears
 everything (moto_server's state is in-memory anyway — a container restart alone already wipes
 it, so re-run `bootstrap.py` after any restart).
-
-## Running the services
 
 Each in its own terminal, service's own venv activated:
 
@@ -136,8 +176,11 @@ curl localhost:8003/products/cow-milk   # stockState should now read OUT_OF_STOC
 
 | Piece | What it does |
 |---|---|
-| `docker-compose.yml` | `moto_server` (all of Cognito/DynamoDB/SQS/EventBridge on one port), `postgres` (three databases, `milkful_user` + `milkful_inventory` + `milkful_catalog`, via `init-databases.sql`), `redis` |
-| `bootstrap.py` | Creates the Cognito pool/client, `otp_requests` DynamoDB table, `zone-updated`/`otp-requested-debug`/`stock-changed` SQS queues (each with a DLQ where applicable), and the EventBridge rules routing to them — the direct-boto3 equivalent of what `cdk deploy` provisions for real. Writes each service's `.env.local`. |
+| `docker-compose.yml` | `moto_server` (all of Cognito/DynamoDB/SQS/EventBridge on one port), `postgres` (three databases, `milkful_user` + `milkful_inventory` + `milkful_catalog`, via `init-databases.sql`), `redis`, a one-shot `bootstrap` container, and (Option A) the four app services themselves — each built from its own `Dockerfile`. |
+| `Dockerfile.bootstrap` | Builds the one-shot `bootstrap` service's image (repo-root build context) — installs `local-dev/requirements.txt`, copies the whole repo in (needed for `apply_migrations.py`'s and the seed scripts' access to each service's `migrations/*.sql`), then runs `bootstrap.py && apply_migrations.py && seed_inventory_zones.py && seed_user_zone_slots.py && seed_catalog_products.py` and exits — the four app services' `depends_on: condition: service_completed_successfully` waits on that exit. |
+| `identity-auth/Dockerfile`, `user/Dockerfile` | Repo-root build context (so they can also copy `local-dev/_env_file.py` + `local-dev/_lambda_local_server.py`, which `run_local.py` needs) — otherwise just `pip install -r requirements-dev.txt` (needed for the shim's `PyJWT` dependency) then `python run_local.py`. |
+| `catalog/Dockerfile` | Own-directory build context, same shape as the pre-existing `inventory/Dockerfile` — no `local-dev/` dependency, since `catalog/src/main.py`/`inventory/src/main.py` are real, self-contained FastAPI entrypoints. |
+| `bootstrap.py` | Creates the Cognito pool/client, `otp_requests` DynamoDB table, `zone-updated`/`otp-requested-debug`/`stock-changed` SQS queues (each with a DLQ where applicable), and the EventBridge rules routing to them — the direct-boto3 equivalent of what `cdk deploy` provisions for real. Writes each service's `.env.local`, plus dummy `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (moto doesn't check these, but boto3's client construction raises `NoCredentialsError` without *something* present — true in a fresh container with no `~/.aws/credentials` even though it wasn't previously an issue on a host that already had these exported globally). `LOCAL_DEV_AWS_ENDPOINT_URL`/`LOCAL_DEV_DB_HOST`/`LOCAL_DEV_REDIS_HOST`/`LOCAL_DEV_INVENTORY_HTTP_URL` override the `localhost`-based defaults (used by the `bootstrap` compose service, pointing at `moto`/`postgres`/`redis`/`inventory` container hostnames instead); `LOCAL_DEV_ENV_OUTPUT_ROOT` overrides where `.env.local` gets written (a shared docker volume per service, for Option A, instead of the host path). |
 | `apply_migrations.py` | Runs each service's real `migrations/*.sql` against its local Postgres database, tracked in a `schema_migrations` table so re-runs only apply new files. |
 | `seed_inventory_zones.py` | Inserts one serviceability zone (pincode prefix `5600`) directly via SQL — there's no admin/write API for zones (MA-95 is read-only), so this is the only local option. Upserts, safe to re-run. |
 | `seed_user_zone_slots.py` | Inserts matching delivery slots into User Service's own `zone_slots` table (same `blr-central` zone id as above) — a separate table from Inventory's, not synced to it in any environment (see `user/README.md`'s flagged decision #1). Upserts, safe to re-run. |
@@ -145,20 +188,18 @@ curl localhost:8003/products/cow-milk   # stockState should now read OUT_OF_STOC
 | `_db.py` | Shared local-Postgres connection settings/helper used by every `seed_*.py` script, plus a friendly-error wrapper for "Postgres isn't up yet" / "migrations haven't been applied yet". |
 | `_zone_seed_data.py` | Shared zone/slot fixture data used by `seed_inventory_zones.py` and `seed_user_zone_slots.py`, so the two independently-seeded tables can't drift out of sync with each other. |
 | `_catalog_seed_data.py` | Shared category/product fixture data used by `seed_catalog_products.py` — category ids/icon names match the Flutter catalog screen's own icon-mapping switch exactly. |
-| `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. |
+| `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. Binds `0.0.0.0`, not `127.0.0.1` — a loopback-only bind works for a native/host run (the process *is* the machine) but is unreachable from outside a container's own network namespace, which is what Option A's published ports need. |
 | `peek_otp.py` | Local-only OTP visibility, since there's no real SMS provider to read the code from. |
-| `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's `main.py` carries a small inline duplicate since `local-dev/` isn't shipped in its container image. |
-| `AWS_ENDPOINT_URL` | The standard, unprefixed env var botocore already reads natively — no application code needed. `bootstrap.py` writes it into each generated `.env.local`, pointing at `http://localhost:5000`; unset in every real deployment, so behavior there is unaffected. |
+| `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's and catalog's `main.py` each carry a small inline duplicate since `local-dev/` isn't shipped in their container images. All four accept `ENV_LOCAL_PATH` to override where `.env.local` is read from (defaulting to the service's own directory) — set by the app services in Option A to point at the shared docker volume `bootstrap` wrote into, instead of a host path. |
+| `AWS_ENDPOINT_URL` | The standard, unprefixed env var botocore already reads natively — no application code needed. `bootstrap.py` writes it into each generated `.env.local`, pointing at `http://localhost:5000` (native) or `http://moto:5000` (Option A, via `LOCAL_DEV_AWS_ENDPOINT_URL`); unset in every real deployment, so behavior there is unaffected. |
 
 ## Known gaps
 
-- **No Docker daemon was available in the sandbox this was built in**, so the Postgres/Redis
-  containers and `docker compose up` itself could not be run end-to-end there. `bootstrap.py`
-  and the full identity-auth login flow (registration, login, logout) *were* verified directly
-  against a real `moto_server` process (pure Python, no Docker needed to run it standalone) — so
-  the AWS-facing half is proven; the Postgres-backed half (User Service register/get_me,
-  Inventory serviceability) is implemented the same way but wasn't exercised against a live
-  Postgres container. Worth a real run-through on a machine with Docker Desktop actually running.
+- ~~No Docker daemon was available in the sandbox this was built in~~ — since resolved: the full
+  `docker compose up -d` path (Option A above, including the `bootstrap` one-shot container and
+  all four app services) has been verified end-to-end on a machine with Docker Desktop running —
+  cold `down` then `up` re-provisions everything and all four services respond correctly with no
+  manual steps.
 - **`moto[server]` must be a recent version (>=5.2.2) if you're running it standalone instead of
   via `docker compose`** (e.g. because Docker isn't available, same fallback used while building
   and testing MA-21's login flow this session). `moto[server]==5.0.21` has a real bug where

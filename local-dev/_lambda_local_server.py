@@ -136,7 +136,11 @@ def _make_handler(routes: dict):
 
 def serve(routes: dict, port: int) -> None:
     handler_cls = _make_handler(routes)
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+    # 0.0.0.0, not 127.0.0.1: binding to loopback only works when this
+    # process *is* the machine (a native/host run) — inside a container,
+    # the host's published port maps to the container's external
+    # interface, which a loopback-only bind can never answer.
+    server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)  # noqa: S104
     print(f"Serving {len(routes)} route(s) on http://localhost:{port}")
     for method, path in routes:
         print(f"  {method:6s} {path}")

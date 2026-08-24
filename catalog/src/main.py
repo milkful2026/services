@@ -15,7 +15,13 @@ def _load_local_env_file() -> None:
     # since that import triggers the CORS-toggle env read at module-import
     # time). Duplicated, not imported, since local-dev/ isn't shipped in
     # the production image.
-    path = Path(__file__).resolve().parents[1] / ".env.local"
+    #
+    # ENV_LOCAL_PATH overrides the default path so the containerized
+    # version of this service can read .env.local from a shared docker
+    # volume (written by the "bootstrap" compose service) instead of
+    # this file's own directory — unset, and this is unchanged from a
+    # native/host run.
+    path = Path(os.environ.get("ENV_LOCAL_PATH", str(Path(__file__).resolve().parents[1] / ".env.local")))
     if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
