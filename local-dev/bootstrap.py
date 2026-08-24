@@ -22,21 +22,27 @@ committed — see .gitignore.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 
-ENDPOINT_URL = "http://localhost:5000"
+# Defaults target the host-side view (docker-compose's ports: mappings) —
+# what you get running this script directly on your machine. Overridable
+# so the same script also works from inside the one-shot "bootstrap"
+# compose service, which sees moto/postgres/redis/inventory by their
+# compose service name on the shared docker network, not localhost.
+ENDPOINT_URL = os.environ.get("LOCAL_DEV_AWS_ENDPOINT_URL", "http://localhost:5000")
 REGION = "us-east-1"
-DB_HOST = "localhost"
+DB_HOST = os.environ.get("LOCAL_DEV_DB_HOST", "localhost")
 DB_PORT = 5432
 DB_USER = "milkful"
 DB_PASSWORD = "milkful"
-REDIS_HOST = "localhost"
+REDIS_HOST = os.environ.get("LOCAL_DEV_REDIS_HOST", "localhost")
 REDIS_PORT = 6379
-INVENTORY_HTTP_URL = "http://localhost:8000"
+INVENTORY_HTTP_URL = os.environ.get("LOCAL_DEV_INVENTORY_HTTP_URL", "http://localhost:8000")
 
 _SERVICES_DIR = Path(__file__).resolve().parent.parent
 
@@ -256,8 +262,26 @@ def bootstrap_stock_changed_queue() -> str:
 
 
 def _write_env_file(service_dir: str, values: dict[str, str]) -> None:
-    path = _SERVICES_DIR / service_dir / ".env.local"
-    lines = [f"{key}={value}" for key, value in values.items()]
+    # Overridable so the one-shot "bootstrap" compose service can write
+    # each service's .env.local into a shared docker volume (mounted at
+    # e.g. /shared/<service>) instead of the host path — the app
+    # containers mount that same volume and read .env.local from there,
+    # rather than sharing a host bind-mount (which would race the file's
+    # first-ever creation against the app container's own mount setup).
+    output_root = Path(os.environ.get("LOCAL_DEV_ENV_OUTPUT_ROOT", _SERVICES_DIR))
+    path = output_root / service_dir / ".env.local"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # boto3's default credential chain (env vars / ~/.aws/credentials /
+    # IAM role) needs *something* present or every client construction
+    # raises NoCredentialsError before a single request reaches moto —
+    # which doesn't check these values, so any non-empty string works.
+    # Every service here talks to moto only, so these are written
+    # unconditionally rather than relying on the developer's own shell
+    # already having AWS creds exported (true on the machine this was
+    # built on, but not guaranteed elsewhere — and never true inside a
+    # freshly built container).
+    all_values = {"AWS_ACCESS_KEY_ID": "local", "AWS_SECRET_ACCESS_KEY": "local", **values}
+    lines = [f"{key}={value}" for key, value in all_values.items()]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[env] wrote {path}")
 

@@ -13,6 +13,7 @@ already run (creates .env.local, and the Postgres schema this service
 reads/writes).
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -25,8 +26,12 @@ from _lambda_local_server import serve  # noqa: E402
 
 # Before importing any handler module — populates real env vars
 # (including the standard AWS_ENDPOINT_URL boto3 already reads
-# natively) from bootstrap.py's generated .env.local.
-load_env_file(_SERVICE_DIR / ".env.local")
+# natively) from bootstrap.py's generated .env.local. ENV_LOCAL_PATH
+# lets the containerized version of this service read its .env.local
+# from a shared docker volume (written by the "bootstrap" compose
+# service) instead of this file's own directory — unset, and this is
+# unchanged from a native/host run.
+load_env_file(Path(os.environ.get("ENV_LOCAL_PATH", str(_SERVICE_DIR / ".env.local"))))
 
 import handlers.delivery_slots_handler as delivery_slots_handler  # noqa: E402
 import handlers.get_me_handler as get_me_handler  # noqa: E402

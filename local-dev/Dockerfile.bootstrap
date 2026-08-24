@@ -1,0 +1,16 @@
+# One-shot provisioning container: runs bootstrap.py, apply_migrations.py,
+# and the seed_*.py scripts once moto/postgres are healthy, then exits.
+# Build context is the repo root (services/) since apply_migrations.py
+# and the seed scripts read each service's migrations/*.sql directly.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY local-dev/requirements.txt ./local-dev/requirements.txt
+RUN pip install --no-cache-dir -r local-dev/requirements.txt
+
+COPY . .
+
+WORKDIR /app/local-dev
+
+CMD ["sh", "-c", "python bootstrap.py && python apply_migrations.py && python seed_inventory_zones.py && python seed_user_zone_slots.py && python seed_catalog_products.py"]

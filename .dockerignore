@@ -1,0 +1,13 @@
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/.coverage
+**/htmlcov/
+**/cdk.out/
+**/node_modules/
+**/.env.local
+**/*.log
+.git/
