@@ -8,33 +8,44 @@ import os
 import threading
 from pathlib import Path
 
-import uvicorn
-
-from adapters.zone_cache_adapter import RedisZoneCacheAdapter, build_redis_client
-from adapters.zone_update_consumer import ZoneUpdateConsumer
-from config.env import get_settings
-from handlers.app import app
-from handlers.health import consumer_health
-
-logger = logging.getLogger(__name__)
-
 
 def _load_local_env_file() -> None:
     # Local dev only: populates real env vars (including the standard
-    # AWS_ENDPOINT_URL botocore reads natively) from bootstrap.py's
-    # generated .env.local. A no-op if absent, as in every deployed
-    # environment. Duplicated (not imported) from local-dev/_env_file.py
-    # deliberately — this file is inventory's real container entrypoint,
-    # and local-dev/ isn't shipped in the production image.
+    # AWS_ENDPOINT_URL botocore reads natively, and INVENTORY_CORS_
+    # ALLOW_ALL, which handlers/app.py reads at *import* time) from
+    # bootstrap.py's generated .env.local. A no-op if absent, as in
+    # every deployed environment. Duplicated (not imported) from
+    # local-dev/_env_file.py deliberately — this file is inventory's
+    # real container entrypoint, and local-dev/ isn't shipped in the
+    # production image.
+    #
+    # Deliberately called here, before the imports below, not inside
+    # main() — handlers/app.py's CORS setup runs at import time
+    # (module-level, so a real CORSMiddleware can be installed once at
+    # app-construction rather than checked per-request), so the env
+    # file must be loaded before `from handlers.app import app` ever
+    # executes, not after.
     path = Path(__file__).resolve().parents[1] / ".env.local"
-    if not path.is_file():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_local_env_file()
+
+import uvicorn  # noqa: E402
+
+from adapters.zone_cache_adapter import RedisZoneCacheAdapter, build_redis_client  # noqa: E402
+from adapters.zone_update_consumer import ZoneUpdateConsumer  # noqa: E402
+from config.env import get_settings  # noqa: E402
+from handlers.app import app  # noqa: E402
+from handlers.health import consumer_health  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def _run_consumer() -> None:
@@ -61,7 +72,6 @@ def _run_consumer() -> None:
 
 
 def main() -> None:
-    _load_local_env_file()
     consumer_thread = threading.Thread(target=_run_consumer, daemon=True, name="zone-update-consumer")
     consumer_thread.start()
     uvicorn.run(app, host="0.0.0.0", port=8000)  # noqa: S104 — Fargate task, not exposed directly

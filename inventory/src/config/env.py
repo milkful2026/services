@@ -25,6 +25,12 @@ class Settings(BaseSettings):
 
     zone_updated_queue_url: str = ""
 
+    # Note: local-dev CORS support (INVENTORY_CORS_ALLOW_ALL) is read
+    # directly from os.environ in handlers/app.py, not through this
+    # class — see that file's comment for why (Settings' eager
+    # validation of every required field at construction time is unsafe
+    # to trigger at module-import time, which is when app.py needs this).
+
 
 def get_settings() -> Settings:
     """Instantiated lazily so tests can inject env vars before first access."""

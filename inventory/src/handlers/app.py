@@ -1,7 +1,10 @@
 """FastAPI app — thin: routing, exception translation, dependency wiring
 only. Business rules live in domain/serviceability_service.py."""
 
+import os
+
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from domain.exceptions import InventoryError
@@ -13,6 +16,23 @@ from handlers.serviceability_check_handler import router as public_router
 app = FastAPI(title="Inventory Service")
 app.include_router(public_router)
 app.include_router(internal_router)
+
+# Read directly from os.environ, not config.env.Settings — this runs at
+# import time (app-setup, before any request is handled), and Settings()
+# eagerly validates *every* required field (database_url, redis_host,
+# ...) the moment it's constructed. Those aren't guaranteed to be set yet
+# at this point (e.g. during test collection, which imports this module
+# before any test's env-var fixture has run) — going through Settings
+# here would turn a local-dev-only CORS toggle into a way to break
+# import entirely. Local dev only either way; never true in a real
+# deployment, where this defaults unset/False.
+if os.environ.get("INVENTORY_CORS_ALLOW_ALL", "").lower() == "true":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.exception_handler(InventoryError)
