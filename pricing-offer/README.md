@@ -90,13 +90,24 @@ pip install -r requirements-dev.txt
 pytest                          # unit only — no DB/AWS needed at all
 ```
 
-Running it (needs Catalog Service reachable at `PRICING_CATALOG_BASE_URL`):
+Running it (needs Catalog Service reachable at `PRICING_CATALOG_BASE_URL`). `PRICING_CORS_ALLOW_ALL`
+is required, not just available, if the caller is a browser (Flutter web) — matches catalog/
+inventory's own identical toggle, needed for the exact same reason (`bootstrap.py`'s own comment:
+"Flutter web's browser-origin CORS block"). Unlike those two, nothing writes it for you
+automatically here (no `bootstrap.py`/`.env.local` step in this build — see "Scope" above), so it
+must be set explicitly on every native run:
 
 ```bash
-cd pricing-offer && python src/main.py   # :8005
+cd pricing-offer && PRICING_CORS_ALLOW_ALL=true python src/main.py   # :8005
 ```
 
-Or via `services/local-dev`'s `docker compose up -d` — see that directory's own README.
+Or via `services/local-dev`'s `docker compose up -d` — see that directory's own README. Whichever
+docker-compose setup eventually wires this service in as a container (this build doesn't touch
+`docker-compose.yml` — see "Scope" above) must set `PRICING_CORS_ALLOW_ALL: "true"` in its
+`environment:` block, the same way `bootstrap.py` already does for `CATALOG_CORS_ALLOW_ALL`/
+`INVENTORY_CORS_ALLOW_ALL` — easy to forget since nothing fails loudly without it; a browser's
+CORS preflight block surfaces to Flutter/Dio as a generic connection error, not anything naming
+CORS.
 
 ```bash
 curl -X POST localhost:8005/pricing/quote \

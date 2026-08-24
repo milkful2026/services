@@ -60,9 +60,16 @@ cd inventory && python src/main.py                    # :8000 — this one's a r
 cd catalog && python src/main.py                      # :8003 — products/categories/search;
                                                        # also a real FastAPI app, same as
                                                        # inventory, no shim needed
-cd pricing-offer && python src/main.py                # :8005 — pricing/quote; no bootstrap
-                                                       # step needed — no DB/AWS at all, just
-                                                       # calls catalog's GET /products/{id}
+cd pricing-offer && PRICING_CORS_ALLOW_ALL=true python src/main.py   # :8005 — pricing/quote; no
+                                                       # bootstrap step needed — no DB/AWS at all,
+                                                       # just calls catalog's GET /products/{id}.
+                                                       # CORS must be set explicitly here (unlike
+                                                       # catalog/inventory above, nothing writes it
+                                                       # into a .env.local for this one) or a
+                                                       # browser-based (Flutter web) caller gets a
+                                                       # CORS preflight block that surfaces as a
+                                                       # generic connection error, not anything
+                                                       # naming CORS.
 ```
 
 ## Exercising registration + login
