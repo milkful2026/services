@@ -93,15 +93,14 @@ def _register_cognito_user(cognito_user_pool: dict, mobile: str = "+919876543210
     # these tests need a real Cognito user (and its real, moto-assigned
     # sub) for that lookup to find anything.
     #
-    # Returns (sub, resolved_mobile) rather than assuming resolved_mobile
-    # == mobile: moto has its own fidelity gap here (documented in
-    # test_cognito_attribute_adapter.py) where it always assigns a random
-    # UUID as Username instead of honoring UsernameAttributes=
-    # ["phone_number"] the way real Cognito does, so under moto
-    # get_mobile_by_sub actually resolves to that UUID, not the phone
-    # number passed to admin_create_user. Capturing the real, moto-actual
-    # Username here keeps this test asserting ground truth instead of a
-    # value moto can't actually produce.
+    # Returns (sub, resolved_mobile), where resolved_mobile is the
+    # `phone_number` attribute — real AWS Cognito (and moto, which
+    # deliberately mirrors it) never sets Username to the supplied value
+    # once UsernameAttributes is configured; it always assigns an
+    # internal GUID as Username instead and stores the supplied value as
+    # the phone_number attribute. get_mobile_by_sub reads that attribute
+    # (see cognito_attribute_adapter.py), so resolved_mobile == mobile
+    # here, same as it would against real Cognito.
     client = cognito_user_pool["client"]
     pool_id = cognito_user_pool["pool_id"]
     client.admin_create_user(
@@ -111,8 +110,8 @@ def _register_cognito_user(cognito_user_pool: dict, mobile: str = "+919876543210
         MessageAction="SUPPRESS",
     )
     user = client.admin_get_user(UserPoolId=pool_id, Username=mobile)
-    sub = next(a["Value"] for a in user["UserAttributes"] if a["Name"] == "sub")
-    return sub, user["Username"]
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    return attrs["sub"], attrs["phone_number"]
 
 
 def _mock_inventory_serviceable(serviceable: bool = True) -> None:
@@ -212,11 +211,7 @@ def test_get_me_after_registration_returns_b2c_profile(wired_env, cognito_user_p
     data = json.loads(response["body"])["data"]
     assert data["userId"] == user_id
     assert data["name"] == "Priya Sharma"
-    # Not asserted against the literal "+919876543210" passed to
-    # _register_cognito_user — see that helper's docstring for why (moto
-    # fidelity gap: Username, which get_mobile_by_sub reads as "mobile",
-    # is never actually set to the phone number under moto).
-    assert data["mobile"] == resolved_mobile
+    assert data["mobile"] == resolved_mobile == "+919876543210"
     assert data["accountType"] == "B2C"
     assert data["defaultAddressId"]
 

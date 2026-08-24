@@ -57,37 +57,45 @@ def test_sync_profile_attributes_updates_existing_user(pool_with_default_pincode
 _FAKE_UUID_SUB = "11111111-2222-3333-4444-555555555555"
 
 
-def test_get_mobile_by_sub_returns_the_username(pool_with_default_pincode_attribute, monkeypatch):
-    # Can't demonstrate this against a real moto-created user (see
-    # test_moto_ignores_username_attributes_and_always_assigns_a_uuid
-    # below) — stubbed the same way
-    # test_sync_profile_attributes_wraps_list_users_client_error stubs
-    # list_users for scenarios moto's fidelity can't reach.
-    adapter = CognitoAttributeAdapter(
-        user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
-    )
-    monkeypatch.setattr(
-        adapter._client,
-        "list_users",
-        lambda **kwargs: {"Users": [{"Username": "+919876543210"}]},
-    )
-
-    assert adapter.get_mobile_by_sub(_FAKE_UUID_SUB) == "+919876543210"
-
-
-def test_moto_ignores_username_attributes_and_always_assigns_a_uuid(
+def test_get_mobile_by_sub_returns_the_phone_number_attribute_not_username(
     pool_with_default_pincode_attribute,
 ):
-    """Documents a moto fidelity gap discovered while adding
-    get_mobile_by_sub: real Cognito, with UsernameAttributes=
-    ["phone_number"] (this pool's actual config — see identity-auth's
-    cognito_adapter.py, whose whole design depends on Username literally
-    becoming the value passed to AdminCreateUser), sets Username to that
-    value. moto instead always assigns a random UUID as Username
-    (reusing the same UUID as `sub`) regardless of UsernameAttributes,
-    so a moto-created user can never demonstrate Username == mobile —
-    see the stubbed test above for how get_mobile_by_sub is actually
-    verified instead."""
+    """Real end-to-end coverage, no stubbing: moto correctly models real
+    AWS Cognito's documented UsernameAttributes behavior (confirmed by
+    reading moto.cognitoidp.models.CognitoIdpBackend.admin_create_user's
+    own source) — Username always becomes an internally-assigned GUID,
+    never the value passed in, and that value instead lands in the
+    `phone_number` attribute. get_mobile_by_sub must read that attribute,
+    not Username — see test_username_is_never_the_supplied_value below
+    for the same fact demonstrated directly against admin_get_user."""
+    client = pool_with_default_pincode_attribute["client"]
+    pool_id = pool_with_default_pincode_attribute["pool_id"]
+    client.admin_create_user(
+        UserPoolId=pool_id,
+        Username="+919876543210",
+        UserAttributes=[{"Name": "phone_number", "Value": "+919876543210"}],
+        MessageAction="SUPPRESS",
+    )
+    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")[
+        "UserAttributes"
+    ]
+    cognito_sub = next(a["Value"] for a in user_attrs if a["Name"] == "sub")
+
+    adapter = CognitoAttributeAdapter(user_pool_id=pool_id, region_name="ap-south-1")
+
+    assert adapter.get_mobile_by_sub(cognito_sub) == "+919876543210"
+
+
+def test_username_is_never_the_supplied_value(pool_with_default_pincode_attribute):
+    """Real AWS Cognito, with UsernameAttributes=["phone_number"] (this
+    pool's actual config — see identity-auth's cognito_adapter.py),
+    always assigns a persistent internal GUID as Username (reused as
+    `sub`) and stores the supplied value in the `phone_number` attribute
+    instead — never Username itself. moto deliberately mirrors this (see
+    its own source comment on admin_create_user); this was previously
+    misread as a moto fidelity gap, which led get_mobile_by_sub to read
+    Username instead of the phone_number attribute — a bug that would
+    have reproduced against real AWS too, not just under moto."""
     client = pool_with_default_pincode_attribute["client"]
     pool_id = pool_with_default_pincode_attribute["pool_id"]
     client.admin_create_user(
