@@ -2,11 +2,12 @@
 credential/port change is a one-file edit instead of a per-script one.
 """
 
+import os
 import sys
 
 import psycopg2
 
-DB_HOST = "localhost"
+DB_HOST = os.environ.get("LOCAL_DEV_DB_HOST", "localhost")
 DB_PORT = 5432
 DB_USER = "milkful"
 DB_PASSWORD = "milkful"

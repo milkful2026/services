@@ -10,6 +10,7 @@ Requires services/local-dev/bootstrap.py to have already run (creates
 this service's .env.local with the moto-backed Cognito pool/table IDs).
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -22,8 +23,12 @@ from _lambda_local_server import serve  # noqa: E402
 
 # Before importing any handler module — populates real env vars
 # (including the standard AWS_ENDPOINT_URL boto3 already reads
-# natively) from bootstrap.py's generated .env.local.
-load_env_file(_SERVICE_DIR / ".env.local")
+# natively) from bootstrap.py's generated .env.local. ENV_LOCAL_PATH
+# lets the containerized version of this service read its .env.local
+# from a shared docker volume (written by the "bootstrap" compose
+# service) instead of this file's own directory — unset, and this is
+# unchanged from a native/host run.
+load_env_file(Path(os.environ.get("ENV_LOCAL_PATH", str(_SERVICE_DIR / ".env.local"))))
 
 import handlers.login_otp_send_handler as login_otp_send_handler  # noqa: E402
 import handlers.login_otp_verify_handler as login_otp_verify_handler  # noqa: E402
