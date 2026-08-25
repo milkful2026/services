@@ -8,7 +8,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY identity-auth/requirements.txt identity-auth/requirements-dev.txt ./identity-auth/
-RUN pip install --no-cache-dir -r identity-auth/requirements-dev.txt
+RUN pip install --no-cache-dir --default-timeout=300 --retries=10 -r identity-auth/requirements-dev.txt
 
 COPY identity-auth/ ./identity-auth/
 COPY local-dev/_env_file.py local-dev/_lambda_local_server.py ./local-dev/
