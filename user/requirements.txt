@@ -1,7 +1,7 @@
-aws-lambda-powertools[tracer]==2.43.1
-pydantic==2.9.2
-pydantic-settings==2.6.1
-sqlalchemy==2.0.36
-psycopg2-binary==2.9.10
-requests==2.32.3
-boto3==1.35.68
+aws-lambda-powertools[tracer]
+pydantic
+pydantic-settings
+sqlalchemy
+psycopg2-binary
+requests
+boto3
