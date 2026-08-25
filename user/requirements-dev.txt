@@ -1,11 +1,11 @@
 -r requirements.txt
-pytest==8.3.4
-pytest-cov==6.0.0
-pytest-mock==3.14.0
-moto[cognitoidp,events]==5.0.21
-responses==0.25.3
-aws-cdk-lib==2.170.0
-constructs>=10.0.0,<11.0.0
+pytest
+pytest-cov
+pytest-mock
+moto[cognitoidp,events]
+responses
+aws-cdk-lib
+constructs
 # Only for services/local-dev/_lambda_local_server.py's unverified JWT
 # decode when running run_local.py — no production code imports this.
-PyJWT==2.10.1
+PyJWT
