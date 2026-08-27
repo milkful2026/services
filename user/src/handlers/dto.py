@@ -106,6 +106,7 @@ def serialize_user_profile(profile: UserProfile) -> dict[str, Any]:
         "mobile": profile.mobile,
         "accountType": profile.account_type,
         "defaultAddressId": profile.default_address_id,
+        "defaultAddressState": profile.default_address_state,
     }
 
 

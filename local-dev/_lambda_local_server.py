@@ -15,6 +15,17 @@ claims`. Fine for a developer's own machine; never a stand-in for the
 real authorizer anywhere else. Requires PyJWT — already a dependency of
 identity-auth; added to user/inventory's requirements-dev.txt purely for
 this shim (their own handler code never imports it).
+
+CORS: a real API Gateway deployment sits behind whatever origin the
+Flutter app is served from, so cross-origin isn't a concern there. This
+shim serves the Flutter web build (a different localhost port) directly
+though, so every response needs CORS headers and OPTIONS preflight
+requests need answering, or the browser silently blocks every call
+before it even reaches this handler — discovered by actually running
+the app in Chrome, not by curl/dart, since neither of those enforce
+CORS. `Access-Control-Allow-Origin: *` is fine here specifically because
+this is local-dev-only, never-deployed tooling with no cookies/
+credentialed requests involved (auth is a Bearer header, not a cookie).
 """
 
 import json
@@ -36,18 +47,40 @@ def _decode_jwt_claims(auth_header: str | None) -> dict:
         return {}
 
 
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Max-Age": "86400",
+}
+
+
 def _make_handler(routes: dict):
     class Handler(BaseHTTPRequestHandler):
+        def _write(self, status: int, body: bytes, extra_headers: dict | None = None) -> None:
+            self.send_response(status)
+            for key, value in _CORS_HEADERS.items():
+                self.send_header(key, value)
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_OPTIONS(self) -> None:
+            # Preflight — the browser sends this before any request with a
+            # non-"simple" Content-Type (application/json) or a custom
+            # header (Authorization, X-Request-Id), and blocks the actual
+            # request entirely if this isn't answered correctly.
+            self._write(204, b"")
+
         def _dispatch(self, method: str) -> None:
             parsed = urlsplit(self.path)
             route_fn = routes.get((method, parsed.path))
             if route_fn is None:
                 body = json.dumps({"error": f"no local route for {method} {parsed.path}"}).encode()
-                self.send_response(404)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._write(404, body, {"Content-Type": "application/json"})
                 return
 
             content_length = int(self.headers.get("Content-Length", 0) or 0)
@@ -76,26 +109,15 @@ def _make_handler(routes: dict):
                 body = json.dumps(
                     {"error": "local server: handler raised an unhandled exception, see server log"}
                 ).encode()
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._write(500, body, {"Content-Type": "application/json"})
                 return
 
             status = response.get("statusCode", 200)
             resp_headers = dict(response.get("headers") or {})
             resp_body = response.get("body") or ""
             resp_body_bytes = resp_body.encode("utf-8")
-
-            self.send_response(status)
             resp_headers.setdefault("Content-Type", "application/json")
-            for key, value in resp_headers.items():
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(resp_body_bytes)))
-            self.end_headers()
-            if resp_body_bytes:
-                self.wfile.write(resp_body_bytes)
+            self._write(status, resp_body_bytes, resp_headers)
 
         def do_GET(self) -> None:
             self._dispatch("GET")

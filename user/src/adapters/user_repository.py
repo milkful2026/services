@@ -181,6 +181,7 @@ class SqlAlchemyUserRepository:
             mobile=user_row.mobile,
             account_type=user_row.account_type,
             default_address_id=default_row.id if default_row else "",
+            default_address_state=default_row.state if default_row else None,
         )
 
     def register(

@@ -1,0 +1,5 @@
+aws-lambda-powertools[tracer]==2.43.1
+pydantic==2.9.2
+pydantic-settings==2.6.1
+boto3==1.35.68
+requests==2.32.3

@@ -58,3 +58,4 @@ class UserProfile:
     mobile: str
     account_type: str  # "B2C" | "B2B" — always "B2C" until a B2B onboarding path exists
     default_address_id: str
+    default_address_state: str | None = None  # None when no default address is set

@@ -8,7 +8,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY user/requirements.txt user/requirements-dev.txt ./user/
-RUN pip install --no-cache-dir --default-timeout=300 --retries=10 -r user/requirements-dev.txt
+RUN pip install --no-cache-dir -r user/requirements-dev.txt
 
 COPY user/ ./user/
 COPY local-dev/_env_file.py local-dev/_lambda_local_server.py ./local-dev/
