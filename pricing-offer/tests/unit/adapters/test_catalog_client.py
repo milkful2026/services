@@ -2,7 +2,11 @@ import pytest
 import responses
 
 from adapters.catalog_client import HttpCatalogClient
-from domain.exceptions import ProductPricingUnknownError, ServiceUnavailableError
+from domain.exceptions import (
+    CatalogIntegrationError,
+    ProductPricingUnknownError,
+    ServiceUnavailableError,
+)
 
 
 def _client() -> HttpCatalogClient:
@@ -72,3 +76,47 @@ def test_get_price_succeeds_on_retry_after_one_transient_failure():
 
     assert price == 68.0
     assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_get_price_does_not_retry_a_4xx_other_than_404():
+    responses.add(
+        responses.GET,
+        "http://catalog.test/products/",
+        json={"requestId": "r1", "status": "error", "data": {}},
+        status=422,
+    )
+
+    with pytest.raises(CatalogIntegrationError):
+        _client().get_price("")
+
+    # Not retried: a 422 means Catalog rejected this exact request, so
+    # retrying it unchanged can't produce a different response.
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_get_price_maps_malformed_200_body_to_catalog_integration_error():
+    responses.add(
+        responses.GET,
+        "http://catalog.test/products/cow-milk",
+        json={"requestId": "r1", "status": "success", "data": {}},
+        status=200,
+    )
+
+    with pytest.raises(CatalogIntegrationError):
+        _client().get_price("cow-milk")
+
+
+@responses.activate
+def test_get_price_sends_the_given_correlation_id():
+    responses.add(
+        responses.GET,
+        "http://catalog.test/products/cow-milk",
+        json={"requestId": "r1", "status": "success", "data": {"id": "cow-milk", "price": 68}},
+        status=200,
+    )
+
+    _client().get_price("cow-milk", correlation_id="corr-123")
+
+    assert responses.calls[0].request.headers["x-correlation-id"] == "corr-123"

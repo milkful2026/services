@@ -11,7 +11,7 @@ class FakeCatalogClient:
         self.error = error
         self.requested_product_ids: list[str] = []
 
-    def get_price(self, product_id: str) -> float:
+    def get_price(self, product_id: str, correlation_id: str = "") -> float:
         self.requested_product_ids.append(product_id)
         if self.error is not None:
             raise self.error
@@ -72,7 +72,9 @@ def test_multiple_line_items_sum_into_one_cart_level_quote():
     result = service.quote(items, delivery_state="Karnataka")
 
     assert result.base_price == 718.0
-    assert catalog_client.requested_product_ids == ["cow-milk", "cow-ghee"]
+    # Items are fetched concurrently now, so only the *set* of requested
+    # products (not the order) is guaranteed.
+    assert sorted(catalog_client.requested_product_ids) == ["cow-ghee", "cow-milk"]
 
 
 def test_mixed_frequencies_across_line_items_omit_the_monthly_estimate():

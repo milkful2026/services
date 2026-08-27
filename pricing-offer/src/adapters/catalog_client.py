@@ -16,7 +16,11 @@ import requests
 from requests.exceptions import RequestException
 
 from adapters.retry import call_with_retry
-from domain.exceptions import ProductPricingUnknownError, ServiceUnavailableError
+from domain.exceptions import (
+    CatalogIntegrationError,
+    ProductPricingUnknownError,
+    ServiceUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,27 +42,46 @@ class HttpCatalogClient:
         self._max_retries = max_retries
         self._backoff_base_seconds = backoff_base_seconds
 
-    def get_price(self, product_id: str) -> float:
+    def get_price(self, product_id: str, correlation_id: str = "") -> float:
         url = f"{self._base_url}/products/{product_id}"
+        headers = {"x-correlation-id": correlation_id}
 
         def _attempt() -> float:
             try:
-                response = requests.get(url, timeout=self._timeout_seconds)
+                response = requests.get(url, timeout=self._timeout_seconds, headers=headers)
             except RequestException as exc:
                 raise _RetryableCatalogError(str(exc)) from exc
 
             if response.status_code == 200:
-                return float(response.json()["data"]["price"])
+                try:
+                    return float(response.json()["data"]["price"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise CatalogIntegrationError(
+                        "Catalog Service returned a 200 with no usable price",
+                        details={"productId": product_id},
+                    ) from exc
             if response.status_code == 404:
                 raise ProductPricingUnknownError(
                     f"No such product: {product_id}", details={"productId": product_id}
+                )
+            if response.status_code < 500:
+                # A non-404 4xx means Catalog rejected this exact request —
+                # retrying it unchanged won't produce a different answer.
+                raise CatalogIntegrationError(
+                    f"Catalog Service rejected the request: HTTP {response.status_code}",
+                    details={"productId": product_id, "status": response.status_code},
                 )
             raise _RetryableCatalogError(f"Catalog Service returned HTTP {response.status_code}")
 
         def _on_attempt_failure(exc: Exception, attempt: int) -> None:
             logger.error(
                 "catalog_client.get_price request failed",
-                extra={"productId": product_id, "attempt": attempt, "error": str(exc)},
+                extra={
+                    "correlationId": correlation_id,
+                    "productId": product_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                },
             )
 
         try:

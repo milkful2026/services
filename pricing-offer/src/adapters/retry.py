@@ -26,6 +26,8 @@ def call_with_retry(
     uncounted. Re-raises the final attempt's exception once retries are
     exhausted.
     """
+    if max_retries < 0:
+        raise ValueError(f"max_retries must be >= 0 (got {max_retries})")
     last_exc: Exception
     for attempt in range(max_retries + 1):
         try:

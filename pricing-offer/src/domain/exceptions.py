@@ -44,3 +44,15 @@ class ServiceUnavailableError(PricingError):
 
     error_code = "SERVICE_UNAVAILABLE"
     http_status = 503
+
+
+class CatalogIntegrationError(PricingError):
+    """Catalog Service answered, but with something pricing-offer can't
+    use: a well-formed non-200/404 status (e.g. it rejected the request
+    outright) or a 200 body missing the expected `data.price` field.
+    Never retried — retrying an identical request against a response we
+    already got and couldn't parse or that was rejected won't change the
+    outcome, unlike a transient 5xx/network failure."""
+
+    error_code = "CATALOG_INTEGRATION_ERROR"
+    http_status = 502

@@ -17,8 +17,8 @@ class FakePricingService:
         self.error = error
         self.quote_calls: list[tuple] = []
 
-    def quote(self, items: list[QuoteLineItem], delivery_state):
-        self.quote_calls.append((items, delivery_state))
+    def quote(self, items: list[QuoteLineItem], delivery_state, correlation_id: str = ""):
+        self.quote_calls.append((items, delivery_state, correlation_id))
         if self.error is not None:
             raise self.error
         return self.quote_result
@@ -74,11 +74,12 @@ def test_quote_success_returns_the_serialized_quote(client):
         "discountAmount": None,
         "appliedOfferId": None,
     }
-    items, delivery_state = service.quote_calls[0]
+    items, delivery_state, correlation_id = service.quote_calls[0]
     assert items == [
         QuoteLineItem(product_id="cow-milk", quantity=1, frequency=Frequency.ONE_TIME)
     ]
     assert delivery_state == "Karnataka"
+    assert correlation_id  # generated when the client sends no x-request-id
 
 
 def test_quote_offer_code_is_accepted_but_not_required(client):
@@ -117,6 +118,37 @@ def test_quote_missing_items_is_a_422(client):
     response = client.post("/pricing/quote", json={"deliveryState": "Karnataka"})
 
     assert response.status_code == 422
+
+
+def test_quote_blank_product_id_is_a_422_not_a_catalog_call(client):
+    service = _override(FakePricingService(quote_result=_QUOTE))
+
+    response = client.post(
+        "/pricing/quote",
+        json={
+            "items": [{"productId": "", "quantity": 1, "frequency": "ONE_TIME"}],
+            "deliveryState": "Karnataka",
+        },
+    )
+
+    assert response.status_code == 422
+    assert service.quote_calls == []
+
+
+def test_quote_propagates_the_inbound_x_request_id_as_correlation_id(client):
+    service = _override(FakePricingService(quote_result=_QUOTE))
+
+    client.post(
+        "/pricing/quote",
+        json={
+            "items": [{"productId": "cow-milk", "quantity": 1, "frequency": "ONE_TIME"}],
+            "deliveryState": "Karnataka",
+        },
+        headers={"x-request-id": "caller-corr-id"},
+    )
+
+    _, _, correlation_id = service.quote_calls[0]
+    assert correlation_id == "caller-corr-id"
 
 
 def test_quote_invalid_request_from_domain_maps_to_400(client):

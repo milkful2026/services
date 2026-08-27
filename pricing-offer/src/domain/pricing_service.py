@@ -17,6 +17,8 @@ The two simplifications that shape this file specifically:
   used here.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
 from adapters.interfaces import CatalogClientPort
 from domain.exceptions import InvalidRequestError
 from domain.models import Frequency, Quote, QuoteLineItem
@@ -33,7 +35,12 @@ class PricingService:
         self._tax_rate_percent = tax_rate_percent
         self._delivery_fee = delivery_fee
 
-    def quote(self, items: list[QuoteLineItem], delivery_state: str | None) -> Quote:
+    def quote(
+        self,
+        items: list[QuoteLineItem],
+        delivery_state: str | None,
+        correlation_id: str = "",
+    ) -> Quote:
         if not items:
             raise InvalidRequestError("items must not be empty")
         if not delivery_state:
@@ -47,8 +54,19 @@ class PricingService:
             if item.quantity < 1:
                 raise InvalidRequestError(f"quantity must be at least 1 (got {item.quantity})")
 
+        # Fan out to Catalog concurrently — each item's HTTP call (with its
+        # own retry/backoff) is independent, so N items shouldn't cost N×
+        # a single item's latency. ThreadPoolExecutor.map preserves result
+        # order to match `items`, regardless of completion order.
+        with ThreadPoolExecutor(max_workers=len(items)) as executor:
+            prices = list(
+                executor.map(
+                    lambda item: self._catalog_client.get_price(item.product_id, correlation_id),
+                    items,
+                )
+            )
         base_price = sum(
-            self._catalog_client.get_price(item.product_id) * item.quantity for item in items
+            price * item.quantity for price, item in zip(prices, items, strict=True)
         )
         tax_amount = round(base_price * self._tax_rate_percent / 100, 2)
         net_payable = round(base_price + tax_amount + self._delivery_fee, 2)

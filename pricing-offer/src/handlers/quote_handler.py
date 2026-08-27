@@ -1,6 +1,8 @@
 """POST /pricing/quote — MA-101/MA-122 FR-1."""
 
-from fastapi import APIRouter, Depends
+import uuid
+
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from domain.exceptions import InvalidRequestError
@@ -13,7 +15,7 @@ router = APIRouter(tags=["pricing"])
 
 
 class QuoteLineItemDto(BaseModel):
-    product_id: str = Field(alias="productId")
+    product_id: str = Field(alias="productId", min_length=1)
     quantity: int
     frequency: str
 
@@ -35,8 +37,13 @@ class QuoteRequestDto(BaseModel):
 @router.post("/pricing/quote")
 def quote(
     request: QuoteRequestDto,
+    http_request: Request,
     service: PricingService = Depends(get_pricing_service),
 ):
+    # Threaded through to the catalog client as a request parameter (never
+    # stored on the singleton service/client instances) so concurrent
+    # requests can't leak each other's correlation IDs into their logs.
+    correlation_id = http_request.headers.get("x-request-id", str(uuid.uuid4()))
     items = [
         QuoteLineItem(
             product_id=item.product_id,
@@ -45,7 +52,7 @@ def quote(
         )
         for item in request.items
     ]
-    result = service.quote(items, request.delivery_state)
+    result = service.quote(items, request.delivery_state, correlation_id)
     return success_envelope(serialize_quote(result))
 
 
