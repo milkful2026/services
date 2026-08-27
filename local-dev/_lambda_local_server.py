@@ -49,7 +49,7 @@ def _decode_jwt_claims(auth_header: str | None) -> dict:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Max-Age": "86400",
 }
@@ -124,6 +124,9 @@ def _make_handler(routes: dict):
 
         def do_POST(self) -> None:
             self._dispatch("POST")
+
+        def do_PUT(self) -> None:
+            self._dispatch("PUT")
 
         def do_DELETE(self) -> None:
             self._dispatch("DELETE")

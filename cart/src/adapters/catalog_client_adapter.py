@@ -57,7 +57,20 @@ class HttpCatalogClient:
                 raise _RetryableCatalogError(str(exc)) from exc
 
             if response.status_code == 200:
-                return response.json()["data"].get("availableQuantity")
+                try:
+                    quantity = response.json()["data"].get("availableQuantity")
+                except (ValueError, KeyError, AttributeError, TypeError) as exc:
+                    # A 200 whose body isn't the expected {"data": {...}}
+                    # envelope (non-JSON, an error envelope, an HTML error
+                    # page from a proxy, `data` as a list) is treated like
+                    # any other transport failure — retried, then surfaced
+                    # as StockCheckUnavailableError — never propagated raw,
+                    # which interfaces.py documents as this adapter's only
+                    # failure mode.
+                    raise _RetryableCatalogError(
+                        f"malformed 200 body from Catalog: {exc}"
+                    ) from exc
+                return quantity
             if response.status_code == 404:
                 # Deliberately not raised as a distinct "product vanished"
                 # case here — the caller (cart_service) already knows the
