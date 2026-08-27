@@ -43,6 +43,9 @@ DB_PASSWORD = "milkful"
 REDIS_HOST = os.environ.get("LOCAL_DEV_REDIS_HOST", "localhost")
 REDIS_PORT = 6379
 INVENTORY_HTTP_URL = os.environ.get("LOCAL_DEV_INVENTORY_HTTP_URL", "http://localhost:8000")
+CATALOG_HTTP_URL = os.environ.get("LOCAL_DEV_CATALOG_HTTP_URL", "http://localhost:8003")
+USER_HTTP_URL = os.environ.get("LOCAL_DEV_USER_HTTP_URL", "http://localhost:8002")
+PRICING_HTTP_URL = os.environ.get("LOCAL_DEV_PRICING_HTTP_URL", "http://localhost:8005")
 
 _SERVICES_DIR = Path(__file__).resolve().parent.parent
 
@@ -191,6 +194,46 @@ def bootstrap_dynamodb() -> str:
     return table_name
 
 
+def bootstrap_cart_table() -> str:
+    # Same shape as bootstrap_dynamodb()'s otp_requests table — single
+    # table, TTL enabled, no GSI needed since cart_repository.py's every
+    # access pattern is PK-only (Query by userId) or a full Scan
+    # (the outbox drain), never a secondary-attribute lookup.
+    client = boto3.client("dynamodb", **_creds)
+    table_name = "cart"
+    try:
+        client.create_table(
+            TableName=table_name,
+            BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[
+                {"AttributeName": "userId", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+            ],
+            KeySchema=[
+                {"AttributeName": "userId", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+        )
+        print(f"[dynamodb] created table {table_name}")
+    except ClientError as exc:
+        if _ignore_already_exists(exc, "ResourceInUseException"):
+            print(f"[dynamodb] table {table_name} already exists, skipping")
+        else:
+            raise
+
+    try:
+        client.update_time_to_live(
+            TableName=table_name,
+            TimeToLiveSpecification={"Enabled": True, "AttributeName": "expiresAt"},
+        )
+    except ClientError as exc:
+        # Same moto caveat as bootstrap_dynamodb()'s own otp_requests
+        # table — best-effort, not fatal for local dev.
+        print(f"[dynamodb] update_time_to_live skipped: {exc}")
+
+    return table_name
+
+
 def bootstrap_sqs_and_eventbridge() -> str:
     sqs = boto3.client("sqs", **_creds)
     events = boto3.client("events", **_creds)
@@ -289,6 +332,7 @@ def _write_env_file(service_dir: str, values: dict[str, str]) -> None:
 def main() -> None:
     pool_id, client_id = bootstrap_cognito()
     table_name = bootstrap_dynamodb()
+    cart_table_name = bootstrap_cart_table()
     queue_url = bootstrap_sqs_and_eventbridge()
     stock_changed_queue_url = bootstrap_stock_changed_queue()
 
@@ -357,6 +401,29 @@ def main() -> None:
             # Local dev only — see inventory's identical entry above for
             # why (Flutter web's browser-origin CORS block).
             "CATALOG_CORS_ALLOW_ALL": "true",
+        },
+    )
+    _write_env_file(
+        "cart",
+        {
+            # Every key here is prefixed CART_CART_*/CART_* per
+            # config.env.Settings' own SettingsConfigDict(env_prefix=
+            # "CART_") — pydantic-settings prepends the prefix to the
+            # field name verbatim, it doesn't replace a leading "cart_"
+            # already in it (matches e.g. identity-auth's own
+            # IDENTITY_AUTH_OTP_REQUESTS_TABLE_NAME for
+            # otp_requests_table_name).
+            "CART_AWS_REGION": REGION,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "CART_CART_TABLE_NAME": cart_table_name,
+            "CART_EVENT_BUS_NAME": "default",
+            "CART_CATALOG_INTERNAL_BASE_URL": CATALOG_HTTP_URL,
+            "CART_USER_INTERNAL_BASE_URL": USER_HTTP_URL,
+            "CART_PRICING_INTERNAL_BASE_URL": PRICING_HTTP_URL,
+            # Left unset — matches config.env.Settings' own "" default:
+            # MA-100 (Wallet Service) doesn't exist, so there's no real
+            # URL to point at (HttpWalletClient never uses this value
+            # today regardless — see its own module docstring).
         },
     )
     print("\nDone. Next: python apply_migrations.py, then start each service.")
