@@ -355,6 +355,63 @@ class DynamoDbCartRepository:
             )
             raise CartServiceError("Failed to delete cart item") from exc
 
+    # -- outbox (outbox_publisher_handler only) --------------------------
+
+    def get_unpublished_outbox_events(self, limit: int) -> list[dict[str, Any]]:
+        # No GSI exists for "every unpublished OUTBOX# row across all
+        # users" — this table's only key is (userId, SK), so finding rows
+        # across *every* partition needs a Scan, not a Query. Acceptable
+        # for this story's expected volume (a periodic, best-effort poll,
+        # same cadence as user's own outbox publisher) but doesn't scale
+        # indefinitely — a GSI (e.g. a constant partition key + SK) would
+        # be the fix if outbox volume ever became Scan-prohibitive.
+        # `Limit` bounds items *examined*, not items *matching* the
+        # filter — a single call may return fewer than `limit` rows even
+        # when more unpublished events exist; the next scheduled run
+        # picks up whatever this one didn't reach, same as user's own
+        # publisher already tolerates via its own outbox_batch_size.
+        try:
+            response = self._client.scan(
+                TableName=self._table_name,
+                FilterExpression="begins_with(SK, :prefix) AND attribute_not_exists(publishedAt)",
+                ExpressionAttributeValues={":prefix": _to_av(_OUTBOX_PREFIX)},
+                Limit=limit,
+            )
+        except ClientError as exc:
+            logger.error(
+                "cart_repository.get_unpublished_outbox_events failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise CartServiceError("Failed to read outbox events") from exc
+
+        events = []
+        for raw_item in response.get("Items", []):
+            item = {k: _deserializer.deserialize(v) for k, v in raw_item.items()}
+            payload = json.loads(item["payload"])
+            events.append(
+                {
+                    "userId": item["userId"],
+                    "eventId": item["SK"].removeprefix(_OUTBOX_PREFIX),
+                    "type": item["type"],
+                    "payload": payload,
+                }
+            )
+        return events
+
+    def mark_outbox_published(self, user_id: str, event_id: str) -> None:
+        try:
+            self._table.update_item(
+                Key={"userId": user_id, "SK": f"{_OUTBOX_PREFIX}{event_id}"},
+                UpdateExpression="SET publishedAt = :now",
+                ExpressionAttributeValues={":now": datetime.now(UTC).isoformat()},
+            )
+        except ClientError as exc:
+            logger.error(
+                "cart_repository.mark_outbox_published failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise CartServiceError("Failed to mark outbox event published") from exc
+
     # -- transaction-item builders ---------------------------------------
 
     def _meta_upsert_transact_item(
@@ -395,7 +452,9 @@ class DynamoDbCartRepository:
             "Update": {
                 "TableName": self._table_name,
                 "Key": {"userId": _to_av(user_id), "SK": _to_av(_META_SK)},
-                "UpdateExpression": "SET cartVersion = if_not_exists(cartVersion, :zero) + :one, expiresAt = :exp",
+                "UpdateExpression": (
+                    "SET cartVersion = if_not_exists(cartVersion, :zero) + :one, expiresAt = :exp"
+                ),
                 "ExpressionAttributeValues": {
                     ":zero": _to_av(0),
                     ":one": _to_av(1),

@@ -40,7 +40,9 @@ class FakeCartRepository:
         )
 
     def replace_cart(self, user_id, items, if_version):
-        self.replace_cart_calls.append({"user_id": user_id, "items": items, "if_version": if_version})
+        self.replace_cart_calls.append(
+            {"user_id": user_id, "items": items, "if_version": if_version}
+        )
         return Cart(line_items=[], cart_version=if_version + 1)
 
     def delete_item(self, user_id, line_item_id):
@@ -87,7 +89,9 @@ class FakePricingClient:
         self.correlation_id = correlation_id
 
     def quote(self, items, delivery_state, offer_code=None):
-        self.calls.append({"items": items, "delivery_state": delivery_state, "offer_code": offer_code})
+        self.calls.append(
+            {"items": items, "delivery_state": delivery_state, "offer_code": offer_code}
+        )
         return self.quote_result
 
 
@@ -118,10 +122,14 @@ def _service(
     pricing = FakePricingClient(quote)
     wallet = FakeWalletClient(wallet_balance, wallet_raises)
     service = CartService(repo, catalog, user, pricing, wallet, wallet_minimum_balance)
-    return service, {"repo": repo, "catalog": catalog, "user": user, "pricing": pricing, "wallet": wallet}
+    return service, {
+        "repo": repo, "catalog": catalog, "user": user, "pricing": pricing, "wallet": wallet,
+    }
 
 
-def _item(id="item-1", product_id="cow-milk", quantity=1, frequency=Frequency.ONE_TIME, start_date=None):
+def _item(
+    id="item-1", product_id="cow-milk", quantity=1, frequency=Frequency.ONE_TIME, start_date=None
+):
     return LineItem(id=id, product_id=product_id, quantity=quantity, frequency=frequency,
                      start_date=start_date, added_at="2026-08-28T00:00:00Z")
 
@@ -214,7 +222,8 @@ def test_add_item_unknown_stock_never_blocks():
     # None must never be treated as "out of stock" regardless of quantity.
     service, _ = _service(available_quantity=None)
 
-    service.add_item("user-1", "cow-milk", 1_000_000, Frequency.ONE_TIME, None, None)  # must not raise
+    # must not raise
+    service.add_item("user-1", "cow-milk", 1_000_000, Frequency.ONE_TIME, None, None)
 
 
 def test_add_item_subscription_triggers_wallet_gate_and_passes_when_sufficient():
@@ -269,8 +278,8 @@ def test_replace_cart_changed_subscription_item_is_re_gated():
         service.replace_cart(
             "user-1",
             items=[
-                {"id": "sub-1", "product_id": "cow-milk", "quantity": 5, "frequency": Frequency.DAILY,
-                 "start_date": "2026-09-01"},  # quantity changed 2 -> 5
+                {"id": "sub-1", "product_id": "cow-milk", "quantity": 5,
+                 "frequency": Frequency.DAILY, "start_date": "2026-09-01"},  # quantity 2 -> 5
             ],
             if_version=3,
         )
@@ -282,7 +291,8 @@ def test_replace_cart_new_subscription_item_is_gated():
     service.replace_cart(
         "user-1",
         items=[
-            {"product_id": "cow-milk", "quantity": 1, "frequency": Frequency.DAILY, "start_date": "2026-09-01"},
+            {"product_id": "cow-milk", "quantity": 1, "frequency": Frequency.DAILY,
+             "start_date": "2026-09-01"},
         ],
         if_version=0,
     )

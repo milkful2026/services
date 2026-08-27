@@ -116,7 +116,9 @@ _MALFORMED_200_BODIES = [
 @responses.activate
 def test_malformed_200_body_becomes_pricing_unavailable_not_raw(body_kwargs):
     for _ in range(2):
-        responses.add(responses.POST, "http://pricing.test/pricing/quote", status=200, **body_kwargs)
+        responses.add(
+            responses.POST, "http://pricing.test/pricing/quote", status=200, **body_kwargs
+        )
 
     with pytest.raises(PricingUnavailableError):
         _client().quote(_ITEMS, delivery_state="Karnataka")

@@ -22,10 +22,11 @@ def _fake_credentials(monkeypatch):
     # fake pair is enough to exercise real signing logic deterministically
     # without touching any real AWS account, same spirit as bootstrap.py's
     # own dummy "local"/"local" pair for moto.
+    fake_credentials = Credentials("AKIAFAKE", "fakesecret")
     monkeypatch.setattr(
         "adapters.user_client_adapter.boto3.Session",
         lambda: type(
-            "FakeSession", (), {"get_credentials": staticmethod(lambda: Credentials("AKIAFAKE", "fakesecret"))}
+            "FakeSession", (), {"get_credentials": staticmethod(lambda: fake_credentials)}
         )(),
     )
 

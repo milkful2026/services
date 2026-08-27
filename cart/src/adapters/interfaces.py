@@ -40,6 +40,17 @@ class CartRepositoryPort(Protocol):
         doesn't belong to user_id (FR-4)."""
         ...
 
+    def get_unpublished_outbox_events(self, limit: int) -> list[dict]:
+        """Used only by outbox_publisher_handler — never from the
+        request-handling path. May return fewer than `limit` events even
+        when more unpublished ones exist (see DynamoDbCartRepository's
+        own docstring on this)."""
+        ...
+
+    def mark_outbox_published(self, user_id: str, event_id: str) -> None:
+        """Used only by outbox_publisher_handler."""
+        ...
+
 
 class CatalogClientPort(Protocol):
     def set_correlation_id(self, correlation_id: str) -> None: ...

@@ -107,7 +107,8 @@ def test_replace_cart_full_replace_removes_omitted_items(repo):
     new_cart = repo.replace_cart(
         "user-1",
         items=[
-            {"id": kept.id, "product_id": "cow-milk", "quantity": 3, "frequency": Frequency.ONE_TIME},
+            {"id": kept.id, "product_id": "cow-milk", "quantity": 3,
+             "frequency": Frequency.ONE_TIME},
             {"product_id": "paneer", "quantity": 1, "frequency": Frequency.ONE_TIME},
         ],
         if_version=2,
@@ -176,3 +177,35 @@ def test_meta_row_gets_its_own_ttl(cart_table, repo):
 
     response = cart_table.get_item(Key={"userId": "user-1", "SK": "META"})
     assert "expiresAt" in response["Item"]
+
+
+def test_get_unpublished_outbox_events_returns_events_from_writes(repo):
+    repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+    repo.add_item("user-2", "paneer", 1, Frequency.ONE_TIME, None, None)
+
+    events = repo.get_unpublished_outbox_events(limit=10)
+
+    assert len(events) == 2
+    user_ids = {e["userId"] for e in events}
+    assert user_ids == {"user-1", "user-2"}
+    for e in events:
+        assert e["type"] == "CartUpdated"
+        assert e["payload"]["changeType"] == "ITEM_ADDED"
+        assert "eventId" in e
+
+
+def test_mark_outbox_published_excludes_it_from_future_reads(repo):
+    repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+    [event] = repo.get_unpublished_outbox_events(limit=10)
+
+    repo.mark_outbox_published(event["userId"], event["eventId"])
+
+    assert repo.get_unpublished_outbox_events(limit=10) == []
+
+
+def test_get_unpublished_outbox_events_ignores_item_and_meta_rows(repo):
+    repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+
+    events = repo.get_unpublished_outbox_events(limit=10)
+
+    assert len(events) == 1  # not the ITEM# row, not the META row too
