@@ -30,9 +30,23 @@ silently decided):
    own separate VPC. Passed as a placeholder env var here.
 6. **Aurora Postgres Serverless v2**, not provisioned — consistent with
    MA-95, cost-appropriate for a new, low-traffic service.
+7. **Internal address-state route (MA-96) uses `HttpIamAuthorizer`, not
+   network isolation.** An earlier revision of MA-96's impl plan assumed
+   this route would be safe unauthenticated because it's "never exposed
+   outside the VPC" — false for this service (Lambda + HttpApi has no
+   VPC boundary of its own, unlike Inventory's Fargate-behind-private-ALB
+   setup that reasoning was borrowed from). `HttpIamAuthorizer` means API
+   Gateway rejects any request without a valid SigV4 signature from a
+   principal holding `execute-api:Invoke` on this route's ARN.
+   `internal_caller_role_arns` is how a caller's execution role gets that
+   grant — same "placeholder until the other side exists" shape as this
+   stack's own Cognito cross-stack reference (point 1 above): defaults to
+   empty (route is unreachable by anyone), and a human wires Cart
+   Service's real role ARN in here once MA-96's own CDK stack is
+   deployed and that ARN is known.
 """
 
-from aws_cdk import Duration, RemovalPolicy, Stack
+from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_authorizers as apigwv2_authorizers
 from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
@@ -58,6 +72,7 @@ class UserStack(Stack):
         cognito_user_pool_id: str,
         cognito_client_id: str,
         inventory_internal_base_url: str = "http://PLACEHOLDER-inventory-internal-alb.local",
+        internal_caller_role_arns: tuple[str, ...] = (),
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -125,11 +140,20 @@ class UserStack(Stack):
         get_me_fn = lambda_.Function(
             self, "GetMeFunction", handler="handlers.get_me_handler.handler", **common_lambda_kwargs
         )
+        address_state_fn = lambda_.Function(
+            self,
+            "InternalAddressStateFunction",
+            handler="handlers.internal_address_state_handler.handler",
+            **common_lambda_kwargs,
+        )
 
-        for fn in (register_fn, delivery_slots_fn, outbox_publisher_fn, get_me_fn):
+        for fn in (register_fn, delivery_slots_fn, outbox_publisher_fn, get_me_fn, address_state_fn):
             secret.grant_read(fn)
 
-        http_api = self._build_http_api(register_fn, delivery_slots_fn, get_me_fn, cognito_client_id)
+        http_api = self._build_http_api(
+            register_fn, delivery_slots_fn, get_me_fn, address_state_fn, cognito_client_id
+        )
+        self._grant_internal_callers(http_api, internal_caller_role_arns)
         self._build_outbox_scheduler(outbox_publisher_fn)
 
     def _build_vpc(self) -> ec2.Vpc:
@@ -204,6 +228,7 @@ class UserStack(Stack):
         register_fn: lambda_.Function,
         delivery_slots_fn: lambda_.Function,
         get_me_fn: lambda_.Function,
+        address_state_fn: lambda_.Function,
         cognito_client_id: str,
     ) -> apigwv2.HttpApi:
         issuer = f"https://cognito-idp.{self.region}.amazonaws.com/{self._cognito_user_pool_id}"
@@ -232,7 +257,62 @@ class UserStack(Stack):
             integration=apigwv2_integrations.HttpLambdaIntegration("GetMeIntegration", get_me_fn),
             authorizer=authorizer,
         )
+        # MA-96: internal, service-to-service only — IAM (SigV4), not the
+        # Cognito JWT authorizer every public route above uses. See the
+        # module docstring's point 7 and internal_address_state_handler.py
+        # for why this isn't (and can't be) "network isolation" instead.
+        http_api.add_routes(
+            path="/v1/internal/users/address-state",
+            methods=[apigwv2.HttpMethod.GET],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "InternalAddressStateIntegration", address_state_fn
+            ),
+            authorizer=apigwv2_authorizers.HttpIamAuthorizer(),
+        )
         return http_api
+
+    def _grant_internal_callers(
+        self, http_api: apigwv2.HttpApi, internal_caller_role_arns: tuple[str, ...]
+    ) -> None:
+        # HttpApi has no resource policy of its own (unlike a REST API's
+        # `addToResourcePolicy`) — IAM authorization is enforced entirely
+        # by whether the *caller's* own identity policy grants
+        # execute-api:Invoke on this route's ARN, so the grant has to be
+        # added to each caller's role from here, not to this API. `*` for
+        # stage matches whatever stage HttpApi's default deployment ends
+        # up using, since that's not something this stack pins down.
+        route_arn = (
+            f"arn:{self.partition}:execute-api:{self.region}:{self.account}:"
+            f"{http_api.http_api_id}/*/GET/v1/internal/users/address-state"
+        )
+        self.internal_address_state_route_arn = route_arn
+        CfnOutput(
+            self,
+            "InternalAddressStateRouteArn",
+            value=route_arn,
+            description=(
+                "execute-api ARN for MA-96's internal address-state route. "
+                "A caller (e.g. Cart Service's own Lambda execution role) "
+                "needs execute-api:Invoke on this ARN to call it — either "
+                "list that role's ARN in this stack's internal_caller_role_arns "
+                "at deploy time, or grant it directly from the caller's own "
+                "stack once this output is available to import."
+            ),
+        )
+
+        for i, arn in enumerate(internal_caller_role_arns):
+            # mutable=True: this role is defined in a *different* stack
+            # (the caller's own — e.g. Cart Service's), not this one; CDK
+            # still allows attaching a policy to it from here as long as
+            # it's marked mutable, since the underlying IAM role is a
+            # plain account-level resource, not something this stack owns
+            # exclusively.
+            caller_role = iam.Role.from_role_arn(
+                self, f"InternalCallerRole{i}", arn, mutable=True
+            )
+            caller_role.add_to_principal_policy(
+                iam.PolicyStatement(actions=["execute-api:Invoke"], resources=[route_arn])
+            )
 
     def _build_outbox_scheduler(self, outbox_publisher_fn: lambda_.Function) -> None:
         rule = events.Rule(
