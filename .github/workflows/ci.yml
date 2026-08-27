@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [cart, catalog, identity-auth, inventory, user, pricing-offer]
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: ${{ matrix.service }}/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install ruff==0.16.5
+
+      - name: Lint — pyflakes (blocking)
+        # F rules only: undefined names, redefinitions, unused imports/vars.
+        # This is the class of bug that shipped the broken inventory/main.py
+        # merge. The full ruff config (E/I/UP/B) is run advisory-only below
+        # until the existing E501/B008 backlog is burned down, then move
+        # `--select F` -> the default rule set here.
+        run: ruff check . --select F
+
+      - name: Lint — full ruff (advisory)
+        run: ruff check . --output-format=github
+        continue-on-error: true
+
+      - name: Tests
+        run: |
+          set +e
+          python -m pytest -q
+          code=$?
+          set -e
+          if [ "$code" -eq 5 ]; then
+            echo "::notice::no tests collected for ${{ matrix.service }} (skeleton service) — treating as pass"
+            exit 0
+          fi
+          exit "$code"

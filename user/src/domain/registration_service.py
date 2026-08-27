@@ -27,7 +27,6 @@ from domain.exceptions import (
 )
 from domain.models import (
     Address,
-    Consent,
     DeliverySlot,
     RegistrationRequest,
     RegistrationResult,
