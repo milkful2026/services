@@ -110,6 +110,12 @@ cd pricing-offer && PRICING_CORS_ALLOW_ALL=true python src/main.py   # :8005 —
                                                        # CORS preflight block that surfaces as a
                                                        # generic connection error, not anything
                                                        # naming CORS.
+cd cart && python run_local.py                        # :8004 — cart CRUD (MA-96). Same Lambda
+                                                       # shim as identity-auth/user above.
+cd cart && python run_local_outbox_publisher.py       # polls the cart table's OUTBOX# rows every
+                                                       # 5s, same pattern as user's own outbox
+                                                       # publisher above (Postgres there, a
+                                                       # DynamoDB Scan here).
 ```
 
 ## Exercising registration + login

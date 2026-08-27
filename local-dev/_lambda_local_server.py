@@ -29,11 +29,40 @@ credentialed requests involved (auth is a Bearer header, not a cookie).
 """
 
 import json
+import re
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 import jwt
+
+_PARAM_SEGMENT = re.compile(r"\{([^{}/]+)\}")
+
+
+def _compile_pattern(path: str) -> re.Pattern[str] | None:
+    """`/cart/items/{id}` -> a regex matching `/cart/items/<anything>`,
+    capturing `id` as a named group — `None` if `path` has no `{...}`
+    segment (the common case; exact-match dict lookup handles those, this
+    is only a fallback for the rare path-parameterized route none of the
+    other four services needed until Cart's DELETE /cart/items/{id})."""
+    if "{" not in path:
+        return None
+    pattern = _PARAM_SEGMENT.sub(lambda m: f"(?P<{m.group(1)}>[^/]+)", re.escape(path).replace(r"\{", "{").replace(r"\}", "}"))
+    return re.compile(f"^{pattern}$")
+
+
+def _match_parameterized_route(routes: dict, method: str, path: str):
+    """Falls back to this only when no exact (method, path) key matches —
+    keeps the common case (every route with no path parameter) an O(1)
+    dict lookup, unchanged from before this existed."""
+    for (route_method, route_path), route_fn in routes.items():
+        if route_method != method or "{" not in route_path:
+            continue
+        compiled = _compile_pattern(route_path)
+        match = compiled.match(path)
+        if match:
+            return route_fn, match.groupdict()
+    return None, None
 
 
 def _decode_jwt_claims(auth_header: str | None) -> dict:
@@ -78,6 +107,10 @@ def _make_handler(routes: dict):
         def _dispatch(self, method: str) -> None:
             parsed = urlsplit(self.path)
             route_fn = routes.get((method, parsed.path))
+            path_params: dict[str, str] = {}
+            if route_fn is None:
+                route_fn, path_params = _match_parameterized_route(routes, method, parsed.path)
+                path_params = path_params or {}
             if route_fn is None:
                 body = json.dumps({"error": f"no local route for {method} {parsed.path}"}).encode()
                 self._write(404, body, {"Content-Type": "application/json"})
@@ -93,6 +126,7 @@ def _make_handler(routes: dict):
                 "body": request_body,
                 "headers": headers,
                 "queryStringParameters": query_params or None,
+                "pathParameters": path_params or None,
                 "requestContext": {"authorizer": {"jwt": {"claims": claims}}},
             }
 
