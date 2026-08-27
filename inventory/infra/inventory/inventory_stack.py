@@ -31,8 +31,6 @@ silently decided):
    low-traffic service) rather than a provisioned cluster.
 """
 
-import os
-
 from aws_cdk import Duration, RemovalPolicy, Stack
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
@@ -43,7 +41,6 @@ from aws_cdk import aws_elasticache as elasticache
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
-from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_rds as rds
 from aws_cdk import aws_sqs as sqs

@@ -57,7 +57,7 @@ def test_logout_already_revoked_token_still_returns_204():
     # cognito_adapter.revoke_token itself swallows non-malformed errors —
     # this test just confirms the handler doesn't add its own failure
     # path on top of that (idempotent per spec FR-3).
-    cognito = _inject()
+    _inject()
 
     first = logout_handler.handler(_event({"refreshToken": "tok"}), None)
     second = logout_handler.handler(_event({"refreshToken": "tok"}), None)
