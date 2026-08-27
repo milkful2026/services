@@ -93,6 +93,30 @@ def test_retries_then_raises_address_lookup_unavailable_on_repeated_5xx():
     assert len(responses.calls) == 2  # max_retries=1 -> exactly 2 attempts
 
 
+_MALFORMED_200_BODIES = [
+    pytest.param({"body": "<html>502</html>", "content_type": "text/html"}, id="not-json"),
+    pytest.param({"json": {"error": "nope"}}, id="no-data-key"),
+    pytest.param({"json": {"data": "not-an-object"}}, id="data-not-a-dict"),
+]
+
+
+@pytest.mark.parametrize("body_kwargs", _MALFORMED_200_BODIES)
+@responses.activate
+def test_malformed_200_body_becomes_address_lookup_unavailable_not_raw(body_kwargs):
+    for _ in range(2):
+        responses.add(
+            responses.GET,
+            "http://user.test/v1/internal/users/address-state",
+            status=200,
+            **body_kwargs,
+        )
+
+    with pytest.raises(AddressLookupUnavailableError):
+        _client().get_delivery_address_state("sub-1")
+
+    assert len(responses.calls) == 2  # retried like any other transport failure
+
+
 def test_no_credentials_available_raises_address_lookup_unavailable(monkeypatch):
     monkeypatch.setattr(
         "adapters.user_client_adapter.boto3.Session",

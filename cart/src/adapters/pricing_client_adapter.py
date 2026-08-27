@@ -107,9 +107,17 @@ class HttpPricingClient:
                 # Pricing failure since callers only distinguish
                 # "available" from "unavailable" here (MA-121 §9 has no
                 # separate "bad request to Pricing" error code).
+                try:
+                    details = response.json().get("data", {})
+                except ValueError:
+                    # A non-JSON 400 body (API Gateway request validation,
+                    # a proxy, a WAF) still means the same thing to callers
+                    # — Pricing is unusable for this request — but must not
+                    # raise an unmapped JSONDecodeError past call_with_retry.
+                    details = {}
                 raise PricingUnavailableError(
                     "Pricing rejected the quote request",
-                    details=response.json().get("data", {}),
+                    details=details,
                 )
             raise _RetryablePricingError(f"Pricing returned HTTP {response.status_code}")
 

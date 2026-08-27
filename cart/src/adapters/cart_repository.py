@@ -11,7 +11,8 @@ Schema (single table, `SK` prefix distinguishes item shape):
                        addedAt, expiresAt (TTL, 30 days from last write)
     META row:         cartVersion (monotonic, FR-1/FR-3), expiresAt
     IDEMPOTENCY# rows: responseBody (serialized LineItem), expiresAt (TTL, 24h)
-    OUTBOX# rows:     type, payload, publishedAt (absent = unpublished)
+    OUTBOX# rows:     type, payload, publishedAt (absent = unpublished),
+                       expiresAt (TTL, set only once published — 24h)
 
 **`META`'s own TTL (open item #6 from specs PR #11's review, resolved
 here):** the original plan gave `ITEM#`/`IDEMPOTENCY#` rows a TTL but
@@ -45,7 +46,12 @@ import boto3
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
-from domain.exceptions import CartServiceError, CartVersionMismatchError, LineItemNotFoundError
+from domain.exceptions import (
+    CartServiceError,
+    CartVersionMismatchError,
+    LineItemNotFoundError,
+    ValidationError,
+)
 from domain.models import Cart, Frequency, LineItem
 
 logger = logging.getLogger(__name__)
@@ -57,6 +63,7 @@ _OUTBOX_PREFIX = "OUTBOX#"
 
 _CART_TTL_SECONDS = 30 * 24 * 3600
 _IDEMPOTENCY_TTL_SECONDS = 24 * 3600
+_OUTBOX_PUBLISHED_TTL_SECONDS = 24 * 3600
 
 _serializer = TypeSerializer()
 _deserializer = TypeDeserializer()
@@ -130,11 +137,36 @@ class DynamoDbCartRepository:
     # -- reads --------------------------------------------------------
 
     def get_cart(self, user_id: str) -> Cart:
+        # The cart's own rows are exactly ITEM#* and META. On the SK
+        # ordering those two are adjacent ("ITEM#..." < "META" always, and
+        # both sort before "OUTBOX#..." and after "IDEMPOTENCY#..."), so a
+        # BETWEEN key condition reads only that contiguous range —
+        # IDEMPOTENCY#/OUTBOX# history is never fetched, and its RCU is
+        # never paid. LastEvaluatedKey is followed to the end so a large
+        # cart is never silently truncated at the 1MB page boundary.
+        line_items: list[LineItem] = []
+        cart_version = 0
+        query_kwargs: dict[str, Any] = {
+            "KeyConditionExpression": "userId = :uid AND SK BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues": {
+                ":uid": user_id,
+                ":lo": _ITEM_PREFIX,
+                ":hi": _META_SK,
+            },
+        }
         try:
-            response = self._table.query(
-                KeyConditionExpression="userId = :uid",
-                ExpressionAttributeValues={":uid": user_id},
-            )
+            while True:
+                response = self._table.query(**query_kwargs)
+                for item in response.get("Items", []):
+                    sk = item["SK"]
+                    if sk.startswith(_ITEM_PREFIX):
+                        line_items.append(_item_to_line_item(item))
+                    elif sk == _META_SK:
+                        cart_version = int(item.get("cartVersion", 0))
+                last_key = response.get("LastEvaluatedKey")
+                if not last_key:
+                    break
+                query_kwargs["ExclusiveStartKey"] = last_key
         except ClientError as exc:
             logger.error(
                 "cart_repository.get_cart failed",
@@ -142,16 +174,6 @@ class DynamoDbCartRepository:
             )
             raise CartServiceError("Failed to read cart") from exc
 
-        line_items: list[LineItem] = []
-        cart_version = 0
-        for item in response.get("Items", []):
-            sk = item["SK"]
-            if sk.startswith(_ITEM_PREFIX):
-                line_items.append(_item_to_line_item(item))
-            elif sk == _META_SK:
-                cart_version = int(item.get("cartVersion", 0))
-            # IDEMPOTENCY#/OUTBOX# rows share the partition but aren't
-            # part of the cart's own contents — ignored here.
         return Cart(line_items=line_items, cart_version=cart_version)
 
     # -- writes ---------------------------------------------------------
@@ -215,6 +237,15 @@ class DynamoDbCartRepository:
                 user_id, idempotency_key, _line_item_to_response_dict(line_item)
             ))
 
+        # Keep the rest of an actively-used cart alive: a mutation refreshes
+        # META and the row it writes, but the cart's *other* ITEM# rows
+        # would otherwise expire on their original clock and silently drop
+        # out from under the user. Appended last so the fixed indices above
+        # (idempotency at 1) are undisturbed.
+        transact_items.extend(
+            self._sibling_item_ttl_refresh(user_id, exclude_ids=set(), expires_at=expires_at)
+        )
+
         try:
             self._client.transact_write_items(TransactItems=transact_items)
         except self._client.exceptions.TransactionCanceledException as exc:
@@ -240,12 +271,35 @@ class DynamoDbCartRepository:
 
         return line_item
 
-    def replace_cart(self, user_id: str, items: list[dict], if_version: int) -> Cart:
-        current = self.get_cart(user_id)
+    def replace_cart(
+        self,
+        user_id: str,
+        items: list[dict],
+        if_version: int,
+        current: Cart | None = None,
+    ) -> Cart:
+        # A duplicate explicit id in the desired state would make DynamoDB
+        # reject the whole transaction ("multiple operations on one item")
+        # — a malformed client request, surfaced as 400 not a generic 500.
+        seen_ids: set[str] = set()
+        for item in items:
+            item_id = item.get("id")
+            if item_id is None:
+                continue
+            if item_id in seen_ids:
+                raise ValidationError(f"Duplicate line item id in request: {item_id}")
+            seen_ids.add(item_id)
+
+        # `current` is normally supplied by cart_service (which has already
+        # read it for validation/wallet-gating) — re-reading here would be
+        # the second of three full-partition reads for one PUT /cart.
+        if current is None:
+            current = self.get_cart(user_id)
         current_ids = {li.id for li in current.line_items}
         desired_ids = {item["id"] for item in items if item.get("id")}
         to_delete = current_ids - desired_ids
         expires_at = _cart_expires_at()
+        now_iso = datetime.now(UTC).isoformat()
         event_id = str(uuid.uuid4())
         new_version = if_version + 1
 
@@ -268,8 +322,25 @@ class DynamoDbCartRepository:
                     }
                 }
             )
+        resolved_items: list[LineItem] = []
         for item in items:
             line_item_id = item.get("id") or str(uuid.uuid4())
+            added_at = item.get("added_at") or now_iso
+            frequency = (
+                item["frequency"]
+                if isinstance(item["frequency"], Frequency)
+                else Frequency(item["frequency"])
+            )
+            resolved_items.append(
+                LineItem(
+                    id=line_item_id,
+                    product_id=item["product_id"],
+                    quantity=item["quantity"],
+                    frequency=frequency,
+                    start_date=item.get("start_date"),
+                    added_at=added_at,
+                )
+            )
             transact_items.append(
                 {
                     "Put": {
@@ -279,9 +350,9 @@ class DynamoDbCartRepository:
                             "SK": f"{_ITEM_PREFIX}{line_item_id}",
                             "productId": item["product_id"],
                             "quantity": item["quantity"],
-                            "frequency": str(item["frequency"]),
+                            "frequency": str(frequency),
                             "startDate": item.get("start_date"),
-                            "addedAt": item.get("added_at") or datetime.now(UTC).isoformat(),
+                            "addedAt": added_at,
                             "expiresAt": expires_at,
                         }.items()},
                     }
@@ -317,10 +388,15 @@ class DynamoDbCartRepository:
             )
             raise CartServiceError("Failed to replace cart") from exc
 
-        return self.get_cart(user_id)
+        # The write succeeded and its post-state is fully known here (the
+        # desired items, each with its resolved id/addedAt, at new_version)
+        # — re-reading the partition just to return it would be a third
+        # full read for one PUT /cart.
+        return Cart(line_items=resolved_items, cart_version=new_version)
 
     def delete_item(self, user_id: str, line_item_id: str) -> None:
         event_id = str(uuid.uuid4())
+        expires_at = _cart_expires_at()
         transact_items = [
             {
                 "Delete": {
@@ -332,9 +408,17 @@ class DynamoDbCartRepository:
                     "ConditionExpression": "attribute_exists(SK)",
                 }
             },
-            self._meta_upsert_transact_item(user_id, _cart_expires_at()),
+            self._meta_upsert_transact_item(user_id, expires_at),
             self._outbox_put_transact_item(user_id, event_id, "ITEM_REMOVED", cart_id=user_id),
         ]
+        # Same actively-used-cart TTL refresh as add_item; the row being
+        # deleted is excluded (a Delete and an Update can't both target it
+        # in one transaction).
+        transact_items.extend(
+            self._sibling_item_ttl_refresh(
+                user_id, exclude_ids={line_item_id}, expires_at=expires_at
+            )
+        )
 
         try:
             self._client.transact_write_items(TransactItems=transact_items)
@@ -365,18 +449,42 @@ class DynamoDbCartRepository:
         # same cadence as user's own outbox publisher) but doesn't scale
         # indefinitely — a GSI (e.g. a constant partition key + SK) would
         # be the fix if outbox volume ever became Scan-prohibitive.
-        # `Limit` bounds items *examined*, not items *matching* the
-        # filter — a single call may return fewer than `limit` rows even
-        # when more unpublished events exist; the next scheduled run
-        # picks up whatever this one didn't reach, same as user's own
-        # publisher already tolerates via its own outbox_batch_size.
+        #
+        # A Scan `Limit` bounds items *examined per page*, not items
+        # *matching* the filter: with published OUTBOX# rows (and ITEM#/
+        # META/IDEMPOTENCY# rows) sitting ahead of an unpublished one in
+        # scan order, a single Limit-capped page can come back empty while
+        # real events wait behind it — and with no ExclusiveStartKey
+        # continuation that stall is permanent. So: follow LastEvaluatedKey
+        # across pages until `limit` matching rows are collected or the
+        # table is exhausted. Published rows also carry their own short TTL
+        # (set in mark_outbox_published) so they stop accumulating.
+        events: list[dict[str, Any]] = []
+        scan_kwargs: dict[str, Any] = {
+            "TableName": self._table_name,
+            "FilterExpression": "begins_with(SK, :prefix) AND attribute_not_exists(publishedAt)",
+            "ExpressionAttributeValues": {":prefix": _to_av(_OUTBOX_PREFIX)},
+        }
         try:
-            response = self._client.scan(
-                TableName=self._table_name,
-                FilterExpression="begins_with(SK, :prefix) AND attribute_not_exists(publishedAt)",
-                ExpressionAttributeValues={":prefix": _to_av(_OUTBOX_PREFIX)},
-                Limit=limit,
-            )
+            while len(events) < limit:
+                response = self._client.scan(**scan_kwargs)
+                for raw_item in response.get("Items", []):
+                    item = {k: _deserializer.deserialize(v) for k, v in raw_item.items()}
+                    payload = json.loads(item["payload"])
+                    events.append(
+                        {
+                            "userId": item["userId"],
+                            "eventId": item["SK"].removeprefix(_OUTBOX_PREFIX),
+                            "type": item["type"],
+                            "payload": payload,
+                        }
+                    )
+                    if len(events) >= limit:
+                        break
+                last_key = response.get("LastEvaluatedKey")
+                if not last_key:
+                    break
+                scan_kwargs["ExclusiveStartKey"] = last_key
         except ClientError as exc:
             logger.error(
                 "cart_repository.get_unpublished_outbox_events failed",
@@ -384,26 +492,21 @@ class DynamoDbCartRepository:
             )
             raise CartServiceError("Failed to read outbox events") from exc
 
-        events = []
-        for raw_item in response.get("Items", []):
-            item = {k: _deserializer.deserialize(v) for k, v in raw_item.items()}
-            payload = json.loads(item["payload"])
-            events.append(
-                {
-                    "userId": item["userId"],
-                    "eventId": item["SK"].removeprefix(_OUTBOX_PREFIX),
-                    "type": item["type"],
-                    "payload": payload,
-                }
-            )
         return events
 
     def mark_outbox_published(self, user_id: str, event_id: str) -> None:
         try:
             self._table.update_item(
                 Key={"userId": user_id, "SK": f"{_OUTBOX_PREFIX}{event_id}"},
-                UpdateExpression="SET publishedAt = :now",
-                ExpressionAttributeValues={":now": datetime.now(UTC).isoformat()},
+                UpdateExpression="SET publishedAt = :now, expiresAt = :exp",
+                ExpressionAttributeValues={
+                    ":now": datetime.now(UTC).isoformat(),
+                    # A published row has done its job — give it a short TTL
+                    # so drained OUTBOX# rows don't pile up in the partition
+                    # forever (which is what let the pre-pagination Scan
+                    # stall in the first place).
+                    ":exp": _now_epoch() + _OUTBOX_PUBLISHED_TTL_SECONDS,
+                },
             )
         except ClientError as exc:
             logger.error(
@@ -413,6 +516,35 @@ class DynamoDbCartRepository:
             raise CartServiceError("Failed to mark outbox event published") from exc
 
     # -- transaction-item builders ---------------------------------------
+
+    def _sibling_item_ttl_refresh(
+        self, user_id: str, exclude_ids: set[str], expires_at: int
+    ) -> list[dict[str, Any]]:
+        """Update ops that bump `expiresAt` on every existing ITEM# row in
+        the cart except `exclude_ids`, so any single mutation keeps the
+        whole cart alive rather than letting untouched older items expire
+        out from under an active user. Bounded by DynamoDB's per-
+        transaction item limit — a cart large enough to exceed it would
+        fail the write loudly instead of silently shedding items."""
+        siblings: list[dict[str, Any]] = []
+        for line_item in self.get_cart(user_id).line_items:
+            if line_item.id in exclude_ids:
+                continue
+            siblings.append(
+                {
+                    "Update": {
+                        "TableName": self._table_name,
+                        "Key": {
+                            "userId": _to_av(user_id),
+                            "SK": _to_av(f"{_ITEM_PREFIX}{line_item.id}"),
+                        },
+                        "UpdateExpression": "SET expiresAt = :exp",
+                        "ExpressionAttributeValues": {":exp": _to_av(expires_at)},
+                        "ConditionExpression": "attribute_exists(SK)",
+                    }
+                }
+            )
+        return siblings
 
     def _meta_upsert_transact_item(
         self,

@@ -3,6 +3,8 @@ through the Port interfaces (`adapters/interfaces.py`) — never
 boto3/requests directly (services/README.md §3.4).
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
 from domain.exceptions import (
     DeliveryAddressRequiredError,
     OutOfStockError,
@@ -10,6 +12,8 @@ from domain.exceptions import (
     WalletBalanceTooLowError,
 )
 from domain.models import Cart, CartView, Frequency, LineItem
+
+_MAX_STOCK_CHECK_WORKERS = 8
 
 
 class CartService:
@@ -103,14 +107,28 @@ class CartService:
         current = self._repository.get_cart(user_id)
         current_by_id = {li.id: li for li in current.line_items}
 
+        seen_ids: set[str] = set()
+        needs_wallet_gate = False
         for item in items:
             quantity = item["quantity"]
             frequency = item["frequency"]
             start_date = item.get("start_date")
             self._validate_item(quantity, frequency, start_date)
-            self._check_stock(item["product_id"], quantity)
 
-            existing = current_by_id.get(item.get("id"))
+            item_id = item.get("id")
+            if item_id is not None:
+                if item_id in seen_ids:
+                    raise ValidationError(
+                        f"Duplicate line item id in request: {item_id}"
+                    )
+                seen_ids.add(item_id)
+
+            existing = current_by_id.get(item_id)
+            if existing is not None:
+                # Preserve the original addedAt for an item that already
+                # exists — an unrelated edit elsewhere in the cart must not
+                # reset every item's "added" timestamp to now.
+                item["added_at"] = existing.added_at
             is_new_or_changed = (
                 existing is None
                 or existing.quantity != quantity
@@ -118,9 +136,21 @@ class CartService:
                 or existing.start_date != start_date
             )
             if frequency.is_subscription and is_new_or_changed:
-                self._check_wallet_gate(user_id)
+                needs_wallet_gate = True
 
-        return self._repository.replace_cart(user_id, items, if_version)
+        # Stock is checked for every item (FR-3), but the checks are
+        # independent Catalog round-trips — run them concurrently rather
+        # than blocking serially on a 20-item replace. The first failure
+        # (e.g. OutOfStockError) propagates out of the pool.
+        self._check_stock_for_all(items)
+
+        # The wallet gate depends only on user_id, so a single call covers
+        # the whole request no matter how many new/changed subscription
+        # items it carries (FR-6).
+        if needs_wallet_gate:
+            self._check_wallet_gate(user_id)
+
+        return self._repository.replace_cart(user_id, items, if_version, current=current)
 
     def delete_item(self, user_id: str, line_item_id: str) -> None:
         self._repository.delete_item(user_id, line_item_id)
@@ -134,6 +164,23 @@ class CartService:
             raise ValidationError("startDate must not be set for a ONE_TIME item")
         if frequency != Frequency.ONE_TIME and start_date is None:
             raise ValidationError("startDate is required for a subscription item")
+
+    def _check_stock_for_all(self, items: list[dict]) -> None:
+        if not items:
+            return
+        if len(items) == 1:
+            self._check_stock(items[0]["product_id"], items[0]["quantity"])
+            return
+        workers = min(_MAX_STOCK_CHECK_WORKERS, len(items))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # list() forces every future to resolve here, re-raising the
+            # first exception (OutOfStockError / StockCheckUnavailableError).
+            list(
+                executor.map(
+                    lambda item: self._check_stock(item["product_id"], item["quantity"]),
+                    items,
+                )
+            )
 
     def _check_stock(self, product_id: str, quantity: int) -> None:
         # None (Catalog's own available_quantity addition, MA-120 §7,

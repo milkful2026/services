@@ -29,10 +29,11 @@ class CartRepositoryPort(Protocol):
         ...
 
     def replace_cart(
-        self, user_id: str, items: list[dict], if_version: int
+        self, user_id: str, items: list[dict], if_version: int, current: Cart | None = None
     ) -> Cart:
         """Raises CartVersionMismatchError if if_version doesn't match the
-        stored cartVersion (FR-3)."""
+        stored cartVersion (FR-3). `current` is the caller's already-read
+        cart state; when supplied the repository skips re-reading it."""
         ...
 
     def delete_item(self, user_id: str, line_item_id: str) -> None:
@@ -42,9 +43,8 @@ class CartRepositoryPort(Protocol):
 
     def get_unpublished_outbox_events(self, limit: int) -> list[dict]:
         """Used only by outbox_publisher_handler — never from the
-        request-handling path. May return fewer than `limit` events even
-        when more unpublished ones exist (see DynamoDbCartRepository's
-        own docstring on this)."""
+        request-handling path. Returns up to `limit` unpublished events,
+        paging past any backlog of already-published rows to get them."""
         ...
 
     def mark_outbox_published(self, user_id: str, event_id: str) -> None:

@@ -93,7 +93,19 @@ class HttpUserClient:
                 raise _RetryableUserError(str(exc)) from exc
 
             if response.status_code == 200:
-                return response.json()["data"].get("defaultAddressState")
+                try:
+                    return response.json()["data"].get("defaultAddressState")
+                except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                    # A 200 whose body isn't the documented envelope (a
+                    # non-JSON API Gateway/proxy/WAF interstitial, or a
+                    # payload missing "data") is a transport-layer failure
+                    # from this adapter's contract's point of view, not a
+                    # value to propagate raw — retried, then surfaced as
+                    # AddressLookupUnavailableError. Same handling
+                    # catalog_client_adapter.py already applies.
+                    raise _RetryableUserError(
+                        f"malformed 200 body from User service: {exc}"
+                    ) from exc
             if response.status_code == 404:
                 # No profile found for this cognito_sub in User Service —
                 # treated the same as "no default address set" (None);

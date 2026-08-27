@@ -39,9 +39,14 @@ class FakeCartRepository:
             added_at="2026-08-28T00:00:00Z",
         )
 
-    def replace_cart(self, user_id, items, if_version):
+    def replace_cart(self, user_id, items, if_version, current=None):
         self.replace_cart_calls.append(
-            {"user_id": user_id, "items": items, "if_version": if_version}
+            {
+                "user_id": user_id,
+                "items": items,
+                "if_version": if_version,
+                "current": current,
+            }
         )
         return Cart(line_items=[], cart_version=if_version + 1)
 
@@ -324,6 +329,59 @@ def test_replace_cart_delegates_to_repository_with_same_args():
 
     assert len(fakes["repo"].replace_cart_calls) == 1
     assert fakes["repo"].replace_cart_calls[0]["if_version"] == 2
+
+
+def test_replace_cart_hands_the_already_read_cart_to_the_repository():
+    existing = _item(id="sub-1")
+    service, fakes = _service(cart=Cart(line_items=[existing], cart_version=4))
+
+    service.replace_cart(
+        "user-1",
+        items=[{"id": "sub-1", "product_id": "cow-milk", "quantity": 1,
+                "frequency": Frequency.ONE_TIME}],
+        if_version=4,
+    )
+
+    # the repository is given the cart the domain already read, so it
+    # doesn't re-query for it
+    assert fakes["repo"].replace_cart_calls[0]["current"] is fakes["repo"].cart
+
+
+def test_replace_cart_wallet_gate_called_once_for_many_new_subscription_items():
+    service, fakes = _service(wallet_balance=1000, wallet_minimum_balance=500)
+
+    service.replace_cart(
+        "user-1",
+        items=[
+            {"product_id": "cow-milk", "quantity": 1, "frequency": Frequency.DAILY,
+             "start_date": "2026-09-01"},
+            {"product_id": "cow-ghee", "quantity": 1, "frequency": Frequency.ALTERNATE_DAYS,
+             "start_date": "2026-09-01"},
+            {"product_id": "paneer", "quantity": 1, "frequency": Frequency.DAILY,
+             "start_date": "2026-09-01"},
+        ],
+        if_version=0,
+    )
+
+    assert fakes["wallet"].calls == ["user-1"]  # hoisted out of the per-item loop
+
+
+def test_replace_cart_duplicate_line_item_id_raises_validation_error():
+    service, fakes = _service()
+
+    with pytest.raises(ValidationError):
+        service.replace_cart(
+            "user-1",
+            items=[
+                {"id": "dup", "product_id": "cow-milk", "quantity": 1,
+                 "frequency": Frequency.ONE_TIME},
+                {"id": "dup", "product_id": "paneer", "quantity": 1,
+                 "frequency": Frequency.ONE_TIME},
+            ],
+            if_version=0,
+        )
+
+    assert fakes["repo"].replace_cart_calls == []
 
 
 # -- delete_item --------------------------------------------------------

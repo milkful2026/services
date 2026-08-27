@@ -95,6 +95,25 @@ def test_400_from_pricing_raises_pricing_unavailable_without_retry():
 
 
 @responses.activate
+def test_non_json_400_body_still_raises_pricing_unavailable_not_raw():
+    # A 400 from API Gateway request validation / a proxy / a WAF has a
+    # non-JSON body — response.json() would raise, and that must not
+    # escape unmapped.
+    responses.add(
+        responses.POST,
+        "http://pricing.test/pricing/quote",
+        body="<html>400 Bad Request</html>",
+        content_type="text/html",
+        status=400,
+    )
+
+    with pytest.raises(PricingUnavailableError):
+        _client().quote(_ITEMS, delivery_state="Karnataka")
+
+    assert len(responses.calls) == 1  # still not retried
+
+
+@responses.activate
 def test_retries_then_raises_pricing_unavailable_on_repeated_5xx():
     responses.add(responses.POST, "http://pricing.test/pricing/quote", status=503)
     responses.add(responses.POST, "http://pricing.test/pricing/quote", status=503)

@@ -1,7 +1,8 @@
 import pytest
+from freezegun import freeze_time
 
 from adapters.cart_repository import DynamoDbCartRepository
-from domain.exceptions import CartVersionMismatchError, LineItemNotFoundError
+from domain.exceptions import CartVersionMismatchError, LineItemNotFoundError, ValidationError
 from domain.models import Frequency
 
 
@@ -121,6 +122,89 @@ def test_replace_cart_full_replace_removes_omitted_items(repo):
     assert new_cart.cart_version == 3
 
 
+def test_replace_cart_preserves_added_at_for_unchanged_items(repo):
+    kept = repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+    original_added_at = repo.get_cart("user-1").line_items[0].added_at
+
+    new_cart = repo.replace_cart(
+        "user-1",
+        items=[
+            # untouched item — its id carries through, so its addedAt must not move
+            {"id": kept.id, "product_id": "cow-milk", "quantity": 1,
+             "frequency": Frequency.ONE_TIME, "added_at": original_added_at},
+            {"product_id": "paneer", "quantity": 1, "frequency": Frequency.ONE_TIME},
+        ],
+        if_version=1,
+    )
+
+    kept_item = next(li for li in new_cart.line_items if li.id == kept.id)
+    assert kept_item.added_at == original_added_at
+
+
+def test_replace_cart_duplicate_explicit_id_raises_validation_error(repo):
+    with pytest.raises(ValidationError):
+        repo.replace_cart(
+            "user-1",
+            items=[
+                {"id": "dup", "product_id": "cow-milk", "quantity": 1,
+                 "frequency": Frequency.ONE_TIME},
+                {"id": "dup", "product_id": "paneer", "quantity": 1,
+                 "frequency": Frequency.ONE_TIME},
+            ],
+            if_version=0,
+        )
+
+
+def test_replace_cart_accepts_caller_supplied_current_without_reading(repo, mocker):
+    repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+    current = repo.get_cart("user-1")
+    spy = mocker.spy(repo, "get_cart")
+
+    repo.replace_cart(
+        "user-1",
+        items=[{"product_id": "paneer", "quantity": 1, "frequency": Frequency.ONE_TIME}],
+        if_version=1,
+        current=current,
+    )
+
+    # no re-read for current, and the post-write state is returned without
+    # a third read either
+    assert spy.call_count == 0
+
+
+def test_add_item_refreshes_ttl_on_the_carts_other_items(cart_table, repo):
+    with freeze_time("2026-08-28T00:00:00Z"):
+        first = repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+    stale = cart_table.get_item(
+        Key={"userId": "user-1", "SK": f"ITEM#{first.id}"}
+    )["Item"]["expiresAt"]
+
+    with freeze_time("2026-08-30T00:00:00Z"):
+        repo.add_item("user-1", "cow-ghee", 1, Frequency.ONE_TIME, None, None)
+
+    refreshed = cart_table.get_item(
+        Key={"userId": "user-1", "SK": f"ITEM#{first.id}"}
+    )["Item"]["expiresAt"]
+    assert refreshed == stale + 2 * 24 * 3600  # bumped by the 2-day gap
+
+
+def test_delete_item_refreshes_ttl_on_the_carts_surviving_items(cart_table, repo):
+    with freeze_time("2026-08-28T00:00:00Z"):
+        keep = repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+        drop = repo.add_item("user-1", "cow-ghee", 1, Frequency.ONE_TIME, None, None)
+    stale = cart_table.get_item(
+        Key={"userId": "user-1", "SK": f"ITEM#{keep.id}"}
+    )["Item"]["expiresAt"]
+
+    with freeze_time("2026-08-30T00:00:00Z"):
+        repo.delete_item("user-1", drop.id)
+
+    refreshed = cart_table.get_item(
+        Key={"userId": "user-1", "SK": f"ITEM#{keep.id}"}
+    )["Item"]["expiresAt"]
+    assert refreshed == stale + 2 * 24 * 3600
+
+
 def test_replace_cart_on_a_fresh_never_existed_cart_requires_version_zero(repo):
     cart = repo.replace_cart(
         "user-1",
@@ -209,3 +293,48 @@ def test_get_unpublished_outbox_events_ignores_item_and_meta_rows(repo):
     events = repo.get_unpublished_outbox_events(limit=10)
 
     assert len(events) == 1  # not the ITEM# row, not the META row too
+
+
+def test_get_unpublished_outbox_events_paginates_past_a_wall_of_published_rows(cart_table, repo):
+    # `Limit` bounds items *examined* per scan page, not matched — a
+    # backlog of published OUTBOX# rows ahead of an unpublished one used to
+    # fill the page and starve it forever. The drain must page past them.
+    import json as _json
+
+    for i in range(30):
+        cart_table.put_item(
+            Item={
+                "userId": "user-1",
+                "SK": f"OUTBOX#{i:03d}",
+                "type": "CartUpdated",
+                "payload": _json.dumps({"changeType": "ITEM_ADDED"}),
+                "source": "cart",
+                "publishedAt": "2026-08-28T00:00:00Z",
+            }
+        )
+    cart_table.put_item(
+        Item={
+            "userId": "user-1",
+            "SK": "OUTBOX#zzz-unpublished",
+            "type": "CartUpdated",
+            "payload": _json.dumps({"changeType": "ITEM_ADDED"}),
+            "source": "cart",
+        }
+    )
+
+    events = repo.get_unpublished_outbox_events(limit=25)
+
+    assert [e["eventId"] for e in events] == ["zzz-unpublished"]
+
+
+def test_mark_outbox_published_sets_a_ttl_on_the_drained_row(cart_table, repo):
+    repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+    [event] = repo.get_unpublished_outbox_events(limit=10)
+
+    repo.mark_outbox_published(event["userId"], event["eventId"])
+
+    row = cart_table.get_item(
+        Key={"userId": "user-1", "SK": f"OUTBOX#{event['eventId']}"}
+    )["Item"]
+    assert "publishedAt" in row
+    assert "expiresAt" in row  # so drained rows don't accumulate forever
