@@ -49,3 +49,17 @@ class Quote:
     monthly_estimate: float | None = None
     discount_amount: float | None = None
     applied_offer_id: str | None = None
+
+
+@dataclass
+class CartView:
+    """`GET /cart`'s full response shape (FR-1): the stored cart plus its
+    live pricing breakdown. `quote` is `None` only for a genuinely empty
+    cart (see `cart_service.CartService.get_cart`'s own docstring for why
+    that's a deliberate, real-implementation-driven deviation from MA-121
+    §5's "GET /cart makes two of these unconditionally" — Pricing &
+    Offer's actual `POST /pricing/quote` rejects an empty `items` list
+    outright, so calling it for zero line items can only ever fail)."""
+
+    cart: Cart
+    quote: Quote | None
