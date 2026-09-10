@@ -1,0 +1,194 @@
+"""Wallet domain service — the only place business rules live.
+
+Covers the MA-1 auto-provision baseline (create_wallet from
+UserRegistered, GET /wallet/me/status, retry) and the MA-24 recharge
+slice (GET /wallet/me, GET /wallet/me/transactions, credit_recharge from
+PaymentConfirmed, GET /wallet/internal/limits).
+"""
+
+import logging
+import uuid
+from datetime import UTC, datetime
+
+from adapters.wallet_repository import (
+    SqlAlchemyWalletRepository,
+    decode_cursor,
+    encode_cursor,
+    new_wallet_id,
+)
+from config.env import Settings
+from domain.exceptions import InvalidCursorError, WalletNotFoundError
+from domain.models import LedgerEntry, LedgerType, TransactionsPage, Wallet, WalletStatus
+
+logger = logging.getLogger(__name__)
+
+_MAX_PAGE = 100
+_DEFAULT_PAGE = 20
+
+_DESCRIPTIONS = {
+    LedgerType.OPENING: "Wallet created",
+    LedgerType.RECHARGE: "Wallet top-up",
+    LedgerType.ORDER_DEBIT: "Order payment",
+    LedgerType.REFUND: "Refund",
+    LedgerType.CASHBACK: "Cashback",
+    LedgerType.REFERRAL_CREDIT: "Referral credit",
+    LedgerType.ADJUSTMENT: "Adjustment",
+}
+
+
+class WalletService:
+    def __init__(self, repository: SqlAlchemyWalletRepository, settings: Settings) -> None:
+        self._repo = repository
+        self._settings = settings
+
+    # --- MA-1 baseline ---
+
+    def create_wallet(self, user_registered: dict) -> None:
+        """Consume a UserRegistered event. Idempotent on user_id."""
+        user_id = user_registered["userId"]
+        created = self._repo.insert_wallet_if_absent(new_wallet_id(), user_id)
+        if not created:
+            logger.info("create_wallet: wallet already exists, no-op", extra={"userId": user_id})
+            return
+        logger.info("create_wallet: wallet provisioned", extra={"userId": user_id})
+
+    def retry_provision(self, user_id: str) -> None:
+        """MA-1 POST /wallet/me/retry — replay the create by user id."""
+        self.create_wallet({"userId": user_id})
+
+    def get_wallet_status_legacy(self, user_id: str) -> dict:
+        """MA-1's GET /wallet/me/status — UNCHANGED body:
+        {walletId, status, balance (whole rupees), currency}. Not the
+        MA-24 balancePaise shape (round-2 finding #9)."""
+        wallet = self._repo.get_wallet_by_user(user_id)
+        if wallet is None:
+            return {
+                "walletId": None,
+                "status": WalletStatus.CREATING.value,
+                "balance": 0,
+                "currency": "INR",
+            }
+        return {
+            "walletId": wallet.id,
+            "status": wallet.status.value,
+            "balance": wallet.balance_paise // 100,
+            "currency": wallet.currency,
+        }
+
+    # --- MA-24 read APIs ---
+
+    def get_wallet_me(self, user_id: str) -> dict:
+        """MA-24 GET /wallet/me — the new endpoint MA-125 consumes."""
+        wallet = self._repo.get_wallet_by_user(user_id)
+        if wallet is None:
+            return {
+                "walletId": None,
+                "status": WalletStatus.CREATING.value,
+                "balancePaise": 0,
+                "currency": "INR",
+                "rechargeMinPaise": self._settings.recharge_min_paise,
+                "rechargeMaxPaise": self._settings.recharge_max_paise,
+            }
+        return {
+            "walletId": wallet.id,
+            "status": wallet.status.value,
+            "balancePaise": wallet.balance_paise,
+            "currency": wallet.currency,
+            "rechargeMinPaise": self._settings.recharge_min_paise,
+            "rechargeMaxPaise": self._settings.recharge_max_paise,
+        }
+
+    def get_internal_limits(self) -> dict:
+        return {
+            "rechargeMinPaise": self._settings.recharge_min_paise,
+            "rechargeMaxPaise": self._settings.recharge_max_paise,
+        }
+
+    def list_transactions(
+        self, user_id: str, limit: int | None, cursor: str | None
+    ) -> TransactionsPage:
+        wallet = self._repo.get_wallet_by_user(user_id)
+        if wallet is None:
+            raise WalletNotFoundError("No wallet for this account")
+
+        page_size = _DEFAULT_PAGE if not limit else max(1, min(limit, _MAX_PAGE))
+        before_id = None
+        if cursor:
+            try:
+                before_id = decode_cursor(cursor)
+            except Exception as exc:  # noqa: BLE001 — any decode failure is a bad cursor
+                raise InvalidCursorError("Malformed pagination cursor") from exc
+
+        entries = self._repo.list_ledger_entries(wallet.id, page_size + 1, before_id)
+        has_more = len(entries) > page_size
+        entries = entries[:page_size]
+        next_cursor = encode_cursor(entries[-1].id) if (has_more and entries) else None
+        return TransactionsPage(items=entries, next_cursor=next_cursor)
+
+    # --- MA-24 recharge consumer ---
+
+    def credit_recharge(self, payment_confirmed: dict) -> None:
+        """Consume PaymentConfirmed(purpose=WALLET_RECHARGE). Idempotent
+        on razorpay_payment_id via the ledger `ref` UNIQUE."""
+        user_id = payment_confirmed["userId"]
+        amount_paise = int(payment_confirmed["amountPaise"])
+        currency = payment_confirmed.get("currency", "INR")
+        if currency != "INR":
+            raise ValueError(f"unsupported currency: {currency!r}")
+        correlation_id = payment_confirmed.get("correlationId")
+        rzp_payment_id = payment_confirmed["razorpayPaymentId"]
+        payment_id = payment_confirmed["paymentId"]
+        ref = f"razorpay_payment:{rzp_payment_id}"
+
+        if not (
+            self._settings.recharge_min_paise
+            <= amount_paise
+            <= self._settings.recharge_max_paise
+        ):
+            # Never reject real money — the capture already happened.
+            logger.warning(
+                "credit_recharge: amount outside current limits, crediting anyway",
+                extra={"userId": user_id, "amountPaise": amount_paise},
+            )
+
+        def _build_outbox(wallet: Wallet, balance_after_paise: int) -> dict:
+            return {
+                "eventId": str(uuid.uuid4()),
+                "occurredAt": datetime.now(UTC).isoformat(),
+                "correlationId": correlation_id or "",
+                "userId": user_id,
+                "walletId": wallet.id,
+                "amountPaise": amount_paise,
+                "balanceAfterPaise": balance_after_paise,
+                "type": "RECHARGE",
+                "ref": ref,
+                "paymentId": payment_id,
+            }
+
+        result = self._repo.credit_recharge(
+            user_id=user_id,
+            amount_paise=amount_paise,
+            ref=ref,
+            correlation_id=correlation_id,
+            outbox_payload_builder=_build_outbox,
+        )
+        if result is None:
+            logger.info(
+                "credit_recharge: duplicate PaymentConfirmed, no-op",
+                extra={"ref": ref},
+            )
+        else:
+            logger.info(
+                "credit_recharge: wallet credited",
+                extra={"ref": ref, "balanceAfterPaise": result.balance_paise},
+            )
+
+
+def render_description(entry: LedgerEntry) -> str:
+    return _DESCRIPTIONS.get(entry.type, entry.type.value)
+
+
+def _iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.isoformat()

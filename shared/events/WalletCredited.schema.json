@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/WalletCredited.schema.json",
+  "title": "WalletCredited",
+  "description": "EventBridge `detail` for a wallet ledger credit. Producer: milkful.wallet (MA-127).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "occurredAt",
+    "correlationId",
+    "userId",
+    "walletId",
+    "amountPaise",
+    "balanceAfterPaise",
+    "type",
+    "ref",
+    "paymentId"
+  ],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1 },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1 },
+    "walletId": { "type": "string", "minLength": 1 },
+    "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
+    "balanceAfterPaise": { "type": "integer", "minimum": 0 },
+    "type": { "const": "RECHARGE" },
+    "ref": { "type": "string", "minLength": 1 },
+    "paymentId": { "type": "string", "minLength": 1 }
+  }
+}
