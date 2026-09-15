@@ -1,9 +1,35 @@
 """Ports the domain depends on. Adapters implement these; the domain
 never imports SQLAlchemy, boto3, or the Razorpay SDK directly."""
 
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 from domain.models import Payment
+
+
+class LockedPaymentPort(Protocol):
+    """A payment row locked for the lifetime of the enclosing
+    `transaction_by_id`/`transaction_by_order_id` block — every write made
+    through it shares that transaction, so the lock is held across the
+    whole status-check-then-write sequence."""
+
+    payment: Payment | None
+
+    def set_status(
+        self,
+        *,
+        status: str,
+        method: str | None = None,
+        razorpay_payment_id: str | None = None,
+        razorpay_signature: str | None = None,
+        failure_code: str | None = None,
+        failure_reason: str | None = None,
+        captured_at_now: bool = False,
+    ) -> None: ...
+
+    def append_event(self, source: str, raw_payload: dict) -> None: ...
+
+    def enqueue_outbox(self, event_type: str, payload: dict) -> None: ...
 
 
 class PaymentRepositoryPort(Protocol):
@@ -24,12 +50,15 @@ class PaymentRepositoryPort(Protocol):
 
     def set_order_id(self, payment_id: str, razorpay_order_id: str) -> None: ...
 
-    def lock_by_id(self, payment_id: str) -> Payment | None:
-        """SELECT ... FOR UPDATE by primary key."""
+    def transaction_by_id(self, payment_id: str) -> AbstractContextManager[LockedPaymentPort]:
+        """Locks the row (`SELECT ... FOR UPDATE`) for the lifetime of the
+        `with` block by primary key."""
         ...
 
-    def lock_by_order_id(self, razorpay_order_id: str) -> Payment | None:
-        """SELECT ... FOR UPDATE by razorpay_order_id."""
+    def transaction_by_order_id(
+        self, razorpay_order_id: str
+    ) -> AbstractContextManager[LockedPaymentPort]:
+        """Same as [transaction_by_id], keyed by `razorpay_order_id`."""
         ...
 
     def set_status(

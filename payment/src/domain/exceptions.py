@@ -53,6 +53,15 @@ class GatewayUnavailableError(PaymentError):
     http_status = 503
 
 
+class GatewayRequestInvalidError(PaymentError):
+    """Razorpay rejected the request itself (bad amount/receipt, invalid
+    auth) — a permanent error that retrying can never fix, unlike
+    [GatewayUnavailableError]'s transient failures."""
+
+    error_code = "GATEWAY_REQUEST_INVALID"
+    http_status = 500
+
+
 class ServiceUnavailableError(PaymentError):
     """DB unreachable — fail closed."""
 

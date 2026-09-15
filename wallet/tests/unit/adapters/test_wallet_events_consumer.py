@@ -101,3 +101,17 @@ def test_unknown_detail_type_is_acked(consumer_factory):
     c = consumer_factory([_msg("SomethingElse", {})])
     c.poll_once()
     assert c._sqs.deleted == ["rh-1"]
+
+
+def test_schema_invalid_payment_confirmed_is_not_acked_and_does_not_crash(
+    consumer_factory, engine, repo
+):
+    # amountPaise as a string is a schema violation (the contract requires
+    # an integer) — jsonschema.validate must raise, and that must be
+    # caught rather than propagate out of poll_once and kill the consumer
+    # loop; the poison message is left for redelivery/DLQ, not acked.
+    seed_wallet(engine, balance_paise=1000)
+    c = consumer_factory([_msg("PaymentConfirmed", _pc(amountPaise="not-a-number"))])
+    c.poll_once()
+    assert c._sqs.deleted == []
+    assert repo.get_wallet_by_user("user-1").balance_paise == 1000

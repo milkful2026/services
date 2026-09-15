@@ -28,9 +28,15 @@ try:  # optional in prod images; present in dev for contract validation
     from shared.events import load_schema  # type: ignore
 
     _PAYMENT_CONFIRMED_SCHEMA = load_schema("PaymentConfirmed")
+    # An empty tuple as the "no jsonschema" fallback below means the except
+    # clause that names this never matches anything (rather than raising
+    # AttributeError trying to look up .ValidationError on None the first
+    # time some *other* exception is being matched against it).
+    _SCHEMA_VALIDATION_ERROR: type[Exception] | tuple[()] = jsonschema.ValidationError
 except Exception:  # noqa: BLE001
     jsonschema = None
     _PAYMENT_CONFIRMED_SCHEMA = None
+    _SCHEMA_VALIDATION_ERROR = ()
 
 
 class WalletEventsConsumer:
@@ -84,6 +90,12 @@ class WalletEventsConsumer:
         except WalletError as exc:
             logger.error(
                 "wallet_events_consumer: transient processing failure — left for retry/DLQ",
+                extra={"messageId": message.get("MessageId"), "error": str(exc)},
+            )
+            return
+        except _SCHEMA_VALIDATION_ERROR as exc:
+            logger.error(
+                "wallet_events_consumer: schema-invalid PaymentConfirmed — left for retry/DLQ",
                 extra={"messageId": message.get("MessageId"), "error": str(exc)},
             )
             return

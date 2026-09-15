@@ -191,6 +191,11 @@ class TestApplyWebhookFailed:
         unpub = repo.fetch_unpublished()
         assert unpub[0]["event_type"] == "PaymentFailed"
         assert metrics.count("recharge.failed") == 1
+        # razorpay_payment_id was never set on this payment (it failed
+        # before Razorpay ever reported one) — the schema types
+        # razorpayPaymentId as string-only, so the key must be omitted
+        # rather than emitted as a null.
+        assert "razorpayPaymentId" not in unpub[0]["payload"]
 
 
 class TestLateCaptureRecovery:

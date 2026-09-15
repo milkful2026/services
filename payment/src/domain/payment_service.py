@@ -141,42 +141,43 @@ class PaymentService:
         razorpay_order_id: str,
         razorpay_signature: str,
     ) -> dict:
-        payment = self._repo.lock_by_id(payment_id)
-        if payment is None or payment.user_id != user_id:
-            raise PaymentNotFoundError("No such payment")
+        with self._repo.transaction_by_id(payment_id) as locked:
+            payment = locked.payment
+            if payment is None or payment.user_id != user_id:
+                raise PaymentNotFoundError("No such payment")
 
-        if not self._gateway.verify_client_signature(
-            razorpay_order_id, razorpay_payment_id, razorpay_signature
-        ):
-            self._repo.append_event(
-                payment_id,
-                "CLIENT_CONFIRM_REJECTED",
+            if not self._gateway.verify_client_signature(
+                razorpay_order_id, razorpay_payment_id, razorpay_signature
+            ):
+                locked.append_event(
+                    "CLIENT_CONFIRM_REJECTED",
+                    {
+                        "razorpayOrderId": razorpay_order_id,
+                        "razorpayPaymentId": razorpay_payment_id,
+                    },
+                )
+                raise SignatureInvalidError("Payment signature could not be verified")
+
+            if payment.razorpay_order_id != razorpay_order_id:
+                raise OrderMismatchError("razorpayOrderId does not match this payment")
+
+            if payment.status in (PaymentStatus.CONFIRMED, PaymentStatus.FAILED):
+                return self._get_response(payment)
+            if payment.status == PaymentStatus.CONFIRMING:
+                return self._get_response(payment)
+
+            locked.set_status(
+                status=PaymentStatus.CONFIRMING.value,
+                razorpay_payment_id=razorpay_payment_id,
+                razorpay_signature=razorpay_signature,
+            )
+            locked.append_event(
+                "CLIENT_CONFIRM",
                 {"razorpayOrderId": razorpay_order_id, "razorpayPaymentId": razorpay_payment_id},
             )
-            raise SignatureInvalidError("Payment signature could not be verified")
-
-        if payment.razorpay_order_id != razorpay_order_id:
-            raise OrderMismatchError("razorpayOrderId does not match this payment")
-
-        if payment.status in (PaymentStatus.CONFIRMED, PaymentStatus.FAILED):
+            self._metrics.emit("recharge.confirming")
+            payment.status = PaymentStatus.CONFIRMING
             return self._get_response(payment)
-        if payment.status == PaymentStatus.CONFIRMING:
-            return self._get_response(payment)
-
-        self._repo.set_status(
-            payment_id,
-            status=PaymentStatus.CONFIRMING.value,
-            razorpay_payment_id=razorpay_payment_id,
-            razorpay_signature=razorpay_signature,
-        )
-        self._repo.append_event(
-            payment_id,
-            "CLIENT_CONFIRM",
-            {"razorpayOrderId": razorpay_order_id, "razorpayPaymentId": razorpay_payment_id},
-        )
-        self._metrics.emit("recharge.confirming")
-        payment.status = PaymentStatus.CONFIRMING
-        return self._get_response(payment)
 
     # --- FR-3: webhook (authoritative) ---
 
@@ -205,87 +206,94 @@ class PaymentService:
         amount_paise = int(entity["amount"])
         method = (entity.get("method") or "OTHER").upper()
 
-        row = self._repo.lock_by_order_id(order_id)
-        if row is None:
-            logger.warning(
-                "apply_webhook: orphan captured event, no matching payment",
-                extra={"razorpayOrderId": order_id},
-            )
-            self._repo.append_event("unknown", "ORPHAN_WEBHOOK", entity)
-            return
+        with self._repo.transaction_by_order_id(order_id) as locked:
+            row = locked.payment
+            if row is None:
+                logger.warning(
+                    "apply_webhook: orphan captured event, no matching payment",
+                    extra={"razorpayOrderId": order_id},
+                )
+                self._repo.append_event("unknown", "ORPHAN_WEBHOOK", entity)
+                return
 
-        if row.status == PaymentStatus.CONFIRMED:
-            self._repo.append_event(row.id, "WEBHOOK_DUP", entity)
-            return
+            if row.status == PaymentStatus.CONFIRMED:
+                locked.append_event("WEBHOOK_DUP", entity)
+                return
 
-        provisional_timeout = row.status == PaymentStatus.FAILED and row.failure_code == "TIMEOUT"
-        if row.status == PaymentStatus.FAILED and not provisional_timeout:
-            # A real Razorpay-reported failure is terminal. A late capture
-            # arriving after that is not auto-recovered — flag for manual
-            # review (PR #16 round-2 finding #7).
-            self._repo.append_event(row.id, "WEBHOOK_DUP", entity)
-            logger.error(
-                "late_capture_after_fail",
-                extra={"paymentId": row.id, "razorpayOrderId": order_id},
+            provisional_timeout = (
+                row.status == PaymentStatus.FAILED and row.failure_code == "TIMEOUT"
             )
-            return
+            if row.status == PaymentStatus.FAILED and not provisional_timeout:
+                # A real Razorpay-reported failure is terminal. A late capture
+                # arriving after that is not auto-recovered — flag for manual
+                # review (PR #16 round-2 finding #7).
+                locked.append_event("WEBHOOK_DUP", entity)
+                logger.error(
+                    "late_capture_after_fail",
+                    extra={"paymentId": row.id, "razorpayOrderId": order_id},
+                )
+                return
 
-        if row.amount_paise != amount_paise:
-            self._repo.set_status(
-                row.id, status=PaymentStatus.FAILED.value, failure_code="AMOUNT_MISMATCH"
-            )
-            self._repo.append_event(row.id, source, entity)
-            self._enqueue_payment_failed(
-                row,
-                failure_code="AMOUNT_MISMATCH",
-                failure_reason="Captured amount did not match",
-            )
-            self._metrics.emit("recharge.failed", code="AMOUNT_MISMATCH")
-            logger.error(
-                "apply_webhook: amount mismatch",
-                extra={"paymentId": row.id, "expected": row.amount_paise, "actual": amount_paise},
-            )
-            return
+            if row.amount_paise != amount_paise:
+                locked.set_status(status=PaymentStatus.FAILED.value, failure_code="AMOUNT_MISMATCH")
+                locked.append_event(source, entity)
+                self._enqueue_payment_failed(
+                    locked,
+                    row,
+                    failure_code="AMOUNT_MISMATCH",
+                    failure_reason="Captured amount did not match",
+                )
+                self._metrics.emit("recharge.failed", code="AMOUNT_MISMATCH")
+                logger.error(
+                    "apply_webhook: amount mismatch",
+                    extra={
+                        "paymentId": row.id,
+                        "expected": row.amount_paise,
+                        "actual": amount_paise,
+                    },
+                )
+                return
 
-        self._repo.set_status(
-            row.id,
-            status=PaymentStatus.CONFIRMED.value,
-            method=method,
-            razorpay_payment_id=rzp_payment_id,
-            captured_at_now=True,
-        )
-        self._repo.append_event(
-            row.id, "LATE_CAPTURE_RECOVERED" if provisional_timeout else source, entity
-        )
-        self._enqueue_payment_confirmed(
-            row, amount_paise=amount_paise, method=method, rzp_payment_id=rzp_payment_id
-        )
-        self._metrics.emit("recharge.confirmed")
+            locked.set_status(
+                status=PaymentStatus.CONFIRMED.value,
+                method=method,
+                razorpay_payment_id=rzp_payment_id,
+                captured_at_now=True,
+            )
+            locked.append_event(
+                "LATE_CAPTURE_RECOVERED" if provisional_timeout else source, entity
+            )
+            self._enqueue_payment_confirmed(
+                locked, row, amount_paise=amount_paise, method=method, rzp_payment_id=rzp_payment_id
+            )
+            self._metrics.emit("recharge.confirmed")
 
     def _apply_failed(self, entity: dict, *, source: str) -> None:
         order_id = entity["order_id"]
-        row = self._repo.lock_by_order_id(order_id)
-        if row is None:
-            logger.warning(
-                "apply_webhook: orphan failed event, no matching payment",
-                extra={"razorpayOrderId": order_id},
-            )
-            return
-        if row.status in (PaymentStatus.CONFIRMED, PaymentStatus.FAILED):
-            self._repo.append_event(row.id, "WEBHOOK_DUP", entity)
-            return
+        with self._repo.transaction_by_order_id(order_id) as locked:
+            row = locked.payment
+            if row is None:
+                logger.warning(
+                    "apply_webhook: orphan failed event, no matching payment",
+                    extra={"razorpayOrderId": order_id},
+                )
+                return
+            if row.status in (PaymentStatus.CONFIRMED, PaymentStatus.FAILED):
+                locked.append_event("WEBHOOK_DUP", entity)
+                return
 
-        failure_code = entity.get("error_code") or "PAYMENT_FAILED"
-        failure_reason = entity.get("error_description") or "Payment failed"
-        self._repo.set_status(
-            row.id,
-            status=PaymentStatus.FAILED.value,
-            failure_code=failure_code,
-            failure_reason=failure_reason,
-        )
-        self._repo.append_event(row.id, source, entity)
-        self._enqueue_payment_failed(row, failure_code=failure_code, failure_reason=failure_reason)
-        self._metrics.emit("recharge.failed", code=failure_code)
+            failure_code = entity.get("error_code") or "PAYMENT_FAILED"
+            failure_reason = entity.get("error_description") or "Payment failed"
+            locked.set_status(
+                status=PaymentStatus.FAILED.value,
+                failure_code=failure_code,
+                failure_reason=failure_reason,
+            )
+            locked.append_event(source, entity)
+            self._enqueue_payment_failed(
+                locked, row, failure_code=failure_code, failure_reason=failure_reason
+            )
+            self._metrics.emit("recharge.failed", code=failure_code)
 
     # --- FR-4: read ---
 
@@ -342,13 +350,21 @@ class PaymentService:
         updated_at = row.updated_at or now
         age_seconds = (now - _as_aware_utc(updated_at)).total_seconds()
         if age_seconds >= self._settings.reconcile_hard_cap_seconds:
-            self._repo.set_status(
-                row.id, status=PaymentStatus.FAILED.value, failure_code="TIMEOUT"
-            )
-            self._repo.append_event(row.id, "RECONCILE", {"reason": "hard_cap_exceeded"})
-            self._enqueue_payment_failed(
-                row, failure_code="TIMEOUT", failure_reason="Payment timed out"
-            )
+            with self._repo.transaction_by_id(row.id) as locked:
+                current = locked.payment
+                # Re-check under the lock — a webhook may have settled this
+                # payment between list_stale's read and this sweep reaching
+                # it; only force-timeout if it's still unresolved.
+                if current is None or current.status not in (
+                    PaymentStatus.CONFIRMING,
+                    PaymentStatus.CREATED,
+                ):
+                    return "already_resolved"
+                locked.set_status(status=PaymentStatus.FAILED.value, failure_code="TIMEOUT")
+                locked.append_event("RECONCILE", {"reason": "hard_cap_exceeded"})
+                self._enqueue_payment_failed(
+                    locked, current, failure_code="TIMEOUT", failure_reason="Payment timed out"
+                )
             self._metrics.emit("recharge.failed", code="TIMEOUT")
             self._metrics.emit("recharge.reconciled", outcome="timeout")
             return "timeout"
@@ -364,7 +380,7 @@ class PaymentService:
     # --- outbox payload builders ---
 
     def _enqueue_payment_confirmed(
-        self, payment: Payment, *, amount_paise: int, method: str, rzp_payment_id: str
+        self, outbox, payment: Payment, *, amount_paise: int, method: str, rzp_payment_id: str
     ) -> None:
         detail = {
             "eventId": str(uuid.uuid4()),
@@ -379,10 +395,10 @@ class PaymentService:
             "razorpayPaymentId": rzp_payment_id,
             "razorpayOrderId": payment.razorpay_order_id,
         }
-        self._repo.enqueue_outbox(payment.id, "PaymentConfirmed", detail)
+        outbox.enqueue_outbox("PaymentConfirmed", detail)
 
     def _enqueue_payment_failed(
-        self, payment: Payment, *, failure_code: str, failure_reason: str
+        self, outbox, payment: Payment, *, failure_code: str, failure_reason: str
     ) -> None:
         detail = {
             "eventId": str(uuid.uuid4()),
@@ -393,12 +409,18 @@ class PaymentService:
             "purpose": payment.purpose.value,
             "amountPaise": payment.amount_paise,
             "currency": payment.currency,
-            "razorpayPaymentId": payment.razorpay_payment_id,
             "razorpayOrderId": payment.razorpay_order_id,
             "failureCode": failure_code,
             "failureReason": failure_reason,
         }
-        self._repo.enqueue_outbox(payment.id, "PaymentFailed", detail)
+        # razorpay_payment_id is only ever set once a payment has actually
+        # been captured (e.g. the AMOUNT_MISMATCH branch) — a payment that
+        # fails before Razorpay reports anything (bad card, reconcile
+        # TIMEOUT) never gets one. Omit the key rather than emit a null:
+        # shared/events/PaymentFailed.schema.json types it string-only.
+        if payment.razorpay_payment_id is not None:
+            detail["razorpayPaymentId"] = payment.razorpay_payment_id
+        outbox.enqueue_outbox("PaymentFailed", detail)
 
 
 def _new_payment_id() -> str:

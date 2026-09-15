@@ -104,6 +104,87 @@ def _dump(payload: dict) -> object:
     return json.dumps(payload)
 
 
+def _status_values(
+    *,
+    status: str,
+    method: str | None = None,
+    razorpay_payment_id: str | None = None,
+    razorpay_signature: str | None = None,
+    failure_code: str | None = None,
+    failure_reason: str | None = None,
+    captured_at_now: bool = False,
+) -> dict[str, object]:
+    values: dict[str, object] = {"status": status, "updated_at": func.now()}
+    if method is not None:
+        values["method"] = method
+    if razorpay_payment_id is not None:
+        values["razorpay_payment_id"] = razorpay_payment_id
+    if razorpay_signature is not None:
+        values["razorpay_signature"] = razorpay_signature
+    if failure_code is not None:
+        values["failure_code"] = failure_code
+    if failure_reason is not None:
+        values["failure_reason"] = failure_reason
+    if captured_at_now:
+        values["captured_at"] = func.now()
+    return values
+
+
+class LockedPayment:
+    """A payment row locked (`SELECT ... FOR UPDATE`) for the lifetime of
+    the enclosing `transaction_by_id`/`transaction_by_order_id` block.
+    `.payment` is the row as of the lock; every write made through this
+    handle shares that same connection/transaction, so the lock is held
+    across the whole status-check-then-write sequence instead of being
+    released before the caller decides what to write."""
+
+    def __init__(self, conn, payment_id: str | None, payment: Payment | None) -> None:
+        self._conn = conn
+        self._payment_id = payment_id
+        self.payment = payment
+
+    def set_status(
+        self,
+        *,
+        status: str,
+        method: str | None = None,
+        razorpay_payment_id: str | None = None,
+        razorpay_signature: str | None = None,
+        failure_code: str | None = None,
+        failure_reason: str | None = None,
+        captured_at_now: bool = False,
+    ) -> None:
+        self._conn.execute(
+            payments_table.update()
+            .where(payments_table.c.id == self._payment_id)
+            .values(
+                **_status_values(
+                    status=status,
+                    method=method,
+                    razorpay_payment_id=razorpay_payment_id,
+                    razorpay_signature=razorpay_signature,
+                    failure_code=failure_code,
+                    failure_reason=failure_reason,
+                    captured_at_now=captured_at_now,
+                )
+            )
+        )
+
+    def append_event(self, source: str, raw_payload: dict) -> None:
+        self._conn.execute(
+            payment_events_table.insert().values(
+                payment_id=self._payment_id, source=source, raw_payload=_dump(raw_payload)
+            )
+        )
+
+    def enqueue_outbox(self, event_type: str, payload: dict) -> None:
+        self._conn.execute(
+            outbox_table.insert().values(
+                aggregate_id=self._payment_id, event_type=event_type, payload=_dump(payload)
+            )
+        )
+
+
 class SqlAlchemyPaymentRepository:
     def __init__(self, engine: Engine, correlation_id: str = "") -> None:
         self._engine = engine
@@ -172,25 +253,40 @@ class SqlAlchemyPaymentRepository:
                     .values(razorpay_order_id=razorpay_order_id, updated_at=func.now())
                 )
 
-    def lock_by_id(self, payment_id: str) -> Payment | None:
-        with self._db_operation("lock_by_id", "Failed to load payment"):
+    @contextmanager
+    def transaction_by_id(self, payment_id: str) -> Iterator["LockedPayment"]:
+        """Locks the row for the lifetime of the whole `with` block — unlike
+        `lock_by_id` (removed) + separate `set_status`/`append_event`/
+        `enqueue_outbox` calls, which each opened and committed their own
+        transaction and so released the lock before the caller's
+        status-check-then-write decision was even made, letting two
+        concurrent callers (e.g. retried webhooks) both act on the same
+        stale snapshot. Mirrors wallet_repository.credit_recharge's
+        single-transaction pattern."""
+        with self._db_operation("transaction_by_id", "Failed to update payment"):
             with self._engine.begin() as conn:
                 row = conn.execute(
                     select(payments_table)
                     .where(payments_table.c.id == payment_id)
                     .with_for_update()
                 ).fetchone()
-        return None if row is None else _row_to_payment(row)
+                payment = None if row is None else _row_to_payment(row)
+                yield LockedPayment(conn, payment_id, payment)
 
-    def lock_by_order_id(self, razorpay_order_id: str) -> Payment | None:
-        with self._db_operation("lock_by_order_id", "Failed to load payment"):
+    @contextmanager
+    def transaction_by_order_id(self, razorpay_order_id: str) -> Iterator["LockedPayment"]:
+        """Same as [transaction_by_id], keyed by `razorpay_order_id` — used
+        by the webhook/reconcile paths, which only have the gateway's order
+        id to look the payment up by."""
+        with self._db_operation("transaction_by_order_id", "Failed to update payment"):
             with self._engine.begin() as conn:
                 row = conn.execute(
                     select(payments_table)
                     .where(payments_table.c.razorpay_order_id == razorpay_order_id)
                     .with_for_update()
                 ).fetchone()
-        return None if row is None else _row_to_payment(row)
+                payment = None if row is None else _row_to_payment(row)
+                yield LockedPayment(conn, None if row is None else row.id, payment)
 
     def set_status(
         self,
@@ -204,25 +300,22 @@ class SqlAlchemyPaymentRepository:
         failure_reason: str | None = None,
         captured_at_now: bool = False,
     ) -> None:
-        values: dict[str, object] = {"status": status, "updated_at": func.now()}
-        if method is not None:
-            values["method"] = method
-        if razorpay_payment_id is not None:
-            values["razorpay_payment_id"] = razorpay_payment_id
-        if razorpay_signature is not None:
-            values["razorpay_signature"] = razorpay_signature
-        if failure_code is not None:
-            values["failure_code"] = failure_code
-        if failure_reason is not None:
-            values["failure_reason"] = failure_reason
-        if captured_at_now:
-            values["captured_at"] = func.now()
         with self._db_operation("set_status", "Failed to update payment"):
             with self._engine.begin() as conn:
                 conn.execute(
                     payments_table.update()
                     .where(payments_table.c.id == payment_id)
-                    .values(**values)
+                    .values(
+                        **_status_values(
+                            status=status,
+                            method=method,
+                            razorpay_payment_id=razorpay_payment_id,
+                            razorpay_signature=razorpay_signature,
+                            failure_code=failure_code,
+                            failure_reason=failure_reason,
+                            captured_at_now=captured_at_now,
+                        )
+                    )
                 )
 
     def append_event(self, payment_id: str, source: str, raw_payload: dict) -> None:

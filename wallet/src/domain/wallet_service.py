@@ -212,9 +212,3 @@ class WalletService:
 
 def render_description(entry: LedgerEntry) -> str:
     return _DESCRIPTIONS.get(entry.type, entry.type.value)
-
-
-def _iso(value: datetime) -> str:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.isoformat()

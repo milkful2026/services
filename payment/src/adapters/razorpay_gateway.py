@@ -15,9 +15,10 @@ import hmac
 import logging
 
 import razorpay
+from razorpay.errors import BadRequestError as RazorpayBadRequestError
 
 from adapters.retry import call_with_retry
-from domain.exceptions import GatewayUnavailableError
+from domain.exceptions import GatewayRequestInvalidError, GatewayUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,15 @@ class RazorpayGateway:
                         "notes": notes,
                     }
                 )
+            except RazorpayBadRequestError as exc:
+                # A permanent client-input error (bad amount/receipt,
+                # invalid auth) — retrying changes nothing, and wrapping it
+                # as a transient _RetryableGatewayError would both waste
+                # real Razorpay calls and mislabel it as
+                # GatewayUnavailableError, misleading callers into treating
+                # it as retryable. pricing_client_adapter.py's 400 handling
+                # follows the same non-retry rule.
+                raise GatewayRequestInvalidError(str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 — the SDK raises its own error types
                 raise _RetryableGatewayError(str(exc)) from exc
             return order["id"]
@@ -96,6 +106,10 @@ class RazorpayGateway:
         def _attempt() -> list[dict]:
             try:
                 result = self._client.order.payments(razorpay_order_id)
+            except RazorpayBadRequestError as exc:
+                # See orders_create's comment — a permanent client-input
+                # error, not a transient one, so it is never retried.
+                raise GatewayRequestInvalidError(str(exc)) from exc
             except Exception as exc:  # noqa: BLE001
                 raise _RetryableGatewayError(str(exc)) from exc
             return result.get("items", [])
