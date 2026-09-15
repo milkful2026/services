@@ -16,7 +16,10 @@ class Settings(BaseSettings):
     aws_region: str = "ap-south-1"
 
     event_bus_name: str = "default"
-    event_source: str = "milkful.payment"
+    # Bare service-name source, matching this codebase's established
+    # convention (user/cart/catalog publish "user"/"cart"/"catalog", not a
+    # dotted "milkful.*" namespace).
+    event_source: str = "payment"
 
     # Razorpay — key_secret/webhook_secret are Secrets Manager values in
     # prod; a local .env.local carries rzp_test_* credentials.

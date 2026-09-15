@@ -17,7 +17,10 @@ class Settings(BaseSettings):
     aws_region: str = "ap-south-1"
 
     event_bus_name: str = "default"
-    event_source: str = "milkful.wallet"
+    # Bare service-name source, matching this codebase's established
+    # convention (user/cart/catalog publish "user"/"cart"/"catalog", not a
+    # dotted "milkful.*" namespace).
+    event_source: str = "wallet"
 
     # SQS queue this service consumes (UserRegistered + recharge PaymentConfirmed).
     events_queue_url: str = ""
