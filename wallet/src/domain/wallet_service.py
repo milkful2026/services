@@ -184,6 +184,32 @@ class WalletService:
             )
 
 
+    # --- MA-127 §5/§7/§11: nightly balance invariant ---
+
+    def check_balance_invariant(self) -> list[str]:
+        """Asserts `wallets.balance_paise == SUM(ledger_entries.amount_paise)`
+        for every wallet. A mismatch is logged as the
+        `wallet.balance_invariant_violations` metric per offending wallet
+        (CloudWatch metric filter on this log line, matching this
+        codebase's existing logging-only convention — no service here
+        has a separate metrics client) rather than raised, so one bad
+        wallet doesn't abort the sweep. Returns the offending wallet ids."""
+        violations = self._repo.find_balance_invariant_violations()
+        offending_ids: list[str] = []
+        for wallet_id, balance_paise, ledger_sum_paise in violations:
+            offending_ids.append(wallet_id)
+            logger.error(
+                "wallet.balance_invariant_violations",
+                extra={
+                    "metric": "wallet.balance_invariant_violations",
+                    "walletId": wallet_id,
+                    "balancePaise": balance_paise,
+                    "ledgerSumPaise": ledger_sum_paise,
+                },
+            )
+        return offending_ids
+
+
 def render_description(entry: LedgerEntry) -> str:
     return _DESCRIPTIONS.get(entry.type, entry.type.value)
 

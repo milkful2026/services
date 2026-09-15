@@ -36,6 +36,11 @@ class WalletRepositoryPort(Protocol):
         self, wallet_id: str, limit: int, before: tuple[str, int] | None
     ) -> list[LedgerEntry]: ...
 
+    def find_balance_invariant_violations(self) -> list[tuple[str, int, int]]:
+        """Returns (wallet_id, balance_paise, ledger_sum_paise) for every
+        wallet where they disagree."""
+        ...
+
 
 class OutboxPort(Protocol):
     def enqueue(self, aggregate_id: str, event_type: str, payload: dict) -> None: ...

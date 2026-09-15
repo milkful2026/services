@@ -1,5 +1,6 @@
 import pytest
 
+from adapters.wallet_repository import ledger_entries_table, wallets_table
 from domain.exceptions import InvalidCursorError, RetryableConsumerError, WalletNotFoundError
 from tests.conftest import seed_wallet
 
@@ -150,3 +151,38 @@ class TestCreditRecharge:
         seed_wallet(engine)
         with pytest.raises(ValueError):
             service.credit_recharge(_payment_confirmed(currency="USD"))
+
+
+class TestBalanceInvariant:
+    def test_consistent_ledger_reports_no_violations(self, service, repo, engine):
+        # balance_paise=0 so the OPENING entry's amount_paise=0 keeps the
+        # ledger sum consistent before the recharge is applied.
+        seed_wallet(engine, balance_paise=0)
+        service.credit_recharge(_payment_confirmed())
+        assert service.check_balance_invariant() == []
+
+    def test_mismatched_wallet_is_reported(self, service, engine, repo):
+        seed_wallet(engine, balance_paise=999999)  # doesn't match the ledger's 0-sum opening entry
+        offending = service.check_balance_invariant()
+        assert offending == ["wal_1"]
+
+    def test_mixed_entry_types_still_consistent(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=0)
+        service.credit_recharge(_payment_confirmed(amountPaise=50000))
+        with engine.begin() as conn:
+            conn.execute(
+                ledger_entries_table.insert().values(
+                    wallet_id="wal_1",
+                    type="ORDER_DEBIT",
+                    amount_paise=-20000,
+                    balance_after_paise=30000,
+                    ref="order:debit-1",
+                    correlation_id=None,
+                )
+            )
+            conn.execute(
+                wallets_table.update()
+                .where(wallets_table.c.id == "wal_1")
+                .values(balance_paise=30000)
+            )
+        assert service.check_balance_invariant() == []

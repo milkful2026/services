@@ -214,6 +214,33 @@ class SqlAlchemyWalletRepository:
                 wallet.balance_paise = new_balance
                 return wallet
 
+    def find_balance_invariant_violations(self) -> list[tuple[str, int, int]]:
+        """Returns `(wallet_id, balance_paise, ledger_sum_paise)` for every
+        wallet whose stored balance disagrees with the sum of its own
+        ledger entries. Read-only, no locking — a wallet mid-credit at the
+        moment of the scan is not a real violation, just a race with this
+        sweep; run periodically, not as a correctness gate."""
+        with self._db_operation("find_balance_invariant_violations", "Failed to check wallets"):
+            ledger_sums = select(
+                ledger_entries_table.c.wallet_id.label("wallet_id"),
+                func.sum(ledger_entries_table.c.amount_paise).label("ledger_sum"),
+            ).group_by(ledger_entries_table.c.wallet_id).subquery()
+
+            stmt = select(
+                wallets_table.c.id,
+                wallets_table.c.balance_paise,
+                func.coalesce(ledger_sums.c.ledger_sum, 0).label("ledger_sum"),
+            ).select_from(
+                wallets_table.outerjoin(ledger_sums, wallets_table.c.id == ledger_sums.c.wallet_id)
+            )
+            with self._engine.connect() as conn:
+                rows = conn.execute(stmt).fetchall()
+        return [
+            (row.id, int(row.balance_paise), int(row.ledger_sum))
+            for row in rows
+            if int(row.balance_paise) != int(row.ledger_sum)
+        ]
+
     def list_ledger_entries(
         self, wallet_id: str, limit: int, before_id: int | None
     ) -> list[LedgerEntry]:
