@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/PaymentFailed.schema.json",
+  "title": "PaymentFailed",
+  "description": "EventBridge `detail` for a failed payment. Producer: milkful.payment (MA-126).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "occurredAt",
+    "correlationId",
+    "paymentId",
+    "userId",
+    "purpose",
+    "amountPaise",
+    "currency",
+    "failureCode",
+    "failureReason"
+  ],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1 },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "minLength": 1 },
+    "paymentId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1 },
+    "purpose": { "type": "string", "enum": ["WALLET_RECHARGE", "ORDER"] },
+    "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
+    "currency": { "const": "INR" },
+    "method": { "type": "string", "enum": ["UPI", "CARD", "NETBANKING", "WALLET", "OTHER"] },
+    "razorpayPaymentId": { "type": "string" },
+    "razorpayOrderId": { "type": "string" },
+    "failureCode": { "type": "string", "minLength": 1 },
+    "failureReason": { "type": "string" }
+  }
+}

@@ -1,0 +1,30 @@
+[project]
+name = "wallet"
+version = "0.1.0"
+description = "Milkful Wallet Service — prepaid balance + immutable ledger, auto-provision on registration, idempotent recharge crediting (MA-100 / MA-24 MA-127)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "src" for this service's own modules; ".." (services/) so
+# `from shared.events import load_schema` resolves the cross-service
+# event-schema package at services/shared/events/ — matches payment's
+# pyproject.toml. Without this, wallet_events_consumer.py's "optional in
+# prod, present in dev" jsonschema import silently falls to its except
+# branch even in wallet's own test suite, so contract validation is never
+# actually exercised.
+pythonpath = ["src", ".."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI's `Depends(...)` / `Query(...)` in parameter defaults is the
+# framework's required idiom, not a bug (same pattern across catalog/inventory).
+ignore = ["B008"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]

@@ -116,6 +116,23 @@ cd cart && python run_local_outbox_publisher.py       # polls the cart table's O
                                                        # 5s, same pattern as user's own outbox
                                                        # publisher above (Postgres there, a
                                                        # DynamoDB Scan here).
+cd wallet && python src/main.py                       # :8006 — balance/transactions/limits +
+                                                       # the wallet-events-q consumer (MA-24
+                                                       # MA-127). Real FastAPI app, no shim.
+cd wallet && python src/handlers/outbox_publisher.py  # drains WalletCreated/WalletCredited to
+                                                       # EventBridge, same 5s-poll shape as cart's.
+cd wallet && python src/handlers/invariant_check_handler.py   # nightly balance-invariant sweep;
+                                                       # run once by hand locally rather than
+                                                       # waiting a full day.
+cd payment && python src/main.py                      # :8007 — Razorpay recharge slice (MA-24
+                                                       # MA-126) + the in-process reconcile-sweep
+                                                       # thread. Needs payment/.env.local with
+                                                       # real rzp_test_* credentials (copy
+                                                       # payment/.env.local.example) for anything
+                                                       # beyond startup — bootstrap.py provisions
+                                                       # everything except those.
+cd payment && python src/handlers/outbox_publisher.py # drains PaymentConfirmed/PaymentFailed to
+                                                       # EventBridge, same 5s-poll shape as cart's.
 ```
 
 ## Exercising registration + login

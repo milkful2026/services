@@ -11,9 +11,8 @@ resources — every resource is looked up and reused if it already exists,
 never silently recreated — but moto_server keeps everything in memory,
 so a container restart clears it and this must be re-run.
 
-Writes one `.env.local` per service (identity-auth/.env.local,
-user/.env.local, inventory/.env.local) with the resource IDs it just
-created. Each service's run_local.py-style entrypoint loads that file
+Writes one `.env.local` per service (identity-auth, user, inventory,
+catalog, cart, wallet, payment) with the resource IDs it just created. Each service's run_local.py-style entrypoint loads that file
 into the real process environment at startup (see local-dev/_env_file.py)
 before constructing any client, so both this service's own settings and
 libraries that read env vars directly (e.g. boto3's native
@@ -46,6 +45,7 @@ INVENTORY_HTTP_URL = os.environ.get("LOCAL_DEV_INVENTORY_HTTP_URL", "http://loca
 CATALOG_HTTP_URL = os.environ.get("LOCAL_DEV_CATALOG_HTTP_URL", "http://localhost:8003")
 USER_HTTP_URL = os.environ.get("LOCAL_DEV_USER_HTTP_URL", "http://localhost:8002")
 PRICING_HTTP_URL = os.environ.get("LOCAL_DEV_PRICING_HTTP_URL", "http://localhost:8005")
+WALLET_HTTP_URL = os.environ.get("LOCAL_DEV_WALLET_HTTP_URL", "http://localhost:8006")
 
 _SERVICES_DIR = Path(__file__).resolve().parent.parent
 
@@ -304,6 +304,47 @@ def bootstrap_stock_changed_queue() -> str:
     return queue_url
 
 
+def bootstrap_wallet_events_queue() -> str:
+    """MA-24's `wallet-events-q` — the single queue Wallet Service (MA-127)
+    consumes: User Service's `UserRegistered` (MA-1 baseline) and Payment
+    Service's recharge `PaymentConfirmed` (MA-126), routed here by two
+    separate EventBridge rules on the same default bus, same
+    queue-with-DLQ shape as `zone-updated`/`stock-changed` above."""
+    sqs = boto3.client("sqs", **_creds)
+    events = boto3.client("events", **_creds)
+
+    _dlq_url, dlq_arn = _get_or_create_queue(sqs, "wallet-events-q-dlq")
+    queue_url, queue_arn = _get_or_create_queue(
+        sqs,
+        "wallet-events-q",
+        Attributes={
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
+        },
+    )
+    _wire_rule(
+        events,
+        "WalletUserRegisteredRule",
+        {"source": ["user"], "detail-type": ["UserRegistered"]},
+        "wallet-user-registered-target",
+        queue_arn,
+    )
+    # MA-126 SS8.3's new rule — only recharge PaymentConfirmed events reach
+    # Wallet Service; a future purpose=ORDER PaymentConfirmed (MA-97) is
+    # deliberately not matched by this pattern.
+    _wire_rule(
+        events,
+        "PaymentConfirmedWalletRechargeRule",
+        {
+            "source": ["payment"],
+            "detail-type": ["PaymentConfirmed"],
+            "detail": {"purpose": ["WALLET_RECHARGE"]},
+        },
+        "payment-confirmed-wallet-recharge-target",
+        queue_arn,
+    )
+    return queue_url
+
+
 def _write_env_file(service_dir: str, values: dict[str, str]) -> None:
     # Overridable so the one-shot "bootstrap" compose service can write
     # each service's .env.local into a shared docker volume (mounted at
@@ -335,6 +376,7 @@ def main() -> None:
     cart_table_name = bootstrap_cart_table()
     queue_url = bootstrap_sqs_and_eventbridge()
     stock_changed_queue_url = bootstrap_stock_changed_queue()
+    wallet_events_queue_url = bootstrap_wallet_events_queue()
 
     # AWS_ENDPOINT_URL (unprefixed): the standard env var name botocore
     # itself reads natively — written once per service's .env.local so
@@ -421,9 +463,42 @@ def main() -> None:
             "CART_USER_INTERNAL_BASE_URL": USER_HTTP_URL,
             "CART_PRICING_INTERNAL_BASE_URL": PRICING_HTTP_URL,
             # Left unset — matches config.env.Settings' own "" default:
-            # MA-100 (Wallet Service) doesn't exist, so there's no real
-            # URL to point at (HttpWalletClient never uses this value
-            # today regardless — see its own module docstring).
+            # Cart Service's own wallet wiring is out of MA-24's scope
+            # (see the MA-24 implementation plan's explicit note); Wallet
+            # Service existing now doesn't change this file.
+        },
+    )
+    _write_env_file(
+        "wallet",
+        {
+            "WALLET_DATABASE_URL": (
+                f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/milkful_wallet"
+            ),
+            "WALLET_AWS_REGION": REGION,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "WALLET_EVENT_BUS_NAME": "default",
+            "WALLET_EVENTS_QUEUE_URL": wallet_events_queue_url,
+            # Local dev only — Flutter web's browser-origin CORS block,
+            # same reasoning as inventory/catalog's identical entries.
+            "WALLET_CORS_ALLOW_ALL": "true",
+        },
+    )
+    _write_env_file(
+        "payment",
+        {
+            "PAYMENT_DATABASE_URL": (
+                f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/milkful_payment"
+            ),
+            "PAYMENT_AWS_REGION": REGION,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "PAYMENT_EVENT_BUS_NAME": "default",
+            "PAYMENT_WALLET_INTERNAL_BASE_URL": WALLET_HTTP_URL,
+            # Razorpay credentials are NOT provisioned by bootstrap.py —
+            # moto has no Razorpay equivalent. Copy payment/.env.local.example
+            # and fill in rzp_test_* values yourself for anything past the
+            # FakeGateway-backed unit/integration tests (real webhook
+            # signature verification, real orders.create).
+            "PAYMENT_CORS_ALLOW_ALL": "true",
         },
     )
     print("\nDone. Next: python apply_migrations.py, then start each service.")

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/PaymentConfirmed.schema.json",
+  "title": "PaymentConfirmed",
+  "description": "EventBridge `detail` for a confirmed payment. Producer: milkful.payment (MA-126). Consumers filter on detail.purpose.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "occurredAt",
+    "correlationId",
+    "paymentId",
+    "userId",
+    "purpose",
+    "amountPaise",
+    "currency",
+    "razorpayPaymentId",
+    "razorpayOrderId"
+  ],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1, "description": "Dedupe key for consumers." },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "minLength": 1 },
+    "paymentId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
+    "purpose": { "type": "string", "enum": ["WALLET_RECHARGE", "ORDER"] },
+    "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
+    "currency": { "const": "INR" },
+    "method": { "type": "string", "enum": ["UPI", "CARD", "NETBANKING", "WALLET", "OTHER"] },
+    "razorpayPaymentId": { "type": "string", "minLength": 1 },
+    "razorpayOrderId": { "type": "string", "minLength": 1 }
+  }
+}
