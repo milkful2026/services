@@ -7,3 +7,5 @@ PyJWT[crypto]
 requests
 cachetools
 redis
+sqlalchemy
+psycopg2-binary

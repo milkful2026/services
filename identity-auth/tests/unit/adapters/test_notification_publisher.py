@@ -99,6 +99,49 @@ def test_publish_retries_then_raises_on_failed_entry(publisher, monkeypatch):
     assert "InternalFailure" in exc_info.value.details["cause"]
 
 
+def test_publish_admin_event_uses_fixed_envelope(publisher, monkeypatch):
+    captured = {}
+
+    def _capture(**kwargs):
+        captured["entry"] = kwargs["Entries"][0]
+        return {"FailedEntryCount": 0, "Entries": [{"EventId": "evt-1"}]}
+
+    monkeypatch.setattr(publisher._client, "put_events", _capture)
+
+    publisher.publish_admin_event(
+        "admin.user.created",
+        {"adminId": "admin-1", "email": "a@milkful.test", "role": "Ops", "createdBy": "admin-0"},
+        "corr-1",
+    )
+
+    entry = captured["entry"]
+    assert entry["Source"] == "identity-auth"
+    assert entry["DetailType"] == "admin.user.created"
+
+    detail = json.loads(entry["Detail"])
+    assert detail["eventType"] == "admin.user.created"
+    assert detail["eventVersion"] == "1.0"
+    assert detail["correlationId"] == "corr-1"
+    assert detail["payload"]["adminId"] == "admin-1"
+    assert "eventId" in detail
+    assert "timestamp" in detail
+
+
+def test_publish_admin_event_retries_then_raises(publisher, monkeypatch):
+    calls = {"count": 0}
+
+    def _raise(**kwargs):
+        calls["count"] += 1
+        raise ClientError({"Error": {"Code": "InternalException"}}, "PutEvents")
+
+    monkeypatch.setattr(publisher._client, "put_events", _raise)
+
+    with pytest.raises(NotificationPublishError):
+        publisher.publish_admin_event("admin.login.failed", {}, "corr-1")
+
+    assert calls["count"] == 3
+
+
 def test_publish_succeeds_after_transient_failure(publisher, monkeypatch):
     calls = {"count": 0}
 

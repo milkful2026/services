@@ -54,7 +54,29 @@ class EventBridgeNotificationPublisher:
             "correlationId": correlation_id,
             "payload": {"mobile": mobile, "otp": otp, "template": template},
         }
+        self._put_with_retry(
+            "identity.otp.requested", detail, failure_message="Failed to publish OtpRequested after retries"
+        )
 
+    def publish_admin_event(self, event_type: str, payload: dict, correlation_id: str) -> None:
+        """Publishes one of the `admin.*` domain events (MA-129 FR-6)
+        using the same standard envelope and retry/backoff behavior as
+        publish_otp_requested — reused per spec §6's explicit instruction
+        rather than a second EventBridge adapter."""
+        detail = {
+            "eventId": str(uuid.uuid4()),
+            "eventType": event_type,
+            "eventVersion": "1.0",
+            "source": self._event_source,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "correlationId": correlation_id,
+            "payload": payload,
+        }
+        self._put_with_retry(
+            event_type, detail, failure_message=f"Failed to publish {event_type} after retries"
+        )
+
+    def _put_with_retry(self, detail_type: str, detail: dict, failure_message: str) -> None:
         last_cause: str | None = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -62,7 +84,7 @@ class EventBridgeNotificationPublisher:
                     Entries=[
                         {
                             "Source": self._event_source,
-                            "DetailType": "identity.otp.requested",
+                            "DetailType": detail_type,
                             "Detail": json.dumps(detail),
                             "EventBusName": self._event_bus_name,
                         }
@@ -92,6 +114,4 @@ class EventBridgeNotificationPublisher:
             if attempt < self._max_retries:
                 time.sleep(self._backoff_base_seconds * (2**attempt))
 
-        raise NotificationPublishError(
-            "Failed to publish OtpRequested after retries", details={"cause": last_cause}
-        )
+        raise NotificationPublishError(failure_message, details={"cause": last_cause})
