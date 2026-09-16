@@ -2,10 +2,10 @@
 All Cognito-JWT, owner-scoped."""
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from shared.handlers.auth import current_user_id
 
 from config.env import Settings, get_settings
 from domain.payment_service import PaymentService
-from handlers.auth import current_user_id
 from handlers.dependencies import correlation_id, get_payment_service
 from handlers.dto import ConfirmPaymentRequest, CreatePaymentRequest, success_envelope
 

@@ -10,10 +10,10 @@ import logging
 import time
 from datetime import UTC, datetime
 
+from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from sqlalchemy import create_engine
 
 from adapters.logging_metrics import LoggingMetricsRecorder
-from adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from adapters.payment_repository import SqlAlchemyPaymentRepository
 from config.env import get_settings
 

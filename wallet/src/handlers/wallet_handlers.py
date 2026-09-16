@@ -2,9 +2,9 @@
 /wallet/me/transactions, POST /wallet/me/retry. All Cognito-JWT."""
 
 from fastapi import APIRouter, Depends, Query
+from shared.handlers.auth import current_user_id
 
 from domain.wallet_service import WalletService
-from handlers.auth import current_user_id
 from handlers.dependencies import get_wallet_service
 from handlers.dto import serialize_transactions, success_envelope
 

@@ -1,6 +1,12 @@
 """Shared retry-with-backoff helper for external adapters
 (services/README.md §3.7's mandatory retry+backoff convention for
-adapters calling out to Catalog/User/Pricing/Wallet)."""
+adapters calling out to Catalog/User/Pricing/Wallet).
+
+Was hand-duplicated byte-for-byte in cart/payment/wallet's own
+`adapters/retry.py` — moved here per services/README.md §2 (`shared/`
+holds cross-cutting libs with no domain rules) so a future fix to
+retry/backoff behavior only has to be made once.
+"""
 
 import time
 from collections.abc import Callable

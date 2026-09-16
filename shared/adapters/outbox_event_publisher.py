@@ -1,7 +1,15 @@
-"""EventBridge publisher used only by the outbox publisher loop — never
-called from the request-handling or SQS-consumer path (transactional
-outbox pattern). Same mechanism as services/cart's own
-outbox_event_publisher.py.
+"""EventBridge publisher used only by an outbox-publisher loop — never
+called from the request-handling, webhook, or SQS-consumer path
+(transactional outbox pattern).
+
+Was hand-duplicated across cart/payment/wallet's own
+`adapters/outbox_event_publisher.py` — moved here per
+services/README.md §2 (`shared/` holds cross-cutting libs with no domain
+rules). Raises `shared.errors.ServiceUnavailableError` rather than any
+one service's own `domain.exceptions.ServiceUnavailableError`, since this
+module can't depend on a single service's domain layer; every caller
+today only catches it as a generic `Exception` in its own outer retry
+loop, so the exact type was never load-bearing.
 """
 
 import json
@@ -11,9 +19,8 @@ from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import ClientError
-
-from adapters.retry import call_with_retry
-from domain.exceptions import ServiceUnavailableError
+from shared.adapters.retry import call_with_retry
+from shared.errors import ServiceUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +83,4 @@ class EventBridgeOutboxPublisher:
                 on_attempt_failure=_on_failure,
             )
         except _RetryablePublishError as exc:
-            raise ServiceUnavailableError(
-                "Failed to publish event after retries", details={"cause": str(exc)}
-            ) from exc
+            raise ServiceUnavailableError(f"Failed to publish event after retries: {exc}") from exc

@@ -16,8 +16,8 @@ import logging
 
 import razorpay
 from razorpay.errors import BadRequestError as RazorpayBadRequestError
+from shared.adapters.retry import call_with_retry
 
-from adapters.retry import call_with_retry
 from domain.exceptions import GatewayRequestInvalidError, GatewayUnavailableError
 
 logger = logging.getLogger(__name__)

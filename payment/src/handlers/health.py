@@ -1,11 +1,8 @@
-"""Process-wide liveness, shared between main.py's background
-reconciliation-sweep thread and the /healthz endpoint served in the same
-process — mirrors catalog/inventory's ConsumerHealth convention."""
+"""Process-wide liveness singleton for this service — the class itself
+lives in shared.handlers.health (services/README.md §2: `shared/` holds
+cross-cutting libs with no domain rules); this instance is this
+process's own, not shared state."""
 
-
-class ConsumerHealth:
-    def __init__(self) -> None:
-        self.alive = True
-
+from shared.handlers.health import ConsumerHealth
 
 consumer_health = ConsumerHealth()

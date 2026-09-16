@@ -6,9 +6,9 @@ task in prod. Never invoked from the request or SQS-consumer path.
 import logging
 import time
 
+from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from sqlalchemy import create_engine
 
-from adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from adapters.wallet_repository import SqlAlchemyWalletRepository
 from config.env import get_settings
 

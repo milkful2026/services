@@ -19,8 +19,7 @@ import time
 
 import requests
 from requests.exceptions import RequestException
-
-from adapters.retry import call_with_retry
+from shared.adapters.retry import call_with_retry
 
 logger = logging.getLogger(__name__)
 

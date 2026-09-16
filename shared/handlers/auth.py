@@ -1,10 +1,14 @@
-"""Cognito identity for `/wallet/me/*`.
+"""Cognito identity for authenticated routes.
 
-API Gateway's Cognito JWT authorizer verifies the token upstream; this
+API Gateway's Cognito JWT authorizer verifies the token upstream; the
 service trusts the verified claims. Locally there is no authorizer, so we
 decode the bearer token unverified — the same dev-only posture
 `services/local-dev/_lambda_local_server.py` documents. `sub` is the
 user id.
+
+Was hand-duplicated byte-for-byte in payment/wallet's own
+`handlers/auth.py` — moved here per services/README.md §2 (`shared/`
+holds cross-cutting libs with no domain rules).
 """
 
 import jwt

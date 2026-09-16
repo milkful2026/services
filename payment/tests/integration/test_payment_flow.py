@@ -15,9 +15,9 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 from moto import mock_aws
+from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from shared.events import load_schema
 
-from adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from adapters.payment_repository import SqlAlchemyPaymentRepository
 from handlers.app import app
 from handlers.dependencies import get_payment_service
