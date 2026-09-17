@@ -179,8 +179,6 @@ def test_create_admin_compensates_cognito_when_aurora_insert_fails(service, deps
     # Force the Aurora side to look like the email already exists there
     # even though Cognito hasn't seen it yet, simulating an Aurora-only
     # failure after Cognito user creation succeeded.
-    original_create = deps["admin_repo"].create
-
     def _fail_create(admin):
         raise RuntimeError("aurora unavailable")
 

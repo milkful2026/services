@@ -27,7 +27,6 @@ through moto.
 import json
 
 import pytest
-from freezegun import freeze_time
 
 import handlers.admin_auth.login_handler as login_handler
 import handlers.admin_auth.verify_2fa_handler as verify_2fa_handler
