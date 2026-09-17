@@ -24,6 +24,50 @@ silently decided):
    `Resource: "*"` for them. Least-privilege here means action-level
    scoping only, not resource-ARN scoping; this is a real AWS limitation,
    not an oversight.
+
+MA-129 (Admin Identity, RBAC & Session Security) additions — flagged
+separately since they were added after the above, and carry their own
+open questions:
+
+6. **Second Cognito User Pool ("Admin Pool"), reusing this stack's
+   existing dedicated VPC** for its new Aurora database rather than
+   provisioning a third VPC — the VPC itself isn't the thing
+   database-per-service governs (the *database* is never shared with
+   another service; this is a brand-new Aurora cluster owned solely by
+   this service).
+7. **The admin API-Gateway authorizer Lambda (admin_authorizer_handler)
+   needs BOTH internet egress (to fetch Cognito's public JWKS endpoint,
+   same requirement `social_jwks_adapter.py` already has for Google/
+   Apple) AND VPC access to reach the new admin Aurora cluster.** This
+   stack's VPC has `nat_gateways=0` — no Lambda placed in it has any
+   internet route at all. That is a PRE-EXISTING gap for
+   `social_auth_fn` (out of scope here — additive-only constraint), but
+   the new admin authorizer inherits the same problem. Not fixed here:
+   a NAT Gateway + public/egress subnet (cost trade-off) or an
+   alternative (e.g. a VPC-reachable JWKS cache) needs a human decision
+   before real deployment — see README "what still needs a human".
+8. **Admin Pool access/ID token validity: 15 minutes; refresh token: 1
+   day.** Spec §12 Q5 asks for this number without providing one
+   ("shorter than the consumer pool's ... recommended but not yet a
+   number") — picked here as a concrete, admin-appropriate value given
+   the stale-role-claim trade-off in spec §11.2, not silently left
+   unset. Flagged for the architect to confirm or override.
+9. **Admin JWT authorizer result caching is disabled (`results_cache_ttl
+   = Duration.seconds(0)`)** — the explicit recommendation in spec
+   §11.2, chosen over a short (e.g. 30s) compromise TTL since the spec
+   itself says this "should not be treated as fully approved" without
+   architect sign-off; disabling entirely is the conservative default
+   until that sign-off happens.
+10. **No endpoint here implements the "JWT refresh/logout" capability
+    spec §3 lists as in-scope.** §4's FR-1..FR-6 never actually define a
+    concrete `/v1/admin/auth/refresh` or `/v1/admin/auth/logout` route,
+    and the task's own explicit endpoint list omits them too — not
+    implemented, flagged as a real spec gap rather than invented. The
+    Admin Pool app client still allows Cognito's standard
+    `REFRESH_TOKEN_AUTH` flow (CDK includes it on every app client by
+    default), so a token refresh is technically possible directly
+    against Cognito without a backend-proxied route, but this is an
+    assumption, not a confirmed contract.
 """
 
 import os
@@ -41,8 +85,11 @@ from aws_cdk import aws_events_targets as events_targets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_rds as rds
 from aws_cdk import aws_wafv2 as wafv2
 from constructs import Construct
+
+_ADMIN_ROLES = ("Ops", "Finance", "Support", "Marketing", "SuperAdmin")
 
 _SRC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "src")
 
@@ -62,6 +109,33 @@ class IdentityAuthStack(Stack):
         vpc, redis_endpoint, lambda_security_group = self._build_vpc_and_redis()
         event_bus_name = "default"
 
+        # --- MA-129: Admin Identity, RBAC & Session Security (additive) ---
+        admin_user_pool = self._build_admin_user_pool()
+        admin_app_client = admin_user_pool.add_client(
+            "AdminAppClient",
+            generate_secret=False,
+            # Admin login is always server-mediated via AdminInitiateAuth
+            # (spec FR-1's enumeration-safety + live Aurora-status-check
+            # requirements) — never direct client-side USER_PASSWORD_AUTH.
+            auth_flows=cognito.AuthFlow(admin_user_password=True),
+            # See module docstring point 8 — a concrete number for spec
+            # §12 Q5, not yet architect-confirmed.
+            access_token_validity=Duration.minutes(15),
+            id_token_validity=Duration.minutes(15),
+            refresh_token_validity=Duration.days(1),
+        )
+        admin_db_cluster, admin_db_security_group = self._build_admin_database(vpc)
+        admin_db_security_group.add_ingress_rule(
+            lambda_security_group, ec2.Port.tcp(5432), "Lambda -> Admin Aurora"
+        )
+        admin_secret = admin_db_cluster.secret
+        admin_db_username = admin_secret.secret_value_from_json("username").unsafe_unwrap()
+        admin_db_password = admin_secret.secret_value_from_json("password").unsafe_unwrap()
+        admin_db_host = admin_secret.secret_value_from_json("host").unsafe_unwrap()
+        admin_db_port = admin_secret.secret_value_from_json("port").unsafe_unwrap()
+        admin_db_name = admin_secret.secret_value_from_json("dbname").unsafe_unwrap()
+        # --- end MA-129 provisioning that other env_vars/roles below need ---
+
         env_vars = {
             "IDENTITY_AUTH_COGNITO_USER_POOL_ID": user_pool.user_pool_id,
             "IDENTITY_AUTH_COGNITO_CLIENT_ID": app_client.user_pool_client_id,
@@ -70,9 +144,15 @@ class IdentityAuthStack(Stack):
             "IDENTITY_AUTH_REDIS_HOST": redis_endpoint,
             "IDENTITY_AUTH_REDIS_PORT": "6379",
             "IDENTITY_AUTH_EVENT_BUS_NAME": event_bus_name,
+            "IDENTITY_AUTH_ADMIN_COGNITO_USER_POOL_ID": admin_user_pool.user_pool_id,
+            "IDENTITY_AUTH_ADMIN_COGNITO_CLIENT_ID": admin_app_client.user_pool_client_id,
+            "IDENTITY_AUTH_ADMIN_DATABASE_URL": (
+                f"postgresql+psycopg2://{admin_db_username}:{admin_db_password}"
+                f"@{admin_db_host}:{admin_db_port}/{admin_db_name}"
+            ),
         }
 
-        execution_role = self._build_execution_role(otp_table, user_pool, event_bus_name)
+        execution_role = self._build_execution_role(otp_table, user_pool, event_bus_name, admin_user_pool)
 
         common_lambda_kwargs = dict(
             runtime=lambda_.Runtime.PYTHON_3_12,
@@ -118,6 +198,64 @@ class IdentityAuthStack(Stack):
             self, "LogoutFunction", handler="handlers.logout_handler.handler", **common_lambda_kwargs
         )
 
+        # --- MA-129 Lambdas (share common_lambda_kwargs — see module
+        # docstring point 7 for the authorizer's own internet-egress gap) ---
+        admin_login_fn = lambda_.Function(
+            self, "AdminLoginFunction", handler="handlers.admin_auth.login_handler.handler", **common_lambda_kwargs
+        )
+        admin_2fa_verify_fn = lambda_.Function(
+            self,
+            "Admin2faVerifyFunction",
+            handler="handlers.admin_auth.verify_2fa_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_create_user_fn = lambda_.Function(
+            self,
+            "AdminCreateUserFunction",
+            handler="handlers.admin_users.create_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_list_users_fn = lambda_.Function(
+            self, "AdminListUsersFunction", handler="handlers.admin_users.list_handler.handler", **common_lambda_kwargs
+        )
+        admin_update_user_fn = lambda_.Function(
+            self,
+            "AdminUpdateUserFunction",
+            handler="handlers.admin_users.update_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_deactivate_user_fn = lambda_.Function(
+            self,
+            "AdminDeactivateUserFunction",
+            handler="handlers.admin_users.deactivate_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_reactivate_user_fn = lambda_.Function(
+            self,
+            "AdminReactivateUserFunction",
+            handler="handlers.admin_users.reactivate_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_authorizer_fn = lambda_.Function(
+            self,
+            "AdminAuthorizerFunction",
+            handler="handlers.admin_authorizer_handler.handler",
+            **common_lambda_kwargs,
+        )
+
+        admin_fns = (
+            admin_login_fn,
+            admin_2fa_verify_fn,
+            admin_create_user_fn,
+            admin_list_users_fn,
+            admin_update_user_fn,
+            admin_deactivate_user_fn,
+            admin_reactivate_user_fn,
+            admin_authorizer_fn,
+        )
+        for fn in admin_fns:
+            admin_secret.grant_read(fn)
+
         http_api = self._build_http_api(
             otp_send_fn,
             otp_verify_fn,
@@ -128,6 +266,17 @@ class IdentityAuthStack(Stack):
             logout_fn,
             user_pool,
             app_client,
+        )
+        self._build_admin_routes(
+            http_api,
+            admin_login_fn,
+            admin_2fa_verify_fn,
+            admin_create_user_fn,
+            admin_list_users_fn,
+            admin_update_user_fn,
+            admin_deactivate_user_fn,
+            admin_reactivate_user_fn,
+            admin_authorizer_fn,
         )
         self._build_waf(http_api)
         self._build_otp_requested_rule(event_bus_name)
@@ -153,6 +302,118 @@ class IdentityAuthStack(Stack):
             account_recovery=cognito.AccountRecovery.NONE,
             removal_policy=RemovalPolicy.RETAIN,
         )
+
+    def _build_admin_user_pool(self) -> cognito.UserPool:
+        pool = cognito.UserPool(
+            self,
+            "AdminUserPool",
+            # Email-only username, unlike the consumer pool (spec §6.1:
+            # "no phone, unlike the consumer pool") — a second, separate
+            # pool per the explicit human decision recorded in spec §11.1.
+            sign_in_aliases=cognito.SignInAliases(username=False, email=True, phone=False),
+            auto_verify=cognito.AutoVerifiedAttrs(email=True),
+            standard_attributes=cognito.StandardAttributes(
+                email=cognito.StandardAttribute(required=True, mutable=True),
+                fullname=cognito.StandardAttribute(required=False, mutable=True),
+            ),
+            self_sign_up_enabled=False,
+            # TOTP MFA REQUIRED at the pool level (spec §6.1) — not
+            # optional, unlike a typical consumer pool.
+            mfa=cognito.Mfa.REQUIRED,
+            mfa_second_factor=cognito.MfaSecondFactor(otp=True, sms=False),
+            account_recovery=cognito.AccountRecovery.NONE,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        for role in _ADMIN_ROLES:
+            cognito.CfnUserPoolGroup(
+                self, f"AdminGroup{role}", user_pool_id=pool.user_pool_id, group_name=role
+            )
+        return pool
+
+    def _build_admin_database(self, vpc: ec2.Vpc) -> tuple[rds.DatabaseCluster, ec2.SecurityGroup]:
+        """A brand-new Aurora Postgres Serverless v2 cluster owned solely
+        by this service for `admin_user` (MA-129 §7) — reuses this
+        stack's existing VPC (module docstring point 6) but is a wholly
+        separate database from anything the consumer flow uses, and
+        never shared with `user` service's own Aurora (database-per-
+        service, services/README.md §1)."""
+        security_group = ec2.SecurityGroup(
+            self, "AdminAuroraSecurityGroup", vpc=vpc, description="Identity Auth Admin Pool Aurora Postgres"
+        )
+        cluster = rds.DatabaseCluster(
+            self,
+            "AdminAuroraCluster",
+            engine=rds.DatabaseClusterEngine.aurora_postgres(
+                version=rds.AuroraPostgresEngineVersion.VER_16_4
+            ),
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            security_groups=[security_group],
+            default_database_name="admin",
+            # Sized for "low hundreds of accounts" (spec §5 Scalability) —
+            # same minimal Serverless v2 sizing as services/user's own
+            # Aurora cluster.
+            serverless_v2_min_capacity=0.5,
+            serverless_v2_max_capacity=2,
+            writer=rds.ClusterInstance.serverless_v2("Writer"),
+            credentials=rds.Credentials.from_generated_secret("identity_auth_admin_service"),
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        return cluster, security_group
+
+    def _build_admin_routes(
+        self,
+        http_api: apigwv2.HttpApi,
+        admin_login_fn: lambda_.Function,
+        admin_2fa_verify_fn: lambda_.Function,
+        admin_create_user_fn: lambda_.Function,
+        admin_list_users_fn: lambda_.Function,
+        admin_update_user_fn: lambda_.Function,
+        admin_deactivate_user_fn: lambda_.Function,
+        admin_reactivate_user_fn: lambda_.Function,
+        admin_authorizer_fn: lambda_.Function,
+    ) -> None:
+        # Simple-response REQUEST authorizer (FR-5) — checks live
+        # Aurora status/role/ip_allowlist on every call. Caching
+        # disabled (module docstring point 9) per spec §11.2.
+        admin_authorizer = apigwv2_authorizers.HttpLambdaAuthorizer(
+            "AdminJwtAuthorizer",
+            admin_authorizer_fn,
+            response_types=[apigwv2_authorizers.HttpLambdaResponseType.SIMPLE],
+            results_cache_ttl=Duration.seconds(0),
+            identity_source=["$request.header.Authorization"],
+        )
+
+        # (path, method, function, authorizer) — login/2fa-verify are
+        # pre-auth (spec §6: unauthenticated for /admin/auth/*); every
+        # other admin route sits behind the authorizer above.
+        AdminRouteEntry = tuple[str, apigwv2.HttpMethod, lambda_.Function, apigwv2_authorizers.HttpLambdaAuthorizer | None]
+        routes: list[AdminRouteEntry] = [
+            ("/v1/admin/auth/login", apigwv2.HttpMethod.POST, admin_login_fn, None),
+            ("/v1/admin/auth/2fa/verify", apigwv2.HttpMethod.POST, admin_2fa_verify_fn, None),
+            ("/v1/admin/users", apigwv2.HttpMethod.POST, admin_create_user_fn, admin_authorizer),
+            ("/v1/admin/users", apigwv2.HttpMethod.GET, admin_list_users_fn, admin_authorizer),
+            ("/v1/admin/users/{id}", apigwv2.HttpMethod.PATCH, admin_update_user_fn, admin_authorizer),
+            (
+                "/v1/admin/users/{id}/deactivate",
+                apigwv2.HttpMethod.POST,
+                admin_deactivate_user_fn,
+                admin_authorizer,
+            ),
+            (
+                "/v1/admin/users/{id}/reactivate",
+                apigwv2.HttpMethod.POST,
+                admin_reactivate_user_fn,
+                admin_authorizer,
+            ),
+        ]
+        for path, method, fn, authorizer in routes:
+            http_api.add_routes(
+                path=path,
+                methods=[method],
+                integration=apigwv2_integrations.HttpLambdaIntegration(f"{fn.node.id}Integration", fn),
+                authorizer=authorizer,
+            )
 
     def _build_otp_table(self) -> dynamodb.Table:
         table = dynamodb.Table(
@@ -218,7 +479,11 @@ class IdentityAuthStack(Stack):
         return vpc, redis_endpoint, lambda_security_group
 
     def _build_execution_role(
-        self, otp_table: dynamodb.Table, user_pool: cognito.UserPool, event_bus_name: str
+        self,
+        otp_table: dynamodb.Table,
+        user_pool: cognito.UserPool,
+        event_bus_name: str,
+        admin_user_pool: cognito.UserPool,
     ) -> iam.Role:
         role = iam.Role(
             self,
@@ -262,6 +527,28 @@ class IdentityAuthStack(Stack):
             iam.PolicyStatement(
                 actions=["events:PutEvents"],
                 resources=[f"arn:aws:events:{self.region}:{self.account}:event-bus/{event_bus_name}"],
+            )
+        )
+
+        # MA-129 — Admin Pool operations, scoped to that pool's own ARN
+        # only (never the consumer pool above). Same real AWS limitation
+        # as point 5 in the module docstring: AdminUserGlobalSignOut and
+        # the group-management actions DO support resource scoping, but
+        # are listed together here for readability since they're all
+        # this-pool-only actions.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "cognito-idp:AdminInitiateAuth",
+                    "cognito-idp:AdminRespondToAuthChallenge",
+                    "cognito-idp:AdminCreateUser",
+                    "cognito-idp:AdminDeleteUser",
+                    "cognito-idp:AdminGetUser",
+                    "cognito-idp:AdminAddUserToGroup",
+                    "cognito-idp:AdminRemoveUserFromGroup",
+                    "cognito-idp:AdminUserGlobalSignOut",
+                ],
+                resources=[admin_user_pool.user_pool_arn],
             )
         )
         return role

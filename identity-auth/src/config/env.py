@@ -48,6 +48,18 @@ class Settings(BaseSettings):
     apple_jwks_url: str = "https://appleid.apple.com/auth/keys"
     jwks_cache_ttl_seconds: int = 3600
 
+    # Admin Identity, RBAC & Session Security (MA-129) — additive; the
+    # Admin Pool is a second, separate Cognito User Pool from the
+    # consumer one above (spec §11.1's explicit human decision).
+    admin_cognito_user_pool_id: str = ""
+    admin_cognito_client_id: str = ""
+    admin_database_url: str = "sqlite:///:memory:"
+    admin_challenge_ttl_seconds: int = 300
+    admin_lockout_max_attempts: int = 5
+    admin_lockout_window_seconds: int = 900
+    admin_lockout_duration_seconds: int = 900
+    admin_default_page_size: int = 20
+
 
 def get_settings() -> Settings:
     """Instantiated lazily so tests can inject env vars before first access."""
