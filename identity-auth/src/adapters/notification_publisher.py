@@ -10,16 +10,24 @@ the client (spec FR-1 edge cases: SMS failure -> retry 2x, surface error).
 
 import json
 import logging
-import time
 import uuid
 from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import ClientError
 
+from adapters.retry import call_with_retry
 from domain.exceptions import NotificationPublishError
 
 logger = logging.getLogger(__name__)
+
+
+class _PutEventsEntryFailed(Exception):
+    """Internal signal for a soft EventBridge PutEvents failure
+    (FailedEntryCount != 0 with no raised ClientError) — raised so
+    call_with_retry's exception-based retry loop can treat this the
+    same as a raised ClientError, instead of needing its own
+    hand-rolled retry loop to inspect a return value."""
 
 
 class EventBridgeNotificationPublisher:
@@ -77,41 +85,38 @@ class EventBridgeNotificationPublisher:
         )
 
     def _put_with_retry(self, detail_type: str, detail: dict, failure_message: str) -> None:
-        last_cause: str | None = None
-        for attempt in range(self._max_retries + 1):
-            try:
-                response = self._client.put_events(
-                    Entries=[
-                        {
-                            "Source": self._event_source,
-                            "DetailType": detail_type,
-                            "Detail": json.dumps(detail),
-                            "EventBusName": self._event_bus_name,
-                        }
-                    ]
-                )
-                if response.get("FailedEntryCount", 0) == 0:
-                    return
-                last_cause = str(response.get("Entries"))
+        def _attempt():
+            response = self._client.put_events(
+                Entries=[
+                    {
+                        "Source": self._event_source,
+                        "DetailType": detail_type,
+                        "Detail": json.dumps(detail),
+                        "EventBusName": self._event_bus_name,
+                    }
+                ]
+            )
+            if response.get("FailedEntryCount", 0) != 0:
                 logger.error(
                     "notification_publisher.put_events entry failed",
-                    extra={
-                        "correlationId": self._correlation_id,
-                        "entries": response.get("Entries"),
-                    },
+                    extra={"correlationId": self._correlation_id, "entries": response.get("Entries")},
                 )
-            except ClientError as exc:
-                last_cause = str(exc)
+                raise _PutEventsEntryFailed(str(response.get("Entries")))
+
+        def _on_attempt_failure(exc: Exception, attempt: int) -> None:
+            if isinstance(exc, ClientError):
                 logger.error(
                     "notification_publisher.put_events failed",
-                    extra={
-                        "correlationId": self._correlation_id,
-                        "attempt": attempt,
-                        "error": str(exc),
-                    },
+                    extra={"correlationId": self._correlation_id, "attempt": attempt, "error": str(exc)},
                 )
 
-            if attempt < self._max_retries:
-                time.sleep(self._backoff_base_seconds * (2**attempt))
-
-        raise NotificationPublishError(failure_message, details={"cause": last_cause})
+        try:
+            call_with_retry(
+                _attempt,
+                max_retries=self._max_retries,
+                backoff_base_seconds=self._backoff_base_seconds,
+                retryable_exceptions=(ClientError, _PutEventsEntryFailed),
+                on_attempt_failure=_on_attempt_failure,
+            )
+        except (ClientError, _PutEventsEntryFailed) as exc:
+            raise NotificationPublishError(failure_message, details={"cause": str(exc)}) from exc

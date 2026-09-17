@@ -36,11 +36,15 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from adapters.retry import call_with_retry
 from domain.admin_exceptions import AdminEmailExistsError
 from domain.admin_models import AdminRole, AdminStatus, AdminUser, AdminUserPage
 from domain.exceptions import ExternalServiceUnavailableError
 
 logger = logging.getLogger(__name__)
+
+_MAX_RETRIES = 2
+_BACKOFF_BASE_SECONDS = 0.1
 
 metadata = MetaData()
 
@@ -98,11 +102,19 @@ class SqlAlchemyAdminUserRepository:
         self._correlation_id = correlation_id
 
     def get_by_email(self, email: str) -> AdminUser | None:
-        try:
+        def _attempt():
             with self._engine.connect() as conn:
-                row = conn.execute(
+                return conn.execute(
                     select(admin_user_table).where(func.lower(admin_user_table.c.email) == email.lower())
                 ).fetchone()
+
+        try:
+            row = call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.get_by_email failed",
@@ -112,11 +124,19 @@ class SqlAlchemyAdminUserRepository:
         return _row_to_admin(row) if row is not None else None
 
     def get_by_id(self, admin_id: str) -> AdminUser | None:
-        try:
+        def _attempt():
             with self._engine.connect() as conn:
-                row = conn.execute(
+                return conn.execute(
                     select(admin_user_table).where(admin_user_table.c.id == admin_id)
                 ).fetchone()
+
+        try:
+            row = call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.get_by_id failed",
@@ -126,11 +146,19 @@ class SqlAlchemyAdminUserRepository:
         return _row_to_admin(row) if row is not None else None
 
     def get_by_cognito_sub(self, cognito_sub: str) -> AdminUser | None:
-        try:
+        def _attempt():
             with self._engine.connect() as conn:
-                row = conn.execute(
+                return conn.execute(
                     select(admin_user_table).where(admin_user_table.c.cognito_sub == cognito_sub)
                 ).fetchone()
+
+        try:
+            row = call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.get_by_cognito_sub failed",
@@ -197,7 +225,7 @@ class SqlAlchemyAdminUserRepository:
             )
         where_clause = and_(*conditions) if conditions else None
 
-        try:
+        def _attempt():
             with self._engine.connect() as conn:
                 count_stmt = select(func.count()).select_from(admin_user_table)
                 if where_clause is not None:
@@ -213,6 +241,15 @@ class SqlAlchemyAdminUserRepository:
                     .offset((page - 1) * page_size)
                 )
                 rows = conn.execute(stmt).fetchall()
+                return total, rows
+
+        try:
+            total, rows = call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.list failed",
@@ -240,11 +277,19 @@ class SqlAlchemyAdminUserRepository:
         if max_concurrent_sessions_set:
             values["max_concurrent_sessions"] = max_concurrent_sessions
 
-        try:
+        def _attempt():
             with self._engine.begin() as conn:
                 conn.execute(
                     update(admin_user_table).where(admin_user_table.c.id == admin_id).values(**values)
                 )
+
+        try:
+            call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.update_role_and_config failed",
@@ -257,13 +302,21 @@ class SqlAlchemyAdminUserRepository:
         return updated
 
     def set_status(self, admin_id: str, status: str) -> None:
-        try:
+        def _attempt():
             with self._engine.begin() as conn:
                 conn.execute(
                     update(admin_user_table)
                     .where(admin_user_table.c.id == admin_id)
                     .values(status=status, updated_at=datetime.now(UTC))
                 )
+
+        try:
+            call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.set_status failed",
@@ -272,13 +325,21 @@ class SqlAlchemyAdminUserRepository:
             raise ExternalServiceUnavailableError("Failed to update admin user status") from exc
 
     def set_last_login_now(self, admin_id: str) -> None:
-        try:
+        def _attempt():
             with self._engine.begin() as conn:
                 conn.execute(
                     update(admin_user_table)
                     .where(admin_user_table.c.id == admin_id)
                     .values(last_login_at=datetime.now(UTC), updated_at=datetime.now(UTC))
                 )
+
+        try:
+            call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.set_last_login_now failed",
@@ -287,9 +348,9 @@ class SqlAlchemyAdminUserRepository:
             raise ExternalServiceUnavailableError("Failed to update last login") from exc
 
     def count_active_super_admins(self) -> int:
-        try:
+        def _attempt():
             with self._engine.connect() as conn:
-                total = conn.execute(
+                return conn.execute(
                     select(func.count())
                     .select_from(admin_user_table)
                     .where(
@@ -297,6 +358,14 @@ class SqlAlchemyAdminUserRepository:
                         admin_user_table.c.status == AdminStatus.ACTIVE.value,
                     )
                 ).scalar_one()
+
+        try:
+            total = call_with_retry(
+                _attempt,
+                max_retries=_MAX_RETRIES,
+                backoff_base_seconds=_BACKOFF_BASE_SECONDS,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "admin_user_repository.count_active_super_admins failed",

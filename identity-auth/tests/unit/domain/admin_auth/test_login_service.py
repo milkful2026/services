@@ -104,7 +104,7 @@ class FakeSessionRegistry:
 
     def register_session(self, admin_id, refresh_token, max_concurrent_sessions):
         self.registered.append((admin_id, refresh_token, max_concurrent_sessions))
-        return self.evict
+        return [self.evict] if self.evict is not None else []
 
     def invalidate_all(self, admin_id: str) -> None:
         pass

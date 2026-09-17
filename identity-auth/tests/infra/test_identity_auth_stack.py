@@ -84,6 +84,42 @@ def test_admin_endpoint_lambdas_exist(template):
     } <= handlers
 
 
+def test_no_stray_handler_lambdas_beyond_consumer_and_admin(template):
+    # The two subset checks above (test_seven_endpoint_lambdas_exist,
+    # test_admin_endpoint_lambdas_exist) only prove the 15 known
+    # handlers are PRESENT — they can't catch a stray/duplicate/
+    # misnamed extra handler, since a superset still satisfies "these
+    # are a subset". This closes that gap with the single exact-total
+    # assertion the original all-consumer test had before MA-129 split
+    # it into two subset checks.
+    functions = template.find_resources("AWS::Lambda::Function")
+    handlers = {
+        props["Properties"].get("Handler")
+        for props in functions.values()
+        if str(props["Properties"].get("Handler", "")).startswith("handlers.")
+    }
+    consumer_handlers = {
+        "handlers.otp_send_handler.handler",
+        "handlers.otp_verify_handler.handler",
+        "handlers.social_auth_handler.handler",
+        "handlers.token_refresh_handler.handler",
+        "handlers.login_otp_send_handler.handler",
+        "handlers.login_otp_verify_handler.handler",
+        "handlers.logout_handler.handler",
+    }
+    admin_handlers = {
+        "handlers.admin_auth.login_handler.handler",
+        "handlers.admin_auth.verify_2fa_handler.handler",
+        "handlers.admin_users.create_handler.handler",
+        "handlers.admin_users.list_handler.handler",
+        "handlers.admin_users.update_handler.handler",
+        "handlers.admin_users.deactivate_handler.handler",
+        "handlers.admin_users.reactivate_handler.handler",
+        "handlers.admin_authorizer_handler.handler",
+    }
+    assert handlers == consumer_handlers | admin_handlers
+
+
 def test_http_api_has_seven_routes_only_logout_authorized(template):
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
 
@@ -131,6 +167,35 @@ def test_admin_routes_exist_with_correct_authorization(template):
         assert "AuthorizerId" in by_key[key], f"{key} must require the admin authorizer"
 
 
+def test_no_stray_routes_beyond_consumer_and_admin(template):
+    # Restores the exact-route-count/exact-key-set guarantee the
+    # original test had before MA-129 split it into subset checks — a
+    # route-key typo colliding with an existing path, or an admin route
+    # accidentally left un-namespaced, would satisfy every subset check
+    # above while still failing this one.
+    routes = template.find_resources("AWS::ApiGatewayV2::Route")
+    found_keys = {props["Properties"]["RouteKey"] for props in routes.values()}
+    consumer_route_keys = {
+        "POST /v1/auth/otp/send",
+        "POST /v1/auth/otp/verify",
+        "POST /v1/auth/social",
+        "POST /v1/auth/token/refresh",
+        "POST /v1/auth/login/otp/send",
+        "POST /v1/auth/login/otp/verify",
+        "POST /v1/auth/logout",
+    }
+    admin_route_keys = {
+        "POST /v1/admin/auth/login",
+        "POST /v1/admin/auth/2fa/verify",
+        "POST /v1/admin/users",
+        "GET /v1/admin/users",
+        "PATCH /v1/admin/users/{id}",
+        "POST /v1/admin/users/{id}/deactivate",
+        "POST /v1/admin/users/{id}/reactivate",
+    }
+    assert found_keys == consumer_route_keys | admin_route_keys
+
+
 def test_logout_authorizer_is_a_cognito_user_pool_authorizer(template):
     template.has_resource_properties(
         "AWS::ApiGatewayV2::Authorizer",
@@ -143,6 +208,16 @@ def test_admin_authorizer_is_a_lambda_request_authorizer_with_no_caching(templat
         "AWS::ApiGatewayV2::Authorizer",
         {"AuthorizerType": "REQUEST", "AuthorizerResultTtlInSeconds": 0},
     )
+
+
+def test_exactly_two_authorizers_total(template):
+    # Restores the exact-count guarantee the original single-authorizer
+    # test had before MA-129 added a second one — without this, a
+    # stray/duplicate authorizer resource (or the admin authorizer
+    # accidentally being wired onto a consumer route) would go
+    # undetected, since the two presence-only checks above are each
+    # satisfied by "at least one of that shape exists".
+    template.resource_count_is("AWS::ApiGatewayV2::Authorizer", 2)
 
 
 def test_execution_role_can_revoke_tokens(template):

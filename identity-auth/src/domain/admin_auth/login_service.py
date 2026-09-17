@@ -107,6 +107,21 @@ class AdminLoginService:
             # a distinct error shape.
             raise ChallengeExpiredError()
 
+        if admin.status != AdminStatus.ACTIVE:
+            # The admin was Active when login_password issued this
+            # challenge but has since been deactivated/reverted to
+            # Pending (e.g. a SuperAdmin acted during the 5-minute 2FA
+            # window). Re-checking status here — not just at the
+            # password step — is what actually makes "deactivation
+            # blocks login" true; without it, a correct TOTP code still
+            # completes the login. Surfaced as ChallengeExpiredError
+            # (not AdminAccountPendingError/AdminAccountDeactivatedError)
+            # so the client's existing "restart from the password step"
+            # handling re-derives the accurate status-specific message
+            # from a fresh login_password call, rather than duplicating
+            # that status-to-message mapping at the 2FA step too.
+            raise ChallengeExpiredError()
+
         if self._lockout.is_locked(admin.id):
             raise AdminAccountLockedError()
 
@@ -135,10 +150,10 @@ class AdminLoginService:
         self._lockout.reset(admin.id)
         self._admin_repo.set_last_login_now(admin.id)
 
-        evicted_refresh_token = self._session_registry.register_session(
+        evicted_refresh_tokens = self._session_registry.register_session(
             admin.id, tokens.refresh_token, admin.max_concurrent_sessions
         )
-        if evicted_refresh_token is not None:
+        for evicted_refresh_token in evicted_refresh_tokens:
             self._cognito.revoke_refresh_token(evicted_refresh_token)
 
         self._event_publisher.publish_admin_event(

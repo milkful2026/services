@@ -131,12 +131,15 @@ class AdminLockoutPort(Protocol):
 class AdminSessionRegistryPort(Protocol):
     def register_session(
         self, admin_id: str, refresh_token: str, max_concurrent_sessions: int | None
-    ) -> str | None:
+    ) -> list[str]:
         """Records a newly-issued refresh token for `admin_id`. If
-        `max_concurrent_sessions` is set and this registration would
-        exceed it, evicts (and returns) the oldest still-tracked refresh
-        token for LRU-eviction by the caller (FR-5) — the caller is
-        responsible for actually revoking it via Cognito."""
+        `max_concurrent_sessions` is set (0 is a valid, distinct value
+        meaning "no sessions allowed" — not the same as `None`/
+        unlimited) and this registration would exceed it, atomically
+        evicts (and returns) however many of the oldest still-tracked
+        refresh tokens are needed for LRU-eviction by the caller (FR-5)
+        — the caller is responsible for actually revoking each one via
+        Cognito. Returns an empty list when nothing was evicted."""
         ...
 
     def invalidate_all(self, admin_id: str) -> None:

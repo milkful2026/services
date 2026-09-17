@@ -17,7 +17,7 @@ indefinitely if this bookkeeping ever falls out of sync with Cognito.
 import logging
 
 import redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 from domain.exceptions import ExternalServiceUnavailableError
 
@@ -34,24 +34,39 @@ class AdminSessionRegistryAdapter:
 
     def register_session(
         self, admin_id: str, refresh_token: str, max_concurrent_sessions: int | None
-    ) -> str | None:
+    ) -> list[str]:
+        """Push-then-trim is one WATCH/MULTI/EXEC transaction (retried
+        on WatchError) rather than separate RPUSH/LLEN/LPOP calls, so
+        two concurrent logins for the same admin can't both read a
+        stale length and either double-evict or let the tracked-session
+        count silently exceed `max_concurrent_sessions`. `0` is treated
+        as a real, distinct limit ("no sessions allowed", evicting the
+        just-registered token itself) rather than falling through to
+        "unlimited" the way a bare `if not max_concurrent_sessions`
+        check would."""
         key = f"{_SESSIONS_KEY_PREFIX}{admin_id}"
         try:
-            # A Redis List used as an append-only-at-the-right-end queue:
-            # RPUSH adds the newest session at the tail, LPOP evicts the
-            # oldest (leftmost) one once the list exceeds the limit.
-            self._redis.rpush(key, refresh_token)
-            self._redis.expire(key, _ENTRY_TTL_SECONDS)
+            with self._redis.pipeline() as pipe:
+                while True:
+                    try:
+                        pipe.watch(key)
+                        current_length = pipe.llen(key)
+                        evict_count = 0
+                        if max_concurrent_sessions is not None and max_concurrent_sessions >= 0:
+                            evict_count = max(0, (current_length + 1) - max_concurrent_sessions)
 
-            if not max_concurrent_sessions or max_concurrent_sessions <= 0:
-                return None
+                        pipe.multi()
+                        pipe.rpush(key, refresh_token)
+                        pipe.expire(key, _ENTRY_TTL_SECONDS)
+                        for _ in range(evict_count):
+                            pipe.lpop(key)
+                        results = pipe.execute()
+                        break
+                    except WatchError:
+                        continue
 
-            length = self._redis.llen(key)
-            if length <= max_concurrent_sessions:
-                return None
-
-            evicted = self._redis.lpop(key)
-            return evicted.decode() if isinstance(evicted, bytes) else evicted
+            evicted_raw = results[2:]
+            return [e.decode() if isinstance(e, bytes) else e for e in evicted_raw if e is not None]
         except RedisError as exc:
             logger.error(
                 "admin_session_registry.register_session failed",

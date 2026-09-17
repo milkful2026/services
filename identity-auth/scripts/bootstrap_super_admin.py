@@ -78,7 +78,6 @@ def main(argv: list[str] | None = None) -> int:
     # installed in every environment that just wants to preview usage.
     sys.path.insert(0, "src")
     from adapters.admin_user_repository import SqlAlchemyAdminUserRepository
-    from domain.admin_exceptions import AdminEmailExistsError
     from domain.admin_models import AdminRole, AdminStatus, AdminUser
     from sqlalchemy import create_engine
 
@@ -131,9 +130,20 @@ def main(argv: list[str] | None = None) -> int:
                 created_by=None,  # the one and only admin_user row with no creator (spec §7)
             )
         )
-    except AdminEmailExistsError:
-        print(f"ERROR: Aurora insert failed (email already exists), compensating (deleting Cognito user)")
-        client.admin_delete_user(UserPoolId=args.admin_pool_id, Username=email)
+    except Exception as exc:
+        # Broadened from `except AdminEmailExistsError` — any Aurora
+        # failure here (not just a uniqueness conflict; a transient
+        # connection error is wrapped as ExternalServiceUnavailableError
+        # by the repository, not AdminEmailExistsError) leaves the same
+        # orphaned-Cognito-user risk and needs the same compensation.
+        print(f"ERROR: Aurora insert failed ({exc}), compensating (deleting Cognito user)")
+        try:
+            client.admin_delete_user(UserPoolId=args.admin_pool_id, Username=email)
+        except ClientError as compensation_exc:
+            print(
+                f"ERROR: compensation FAILED — Cognito user {email!r} is orphaned "
+                f"(no matching Aurora row) and needs manual cleanup: {compensation_exc}"
+            )
         return 1
 
     print(

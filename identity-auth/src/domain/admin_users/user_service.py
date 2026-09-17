@@ -60,6 +60,14 @@ def validate_cidr_list(cidrs: list[str]) -> list[str]:
     return validated
 
 
+def validate_max_concurrent_sessions(value: int) -> int:
+    """`0` is a valid, deliberate value ("no sessions allowed") — only
+    negative values are rejected."""
+    if value < 0:
+        raise AdminValidationError("maxConcurrentSessions must be >= 0")
+    return value
+
+
 def _require_super_admin(caller_role: str) -> None:
     if caller_role != AdminRole.SUPER_ADMIN.value:
         raise AdminForbiddenError()
@@ -114,13 +122,12 @@ class AdminUserService:
 
         try:
             self._cognito.set_group(email, role)
-        except Exception:
+        except Exception as original_exc:
             logger.error(
                 "admin_user_service.create_admin: group assignment failed, compensating",
                 extra={"correlationId": correlation_id, "email": email},
             )
-            self._cognito.admin_delete_user(email)
-            raise
+            self._compensate_create_failure(email, original_exc, correlation_id)
 
         try:
             created = self._admin_repo.create(
@@ -136,14 +143,13 @@ class AdminUserService:
                     created_by=caller_admin_id,
                 )
             )
-        except Exception:
+        except Exception as original_exc:
             logger.error(
                 "admin_user_service.create_admin: Aurora insert failed after Cognito create, "
                 "compensating by deleting the Cognito user",
                 extra={"correlationId": correlation_id, "email": email},
             )
-            self._cognito.admin_delete_user(email)
-            raise
+            self._compensate_create_failure(email, original_exc, correlation_id)
 
         # Invitation email trigger is this event itself (spec §3: "no new
         # notification channel invented") — a future Notification
@@ -155,6 +161,28 @@ class AdminUserService:
             correlation_id,
         )
         return created
+
+    def _compensate_create_failure(self, email: str, original_exc: Exception, correlation_id: str) -> None:
+        """Deletes the just-created Cognito user after a downstream
+        create_admin step fails. If the compensating delete ITSELF
+        raises (e.g. a transient Cognito throttle), that new exception
+        must not silently replace `original_exc` in what the caller
+        sees — a masked root cause is exactly how an orphaned Cognito
+        user (group-assigned or not, with no matching Aurora row) goes
+        unnoticed. Logged critically as its own distinct failure mode
+        so ops has a durable signal to reconcile, then re-raises the
+        original failure either way."""
+        try:
+            self._cognito.admin_delete_user(email)
+        except Exception as compensation_exc:
+            logger.critical(
+                "admin_user_service.create_admin: compensation FAILED — Cognito user %s is "
+                "orphaned (no matching Aurora row) and needs manual cleanup",
+                email,
+                extra={"correlationId": correlation_id, "email": email},
+                exc_info=compensation_exc,
+            )
+        raise original_exc from original_exc
 
     def list_admins(
         self,
@@ -201,23 +229,63 @@ class AdminUserService:
 
         validated_role = validate_role(role) if role is not None else None
         validated_ips = validate_cidr_list(ip_allowlist or []) if ip_allowlist_set else None
-        # Captured BEFORE update_role_and_config runs — a repository
-        # implementation that mutates its returned object in place (as
-        # some ORMs do) would otherwise make this comparison always see
-        # the already-updated value.
+        validated_max_sessions = (
+            validate_max_concurrent_sessions(max_concurrent_sessions)
+            if max_concurrent_sessions_set and max_concurrent_sessions is not None
+            else max_concurrent_sessions
+        )
+        # Captured BEFORE any write — a repository implementation that
+        # mutates its returned object in place (as some ORMs do) would
+        # otherwise make this comparison always see the already-updated
+        # value.
         original_role = target.role.value
         target_email = target.email
+        role_changing = validated_role is not None and validated_role != original_role
 
-        updated = self._admin_repo.update_role_and_config(
-            target_id,
-            role=validated_role,
-            ip_allowlist=validated_ips,
-            max_concurrent_sessions=max_concurrent_sessions,
-            max_concurrent_sessions_set=max_concurrent_sessions_set,
-        )
-
-        if validated_role is not None and validated_role != original_role:
+        # Cognito Group membership is changed BEFORE the Aurora write
+        # (not after, as this previously did): if set_group fails here,
+        # nothing has changed in Aurora yet and the request just fails
+        # cleanly. The reverse order (Aurora first) risks committing the
+        # new role in Aurora and then failing to mirror it into Cognito
+        # with no rollback — the two sources of truth this module's own
+        # docstring says are "kept in sync on every role change" would
+        # silently desync instead.
+        if role_changing:
             self._cognito.set_group(target_email, validated_role)
+
+        try:
+            updated = self._admin_repo.update_role_and_config(
+                target_id,
+                role=validated_role,
+                ip_allowlist=validated_ips,
+                max_concurrent_sessions=validated_max_sessions,
+                max_concurrent_sessions_set=max_concurrent_sessions_set,
+            )
+        except Exception:
+            if role_changing:
+                # Aurora is the record system list/detail reads come
+                # from, so a failure here after Cognito already changed
+                # must not leave the two silently desynced. Best-effort
+                # revert; if the revert itself fails, that failure is
+                # logged critically (not swallowed) so ops can
+                # reconcile manually, and the ORIGINAL Aurora error is
+                # still what propagates to the caller — a revert
+                # failure must not mask the real cause of the request
+                # failing.
+                try:
+                    self._cognito.set_group(target_email, original_role)
+                except Exception:
+                    logger.critical(
+                        "admin_user_service.update_admin: Aurora write failed AND Cognito "
+                        "group revert failed — admin is desynced (Cognito=%s, Aurora=%s) "
+                        "and needs manual reconciliation",
+                        validated_role,
+                        original_role,
+                        extra={"correlationId": correlation_id, "adminId": target_id, "email": target_email},
+                    )
+            raise
+
+        if role_changing:
             self._cognito.global_sign_out(target_email)
             self._session_registry.invalidate_all(target_id)
             self._event_publisher.publish_admin_event(
@@ -239,8 +307,33 @@ class AdminUserService:
         if target is None:
             raise AdminNotFoundError()
 
-        self._cognito.global_sign_out(target.email)
+        # Aurora status is the authoritative "is this account allowed to
+        # log in" record (checked by login_password and, since the
+        # verify_2fa status re-check fix, by verify_2fa too) — it's
+        # written FIRST, not after global_sign_out as this previously
+        # did. That prior ordering meant a transient Aurora failure
+        # after global_sign_out already succeeded left the *current*
+        # session killed while the account still showed Active, so a
+        # caller told "deactivation failed" would wrongly believe the
+        # account still had access. With status written first, a
+        # failure here is a clean no-op: Cognito hasn't been touched.
         self._admin_repo.set_status(target_id, AdminStatus.DEACTIVATED.value)
+
+        # Killing the *current* session is best-effort cleanup once the
+        # authoritative status change has already landed — new logins
+        # and refreshes are already blocked by the status check above,
+        # so a failure here (logged, not raised) must not make this
+        # request report "deactivation failed" when the account is in
+        # fact already deactivated.
+        try:
+            self._cognito.global_sign_out(target.email)
+        except Exception:
+            logger.warning(
+                "admin_user_service.deactivate_admin: account deactivated but session "
+                "revocation failed — existing refresh token remains valid until natural "
+                "expiry; manual Cognito reconciliation may be needed",
+                extra={"correlationId": correlation_id, "adminId": target_id, "email": target.email},
+            )
         self._session_registry.invalidate_all(target_id)
 
         self._event_publisher.publish_admin_event(
