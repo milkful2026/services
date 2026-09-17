@@ -11,7 +11,19 @@ like that module's own `lines` column.
 
 Per services/README.md §3.7: the only place allowed to import SQLAlchemy
 for this concern.
+
+`from __future__ import annotations` is required, not stylistic: this
+class defines a method literally named `list`, which shadows the
+builtin `list` for every subsequent method's annotations in this same
+class body once bound (e.g. `update_role_and_config`'s
+`ip_allowlist: list[str] | None`) — eager annotation evaluation
+(the default on Python <3.14, including this project's CI on 3.11)
+then crashes at class-definition time. See admin_interfaces.py's
+matching note; `AdminUserRepositoryPort` has the identical `list`
+method name and needed the same fix.
 """
+
+from __future__ import annotations
 
 import logging
 import uuid

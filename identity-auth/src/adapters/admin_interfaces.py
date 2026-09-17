@@ -6,7 +6,22 @@ are wired at the composition root (each handler module). Domain code depends
 on these Protocols only, never on boto3/SQLAlchemy/redis directly. Kept
 separate from adapters/interfaces.py so the pre-existing consumer-flow
 Protocols are never touched by this additive feature.
+
+`from __future__ import annotations` is required here, not stylistic:
+`AdminUserRepositoryPort` (and the concrete `SqlAlchemyAdminUserRepository`
+in admin_user_repository.py) both define a method literally named
+`list`, which — once bound in the class body during construction —
+shadows the builtin `list` for every subsequent method's annotation
+in that same class body (e.g. `ip_allowlist: list[str] | None`).
+Eagerly-evaluated annotations (the default on Python <3.14, including
+this project's CI on 3.11) then crash at class-definition time with
+`TypeError: 'function' object is not subscriptable`. Deferring
+evaluation via this import — rather than renaming a public interface
+method — is the standard, minimal fix for exactly this shadowing
+class of bug.
 """
+
+from __future__ import annotations
 
 from typing import Protocol
 
