@@ -87,3 +87,70 @@ def test_internal_limits_no_auth(client):
 
 def test_missing_bearer_is_401(client):
     assert client.get("/wallet/me").status_code == 401
+
+
+def test_internal_debit_no_auth_debits_and_returns_200(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    r = client.post(
+        "/wallet/internal/debit",
+        json={"userId": "user-1", "orderId": "order-1", "amountPaise": 30000},
+    )
+    assert r.status_code == 200
+    assert r.json()["data"] == {"status": "DEBITED", "balanceAfterPaise": 70000}
+
+
+def test_internal_debit_insufficient_balance_is_200_not_4xx(client, engine):
+    seed_wallet(engine, balance_paise=100)
+    r = client.post(
+        "/wallet/internal/debit",
+        json={"userId": "user-1", "orderId": "order-1", "amountPaise": 30000},
+    )
+    assert r.status_code == 200
+    assert r.json()["data"] == {
+        "status": "INSUFFICIENT_BALANCE",
+        "balancePaise": 100,
+        "requiredPaise": 30000,
+    }
+
+
+def test_internal_debit_wallet_not_active_is_200_not_4xx(client, engine):
+    seed_wallet(engine, balance_paise=100000, status="FAILED")
+    r = client.post(
+        "/wallet/internal/debit",
+        json={"userId": "user-1", "orderId": "order-1", "amountPaise": 30000},
+    )
+    assert r.status_code == 200
+    assert r.json()["data"] == {"status": "WALLET_NOT_ACTIVE"}
+
+
+def test_internal_debit_no_wallet_row_is_503_not_200(client):
+    # Regression: the provisioning race must surface as a retryable 503,
+    # never the 200 WALLET_NOT_ACTIVE shape.
+    r = client.post(
+        "/wallet/internal/debit",
+        json={"userId": "ghost", "orderId": "order-1", "amountPaise": 30000},
+    )
+    assert r.status_code == 503
+    assert r.json()["data"]["errorCode"] == "WALLET_PROVISIONING_PENDING"
+
+
+def test_internal_debit_non_positive_amount_is_422(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    r = client.post(
+        "/wallet/internal/debit",
+        json={"userId": "user-1", "orderId": "order-1", "amountPaise": 0},
+    )
+    assert r.status_code == 422  # pydantic Field(gt=0) rejection
+
+
+def test_internal_balance_no_auth(client, engine):
+    seed_wallet(engine, balance_paise=45000)
+    r = client.get("/wallet/internal/balance", params={"userId": "user-1"})
+    assert r.status_code == 200
+    assert r.json()["data"] == {"balancePaise": 45000, "status": "ACTIVE"}
+
+
+def test_internal_balance_no_wallet_is_creating_zero(client):
+    r = client.get("/wallet/internal/balance", params={"userId": "ghost"})
+    assert r.status_code == 200
+    assert r.json()["data"] == {"balancePaise": 0, "status": "CREATING"}

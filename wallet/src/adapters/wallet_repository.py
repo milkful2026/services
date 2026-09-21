@@ -30,8 +30,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from domain.exceptions import RetryableConsumerError, ServiceUnavailableError
-from domain.models import LedgerEntry, LedgerType, Wallet, WalletStatus
+from domain.exceptions import (
+    OrderUserMismatchError,
+    RetryableConsumerError,
+    ServiceUnavailableError,
+    WalletProvisioningPendingError,
+)
+from domain.models import DebitOutcome, DebitResult, LedgerEntry, LedgerType, Wallet, WalletStatus
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +218,111 @@ class SqlAlchemyWalletRepository:
                 )
                 wallet.balance_paise = new_balance
                 return wallet
+
+    def debit_for_order(
+        self,
+        *,
+        user_id: str,
+        order_id: str,
+        amount_paise: int,
+        ref: str,
+        correlation_id: str | None,
+        outbox_payload_builder,
+    ) -> DebitOutcome:
+        """MA-130 FR: one transaction, mirrors `credit_recharge`'s
+        lock-check-write shape. `SELECT ... FOR UPDATE` the wallet row,
+        then:
+          - no row at all -> raise WalletProvisioningPendingError (503,
+            retryable — a provisioning race, not a settled bad state).
+          - row present but not ACTIVE -> WALLET_NOT_ACTIVE (no write).
+          - `ref` already debited -> DEBITED replay, using the existing
+            entry's own wallet_id/balance_after_paise (no new write); a
+            `ref` that resolves to a *different* wallet than the one just
+            locked raises OrderUserMismatchError (should be impossible —
+            `order_id` is server-generated and globally unique).
+          - insufficient balance -> INSUFFICIENT_BALANCE (no write).
+          - otherwise -> insert the ORDER_DEBIT ledger row, decrement the
+            balance, insert a WalletDebited outbox row, all in this one
+            transaction.
+        """
+        with self._db_operation("debit_for_order", "Failed to debit wallet"):
+            with self._engine.begin() as conn:
+                row = conn.execute(
+                    select(wallets_table)
+                    .where(wallets_table.c.user_id == user_id)
+                    .with_for_update()
+                ).fetchone()
+                if row is None:
+                    raise WalletProvisioningPendingError(
+                        f"no wallet row yet for user {user_id!r}"
+                    )
+                wallet = _row_to_wallet(row)
+                if wallet.status != WalletStatus.ACTIVE:
+                    return DebitOutcome(result=DebitResult.WALLET_NOT_ACTIVE)
+
+                existing = conn.execute(
+                    select(ledger_entries_table).where(ledger_entries_table.c.ref == ref)
+                ).fetchone()
+                if existing is not None:
+                    if existing.wallet_id != wallet.id:
+                        raise OrderUserMismatchError(
+                            f"order {order_id!r} already debited against a different wallet"
+                        )
+                    return DebitOutcome(
+                        result=DebitResult.DEBITED,
+                        wallet_id=wallet.id,
+                        balance_paise=int(existing.balance_after_paise),
+                    )
+
+                if wallet.balance_paise < amount_paise:
+                    return DebitOutcome(
+                        result=DebitResult.INSUFFICIENT_BALANCE,
+                        wallet_id=wallet.id,
+                        balance_paise=wallet.balance_paise,
+                        required_paise=amount_paise,
+                    )
+
+                new_balance = wallet.balance_paise - amount_paise
+                conn.execute(
+                    ledger_entries_table.insert().values(
+                        wallet_id=wallet.id,
+                        type=LedgerType.ORDER_DEBIT.value,
+                        amount_paise=-amount_paise,
+                        balance_after_paise=new_balance,
+                        ref=ref,
+                        correlation_id=correlation_id,
+                    )
+                )
+                conn.execute(
+                    wallets_table.update()
+                    .where(wallets_table.c.id == wallet.id)
+                    .values(balance_paise=new_balance, updated_at=func.now())
+                )
+                payload = outbox_payload_builder(wallet.id, new_balance)
+                conn.execute(
+                    outbox_table.insert().values(
+                        aggregate_id=wallet.id,
+                        event_type="WalletDebited",
+                        payload=_dump_payload(payload),
+                    )
+                )
+                return DebitOutcome(
+                    result=DebitResult.DEBITED, wallet_id=wallet.id, balance_paise=new_balance
+                )
+
+    def enqueue_outbox_event(self, *, aggregate_id: str, event_type: str, payload: dict) -> None:
+        """Standalone one-row outbox insert for events that aren't part of
+        a larger state-changing transaction (e.g. `WalletLowBalance`,
+        raised as a secondary effect *after* `debit_for_order` commits)."""
+        with self._db_operation("enqueue_outbox_event", "Failed to enqueue event"):
+            with self._engine.begin() as conn:
+                conn.execute(
+                    outbox_table.insert().values(
+                        aggregate_id=aggregate_id,
+                        event_type=event_type,
+                        payload=_dump_payload(payload),
+                    )
+                )
 
     def find_balance_invariant_violations(self) -> list[tuple[str, int, int]]:
         """Returns `(wallet_id, balance_paise, ledger_sum_paise)` for every

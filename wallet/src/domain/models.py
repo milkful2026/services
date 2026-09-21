@@ -48,3 +48,28 @@ class LedgerEntry:
 class TransactionsPage:
     items: list[LedgerEntry]
     next_cursor: str | None
+
+
+class DebitResult(StrEnum):
+    """MA-130 `debit_for_order` outcome. `WALLET_NOT_ACTIVE` here is a
+    normal 200 response value, not an exception — see
+    `WalletProvisioningPendingError`'s docstring for why the "no wallet
+    row at all" case is a *separate*, retryable (503) path instead."""
+
+    DEBITED = "DEBITED"
+    INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+    WALLET_NOT_ACTIVE = "WALLET_NOT_ACTIVE"
+
+
+@dataclass
+class DebitOutcome:
+    result: DebitResult
+    wallet_id: str | None = None
+    balance_paise: int | None = None  # set for DEBITED / INSUFFICIENT_BALANCE
+    required_paise: int | None = None  # set only for INSUFFICIENT_BALANCE
+
+    # Defined in domain/models.py rather than domain/wallet_service.py
+    # (as the MA-25 implementation plan's prose has it) to avoid a
+    # circular import: adapters/wallet_repository.py must construct
+    # DebitOutcome values, and wallet_service.py already imports from
+    # adapters/wallet_repository.py.

@@ -41,3 +41,36 @@ class RetryableConsumerError(WalletError):
 
     error_code = "CONSUMER_RETRYABLE"
     http_status = 503
+
+
+class OrderUserMismatchError(WalletError):
+    """A replayed `debit_for_order` for an already-debited `orderId`
+    resolves to a wallet different from the one just locked. `orderId` is
+    server-generated and globally unique, so this should be impossible —
+    checked defensively rather than trusting it, the only place this can
+    run since it's entirely local data (no Order Service call needed)."""
+
+    error_code = "ORDER_USER_MISMATCH"
+    http_status = 400
+
+
+class InvalidAmountError(WalletError):
+    error_code = "INVALID_AMOUNT"
+    http_status = 400
+
+
+class WalletProvisioningPendingError(WalletError):
+    """Raised by the synchronous `debit_for_order` path (MA-25/MA-130)
+    when no wallet row exists yet for this user — the same
+    UserRegistered-before-wallet-exists race `credit_recharge` already
+    treats as retryable via `RetryableConsumerError`, but this call comes
+    from Order Service over HTTP, not an SQS consumer, so it must surface
+    as a retryable HTTP status (503) rather than a queue-level retry.
+    Deliberately distinct from `WALLET_NOT_ACTIVE` (a settled,
+    non-retryable state, returned as a normal 200 `DebitOutcome` instead)
+    — folding the two together would let a subscription's first-ever
+    order (created moments after registration) permanently fail instead
+    of retrying once provisioning catches up."""
+
+    error_code = "WALLET_PROVISIONING_PENDING"
+    http_status = 503

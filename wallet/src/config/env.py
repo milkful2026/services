@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     recharge_min_paise: int = 10_000       # ₹100
     recharge_max_paise: int = 10_000_000   # ₹1,00,000
 
+    # MA-130 §7 — below this post-debit (or post-refusal) balance,
+    # debit_for_order enqueues WalletLowBalance for Notification/Reporting.
+    # Env var: WALLET_LOW_BALANCE_THRESHOLD_PAISE (prefix + field name).
+    low_balance_threshold_paise: int = 10_000   # ₹100
+
 
 def get_settings() -> Settings:
     """Instantiated lazily so tests can inject env vars before first access."""

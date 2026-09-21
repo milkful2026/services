@@ -17,8 +17,16 @@ from adapters.wallet_repository import (
     new_wallet_id,
 )
 from config.env import Settings
-from domain.exceptions import InvalidCursorError, WalletNotFoundError
-from domain.models import LedgerEntry, LedgerType, TransactionsPage, Wallet, WalletStatus
+from domain.exceptions import InvalidAmountError, InvalidCursorError, WalletNotFoundError
+from domain.models import (
+    DebitOutcome,
+    DebitResult,
+    LedgerEntry,
+    LedgerType,
+    TransactionsPage,
+    Wallet,
+    WalletStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +112,14 @@ class WalletService:
             "rechargeMaxPaise": self._settings.recharge_max_paise,
         }
 
+    def get_internal_balance(self, user_id: str) -> dict:
+        """MA-130 FR-3 — service-to-service balance read (SigV4/mTLS in
+        prod, VPC-only). Same CREATING-if-absent convention as get_wallet_me."""
+        wallet = self._repo.get_wallet_by_user(user_id)
+        if wallet is None:
+            return {"balancePaise": 0, "status": WalletStatus.CREATING.value}
+        return {"balancePaise": wallet.balance_paise, "status": wallet.status.value}
+
     def list_transactions(
         self, user_id: str, limit: int | None, cursor: str | None
     ) -> TransactionsPage:
@@ -183,6 +199,84 @@ class WalletService:
                 extra={"ref": ref, "balanceAfterPaise": result.balance_paise},
             )
 
+
+    # --- MA-130 (MA-25): synchronous debit for Order Service ---
+
+    def debit_for_order(
+        self, *, user_id: str, order_id: str, amount_paise: int, correlation_id: str | None
+    ) -> DebitOutcome:
+        """`POST /wallet/internal/debit` — Order Service's synchronous
+        order-creation critical path. Idempotent on `order_id` via the
+        ledger `ref` UNIQUE (a replayed call for an already-debited order
+        returns the same DEBITED outcome, no second write). Raises
+        `InvalidAmountError` for a non-positive amount, and
+        `WalletProvisioningPendingError`/`OrderUserMismatchError` per
+        `debit_for_order`'s own contract on the repository — both are
+        real exceptions (never a `DebitOutcome`), since both are either
+        a caller bug or a race the caller must retry, not an outcome
+        Order Service should branch on."""
+        if amount_paise <= 0:
+            raise InvalidAmountError("amountPaise must be > 0")
+
+        ref = f"order:{order_id}"
+
+        def _build_debited_outbox(wallet_id: str, balance_after_paise: int) -> dict:
+            return {
+                "eventId": str(uuid.uuid4()),
+                "occurredAt": datetime.now(UTC).isoformat(),
+                "correlationId": correlation_id or "",
+                "userId": user_id,
+                "walletId": wallet_id,
+                "orderId": order_id,
+                "amountPaise": amount_paise,
+                "balanceAfterPaise": balance_after_paise,
+            }
+
+        outcome = self._repo.debit_for_order(
+            user_id=user_id,
+            order_id=order_id,
+            amount_paise=amount_paise,
+            ref=ref,
+            correlation_id=correlation_id,
+            outbox_payload_builder=_build_debited_outbox,
+        )
+
+        self._maybe_enqueue_low_balance(user_id, outcome)
+
+        logger.info(
+            "debit_for_order: %s",
+            outcome.result.value,
+            extra={"userId": user_id, "orderId": order_id, "result": outcome.result.value},
+        )
+        return outcome
+
+    def _maybe_enqueue_low_balance(self, user_id: str, outcome: DebitOutcome) -> None:
+        """After a DEBITED or INSUFFICIENT_BALANCE outcome (never
+        WALLET_NOT_ACTIVE — no balance to compare), enqueue
+        WalletLowBalance if the resulting/refused-against balance is
+        under threshold. A separate, best-effort outbox insert — not
+        part of debit_for_order's own transaction, same as this
+        codebase's other post-commit side-effect enqueues."""
+        if outcome.result not in (DebitResult.DEBITED, DebitResult.INSUFFICIENT_BALANCE):
+            return
+        if outcome.balance_paise is None or outcome.wallet_id is None:
+            return
+        if outcome.balance_paise >= self._settings.low_balance_threshold_paise:
+            return
+        reason = "LOW_AFTER_DEBIT" if outcome.result == DebitResult.DEBITED else "DEBIT_REFUSED"
+        self._repo.enqueue_outbox_event(
+            aggregate_id=outcome.wallet_id,
+            event_type="WalletLowBalance",
+            payload={
+                "eventId": str(uuid.uuid4()),
+                "occurredAt": datetime.now(UTC).isoformat(),
+                "userId": user_id,
+                "walletId": outcome.wallet_id,
+                "balancePaise": outcome.balance_paise,
+                "thresholdPaise": self._settings.low_balance_threshold_paise,
+                "reason": reason,
+            },
+        )
 
     # --- MA-127 §5/§7/§11: nightly balance invariant ---
 
