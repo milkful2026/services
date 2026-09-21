@@ -17,7 +17,12 @@ from adapters.wallet_repository import (
     new_wallet_id,
 )
 from config.env import Settings
-from domain.exceptions import InvalidAmountError, InvalidCursorError, WalletNotFoundError
+from domain.exceptions import (
+    InvalidAmountError,
+    InvalidCursorError,
+    WalletError,
+    WalletNotFoundError,
+)
 from domain.models import (
     DebitOutcome,
     DebitResult,
@@ -224,7 +229,10 @@ class WalletService:
             return {
                 "eventId": str(uuid.uuid4()),
                 "occurredAt": datetime.now(UTC).isoformat(),
-                "correlationId": correlation_id or "",
+                # WalletDebited.schema.json requires a non-empty
+                # correlationId; DebitRequest.correlationId is optional
+                # from the caller, so mint one rather than publish "".
+                "correlationId": correlation_id or str(uuid.uuid4()),
                 "userId": user_id,
                 "walletId": wallet_id,
                 "orderId": order_id,
@@ -241,7 +249,24 @@ class WalletService:
             outbox_payload_builder=_build_debited_outbox,
         )
 
-        self._maybe_enqueue_low_balance(user_id, outcome)
+        # Skip on replay: the ledger/balance write already happened (and
+        # was already evaluated for low-balance) on the original call —
+        # re-running this on every retry would emit a duplicate
+        # WalletLowBalance per replay, each with its own eventId (so
+        # consumer-side eventId dedup wouldn't catch it either).
+        if not outcome.replayed:
+            try:
+                self._maybe_enqueue_low_balance(user_id, outcome)
+            except WalletError:
+                # Best-effort secondary write; the debit itself already
+                # committed, so a failure here must not surface as a
+                # failed debit_for_order call (e.g. a 503 to Order
+                # Service for money that was, in fact, taken).
+                logger.error(
+                    "debit_for_order: failed to enqueue WalletLowBalance after a "
+                    "successful debit",
+                    extra={"userId": user_id, "orderId": order_id},
+                )
 
         logger.info(
             "debit_for_order: %s",

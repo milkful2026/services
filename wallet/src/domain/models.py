@@ -67,6 +67,7 @@ class DebitOutcome:
     wallet_id: str | None = None
     balance_paise: int | None = None  # set for DEBITED / INSUFFICIENT_BALANCE
     required_paise: int | None = None  # set only for INSUFFICIENT_BALANCE
+    replayed: bool = False  # True when DEBITED is a replay of an already-debited ref
 
     # Defined in domain/models.py rather than domain/wallet_service.py
     # (as the MA-25 implementation plan's prose has it) to avoid a
