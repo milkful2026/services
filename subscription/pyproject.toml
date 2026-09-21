@@ -1,0 +1,27 @@
+[project]
+name = "subscription"
+version = "0.1.0"
+description = "Milkful Subscription Service — lifecycle (create/pause/resume/stop/skip/edit), cut-off enforcement, the Daily Run (MA-100 / MA-25 MA-131)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "src" for this service's own modules; ".." (services/) so
+# `from shared.events import load_schema` and `shared.adapters.retry`
+# resolve the cross-service shared/ package — matches wallet/payment's
+# pyproject.toml.
+pythonpath = ["src", ".."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI's `Depends(...)` / `Query(...)` in parameter defaults is the
+# framework's required idiom, not a bug (same pattern across every service).
+ignore = ["B008"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]

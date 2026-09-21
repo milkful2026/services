@@ -6,6 +6,8 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "eventId",
+    "occurredAt",
     "subscriptionId",
     "userId",
     "productId",
@@ -15,6 +17,8 @@
     "correlationId"
   ],
   "properties": {
+    "eventId": { "type": "string", "minLength": 1, "description": "Dedupe key for consumers." },
+    "occurredAt": { "type": "string", "format": "date-time" },
     "subscriptionId": { "type": "string", "minLength": 1 },
     "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
     "productId": { "type": "string", "minLength": 1 },
