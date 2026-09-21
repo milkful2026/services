@@ -45,6 +45,7 @@ when running via `run_local.py`.
 import secrets
 
 import jwt as pyjwt
+from botocore.exceptions import ClientError
 
 LOCAL_MFA_CODE = "123456"  # matches portal-ui's own MOCK_TOTP_CODE, for a consistent dev experience
 
@@ -74,6 +75,14 @@ class LocalDevAdminCognitoAdapter:
             )
         except (client.exceptions.NotAuthorizedException, client.exceptions.UserNotFoundException) as exc:
             raise IncorrectAdminCredentialsError() from exc
+        except ClientError as exc:
+            # Mirrors the real adapter's own generic-ClientError handling
+            # (throttling, a misconfigured pool, moto acting up) — without
+            # this, anything other than the two exceptions above would
+            # propagate as a raw botocore exception instead of the
+            # structured ExternalServiceUnavailableError the domain/
+            # handler layer (and a real developer) expects.
+            raise self._real._log_and_wrap("admin_password_auth", exc) from exc  # noqa: SLF001
 
         fake_session = secrets.token_urlsafe(24)
         self._pending[fake_session] = response["AuthenticationResult"]

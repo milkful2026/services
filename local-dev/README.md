@@ -382,9 +382,14 @@ env var (or set it to anything else) for the default, backend-independent MSW-mo
   table declared it `JSON` — a genuine Postgres type mismatch (not a local-dev-only issue; this
   would have broken every admin create/update against real Aurora too) that broke every insert.
   The offline pytest suite (SQLite, which doesn't enforce this distinction) never caught it —
-  only running against real Postgres here did. Fixed by changing the migration to `JSONB`,
-  matching `user` service's own working `lines` column precedent this file's docstring already
-  claimed to follow.
+  only running against real Postgres here did. `0001` had already been merged by the time this was
+  found, so the fix is a new `migrations/0002_fix_admin_ip_allowlist_type.sql` (drops and re-adds
+  the column as `JSONB`, matching `user` service's own working `lines` column precedent), not an
+  edit to `0001` — per `services/README.md` §3.6's migration-immutability rule. **If you already
+  ran this stack before this fix landed**, your local `milkful_identity_auth` database has the
+  broken column and `apply_migrations.py`'s per-filename tracking won't retroactively fix it —
+  run `docker compose down -v` (or manually drop that one database) before bringing the stack back
+  up, same as any other schema-breaking local change.
 - **Catalog's `StockChanged` consumer has no real producer yet** — Inventory's reserve/commit/
   release (MA-95/MA-118) is spec'd but not implemented, so nothing publishes this event in normal
   operation. The consumer itself is implemented and tested (unit tests with a mocked SQS queue,

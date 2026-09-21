@@ -1,0 +1,21 @@
+-- Fixes a real bug in 0001_admin_user.sql (already merged, hence a new
+-- migration rather than an edit — services/README.md §3.6: "versioned
+-- migrations are immutable once merged"): ip_allowlist was declared
+-- TEXT[], but admin_user_repository.py's SQLAlchemy Core table declares
+-- it JSON — a genuine Postgres type mismatch that broke every admin
+-- create/update against real Postgres (the offline SQLite test double
+-- doesn't enforce column types, so pytest never caught it). JSONB
+-- matches the `user` service's own working `lines`-column precedent
+-- this file's docstring already claimed to follow.
+--
+-- Dropped and re-added, not cast in place: TEXT[] has no direct cast to
+-- JSONB, and this table has never been deployed to a real environment
+-- (MA-47 is still in review) — no production data exists to preserve.
+-- A local-dev Postgres that already applied 0001 with the broken type
+-- must drop its milkful_identity_auth database (or the whole
+-- docker-compose volume: `docker compose down -v`) and let bootstrap
+-- re-create it, exactly like any other schema-breaking local change —
+-- this migration alone does not undo already-corrupted local state,
+-- only prevents the bug for anyone applying migrations from scratch.
+ALTER TABLE admin_user DROP COLUMN ip_allowlist;
+ALTER TABLE admin_user ADD COLUMN ip_allowlist JSONB;

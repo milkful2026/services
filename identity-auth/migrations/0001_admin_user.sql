@@ -16,7 +16,7 @@ CREATE TABLE admin_user (
     email                     VARCHAR(255) NOT NULL UNIQUE,
     role                      VARCHAR(16) NOT NULL,
     status                    VARCHAR(16) NOT NULL,
-    ip_allowlist              JSONB,
+    ip_allowlist              TEXT[],
     max_concurrent_sessions   INTEGER,
     last_login_at             TIMESTAMPTZ,
     created_by                VARCHAR(36) REFERENCES admin_user(id),
