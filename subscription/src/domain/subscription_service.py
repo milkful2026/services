@@ -111,14 +111,24 @@ def _next_delivery_date(
     subscription: Subscription,
     skipped_dates: frozenset[date],
     start_from: date,
+    logged_dates: frozenset[date] = frozenset(),
     horizon_days: int = _PROJECTION_HORIZON_DAYS,
 ) -> date | None:
+    """Projects the soonest due, non-skipped, non-already-materialized
+    date from `start_from` onward. `logged_dates` (from
+    `subscription_run_log`) is distinct from `skipped_dates`: a date
+    already recorded there was already turned into a `SubscriptionOrderDue`
+    (via create's same-day case or a prior Daily Run) and must never be
+    re-reported as still-upcoming, even though `is_due` alone would still
+    say yes for it."""
     if subscription.status == SubscriptionStatus.STOPPED:
         return None
     if subscription.pause_from is not None and subscription.pause_until is None:
         return None  # indefinite pause, no resume date to project past
     for offset in range(horizon_days):
         candidate = start_from + timedelta(days=offset)
+        if candidate in logged_dates:
+            continue
         if is_due(subscription, candidate, skipped_dates):
             return candidate
     return None
@@ -167,7 +177,7 @@ class SubscriptionService:
 
         existing = self._repo.get_by_idempotency_key(user_id, idempotency_key)
         if existing is not None:
-            return self._create_response(existing, today)
+            return self._create_response(existing, now)
 
         if start_date < today:
             raise InvalidScheduleError("startDate must be today or later")
@@ -219,13 +229,26 @@ class SubscriptionService:
             "subscription.created" if created else "subscription.create_replay",
             extra={"subscriptionId": result.id, "userId": user_id},
         )
-        return self._create_response(result, today)
+        return self._create_response(result, now)
 
-    def _create_response(self, subscription: Subscription, today: date) -> dict:
-        skipped = frozenset(self._repo.list_skip_dates(subscription.id))
-        next_delivery = _next_delivery_date(
-            subscription, skipped, start_from=today + timedelta(days=1)
+    def _project_next_delivery(self, subscription: Subscription, now: datetime) -> date | None:
+        """Today is a valid candidate only while it's still before today's
+        own cut-off (matching create's same-day rule); past it, today is
+        no longer reachable regardless of what the schedule says (MA-131
+        §9's own edge case). Already-materialized dates (`subscription_run_log`)
+        are excluded so a just-emitted same-day/Daily-Run date is never
+        re-reported as still-upcoming."""
+        today = now.astimezone(IST).date()
+        start_from = (
+            today if now < _todays_cutoff_moment(now, self._settings.cutoff_hour_ist)
+            else today + timedelta(days=1)
         )
+        skipped = frozenset(self._repo.list_skip_dates(subscription.id))
+        logged = frozenset(self._repo.list_logged_dates(subscription.id))
+        return _next_delivery_date(subscription, skipped, start_from, logged)
+
+    def _create_response(self, subscription: Subscription, now: datetime) -> dict:
+        next_delivery = self._project_next_delivery(subscription, now)
         return {
             "subscriptionId": subscription.id,
             "status": subscription.status.value,
@@ -261,22 +284,22 @@ class SubscriptionService:
             pause_until=until,
             status=SubscriptionStatus.PAUSED,
         )
-        return self._detail_response(updated)
+        return self._detail_response(updated, now)
 
-    def resume(self, subscription_id: str, user_id: str) -> dict:
+    def resume(self, subscription_id: str, user_id: str, *, now: datetime | None = None) -> dict:
         sub = self._get_owned(subscription_id, user_id)
         if sub.status == SubscriptionStatus.STOPPED:
             raise SubscriptionStoppedError("Cannot resume a stopped subscription")
         updated = self._repo.update_pause(
             sub.id, pause_from=None, pause_until=None, status=SubscriptionStatus.ACTIVE
         )
-        return self._detail_response(updated)
+        return self._detail_response(updated, now)
 
-    def stop(self, subscription_id: str, user_id: str) -> dict:
+    def stop(self, subscription_id: str, user_id: str, *, now: datetime | None = None) -> dict:
         sub = self._get_owned(subscription_id, user_id)
         if sub.status != SubscriptionStatus.STOPPED:
             sub = self._repo.update_status(sub.id, SubscriptionStatus.STOPPED)
-        return self._detail_response(sub)  # idempotent — same response either way
+        return self._detail_response(sub, now)  # idempotent — same response either way
 
     # --- FR-5: skip ---
 
@@ -310,15 +333,16 @@ class SubscriptionService:
         _validate_schedule(new_schedule)
 
         skipped = frozenset(self._repo.list_skip_dates(sub.id))
+        logged = frozenset(self._repo.list_logged_dates(sub.id))
         tomorrow = now.astimezone(IST).date() + timedelta(days=1)
-        next_due = _next_delivery_date(sub, skipped, start_from=tomorrow)
+        next_due = _next_delivery_date(sub, skipped, tomorrow, logged)
 
         if next_due is None or now < _cutoff_moment(next_due, self._settings.cutoff_hour_ist):
             self._repo.apply_edit_now(sub.id, new_quantity, new_schedule)
             return {"effectiveFrom": next_due.isoformat() if next_due else None}
 
         after_next = _next_delivery_date(
-            sub, skipped, start_from=next_due + timedelta(days=1)
+            sub, skipped, next_due + timedelta(days=1), logged
         ) or (next_due + timedelta(days=1))
         self._repo.set_pending_edit(
             sub.id,
@@ -328,18 +352,18 @@ class SubscriptionService:
 
     # --- FR-9: read APIs ---
 
-    def get(self, subscription_id: str, user_id: str) -> dict:
+    def get(self, subscription_id: str, user_id: str, *, now: datetime | None = None) -> dict:
         sub = self._get_owned(subscription_id, user_id)
-        return self._detail_response(sub)
+        return self._detail_response(sub, now)
 
-    def list_for_user(self, user_id: str) -> list[dict]:
-        return [self._detail_response(s) for s in self._repo.list_by_user(user_id)]
+    def list_for_user(self, user_id: str, *, now: datetime | None = None) -> list[dict]:
+        now = now or datetime.now(IST)
+        return [self._detail_response(s, now) for s in self._repo.list_by_user(user_id)]
 
-    def _detail_response(self, sub: Subscription) -> dict:
+    def _detail_response(self, sub: Subscription, now: datetime | None = None) -> dict:
+        now = now or datetime.now(IST)
         skipped = self._repo.list_skip_dates(sub.id)
-        next_delivery = _next_delivery_date(
-            sub, frozenset(skipped), start_from=date.today() + timedelta(days=1)
-        )
+        next_delivery = self._project_next_delivery(sub, now)
         return {
             "subscriptionId": sub.id,
             "productId": sub.product_id,

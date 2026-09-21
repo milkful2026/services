@@ -311,6 +311,16 @@ class SqlAlchemySubscriptionRepository:
                 ).fetchall()
         return {r.skipped_date for r in rows}
 
+    def list_logged_dates(self, subscription_id: str) -> set[date]:
+        with self._db_operation("list_logged_dates", "Failed to load run log"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(subscription_run_log_table.c.delivery_date).where(
+                        subscription_run_log_table.c.subscription_id == subscription_id
+                    )
+                ).fetchall()
+        return {r.delivery_date for r in rows}
+
     # --- Daily Run ---
 
     def list_logged_subscription_ids(self, delivery_date: date) -> set[str]:

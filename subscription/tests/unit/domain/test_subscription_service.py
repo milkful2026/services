@@ -294,6 +294,28 @@ class TestCreateSameDayEmission:
         ]
         assert len(due_events) == 1
 
+    def test_already_materialized_date_never_reported_as_next_delivery(self, service):
+        # Regression (caught in CI, not locally): a DAILY subscription due
+        # today gets same-day-emitted at create time, logging TODAY into
+        # subscription_run_log. A later read (get/list/pause/resume/stop)
+        # must not re-report TODAY as nextDeliveryDate just because
+        # is_due(sub, TODAY) is still (correctly) true — it was already
+        # turned into a SubscriptionOrderDue and must roll to tomorrow.
+        created = service.create(
+            user_id="user-1",
+            product_id="prod-1",
+            quantity=1,
+            schedule=_daily_schedule(),
+            start_date=TODAY,
+            slot_id="slot-1",
+            idempotency_key="key-1",
+            correlation_id=None,
+            now=BEFORE_CUTOFF,
+        )
+        sub_id = created["subscriptionId"]
+        detail = service.get(sub_id, "user-1", now=BEFORE_CUTOFF)
+        assert detail["nextDeliveryDate"] == (TODAY + timedelta(days=1)).isoformat()
+
 
 class TestPauseResumeStop:
     def _create(self, service, **overrides):

@@ -66,6 +66,12 @@ class SubscriptionRepositoryPort(Protocol):
 
     def list_skip_dates(self, subscription_id: str) -> set[date]: ...
 
+    def list_logged_dates(self, subscription_id: str) -> set[date]:
+        """Every `delivery_date` already recorded in `subscription_run_log`
+        for this subscription — used to keep `nextDeliveryDate` projection
+        from re-reporting an already-materialized date as upcoming."""
+        ...
+
     def list_logged_subscription_ids(self, delivery_date: date) -> set[str]:
         """Batched — one query for every subscription already logged for
         `delivery_date`, so `run_daily` never queries per subscription."""

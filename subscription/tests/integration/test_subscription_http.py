@@ -1,6 +1,6 @@
 """FastAPI HTTP surface — TestClient against the SQLite double."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import jwt
 import pytest
@@ -27,7 +27,13 @@ def _create_body(**overrides):
         "productId": "prod-1",
         "quantity": 1,
         "schedule": {"type": "DAILY"},
-        "startDate": (date.today() + timedelta(days=1)).isoformat(),
+        # +3 days, not +1 — the server computes "today" in IST while this
+        # helper uses the naive local/UTC date; near a UTC-evening/
+        # IST-early-morning boundary those two "today"s can disagree by a
+        # day, which would flip this into the same-day-emission path
+        # (already covered deterministically in the unit tests) instead
+        # of the plain future-start-date case this suite exercises.
+        "startDate": (date.today() + timedelta(days=3)).isoformat(),
         "slotId": "slot-1",
         "idempotencyKey": "key-1",
     }
@@ -106,7 +112,17 @@ def test_run_daily_emits_schema_valid_event(client, repo):
     import jsonschema
     from shared.events import load_schema
 
-    client.post("/subscriptions", json=_create_body(), headers=_bearer())
+    from domain.models import IST
+
+    # startDate = the server's own IST "tomorrow" (not the naive local
+    # date +1 the other tests use) so this never collides with create's
+    # same-day-emission path regardless of a UTC/IST day-boundary
+    # crossing, and matches exactly what run_daily computes as "tomorrow"
+    # moments later.
+    ist_tomorrow = (datetime.now(IST) + timedelta(days=1)).date()
+    client.post(
+        "/subscriptions", json=_create_body(startDate=ist_tomorrow.isoformat()), headers=_bearer()
+    )
     r = client.post("/internal/run-daily")
     assert r.status_code == 200
 
