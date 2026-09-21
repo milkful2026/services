@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/WalletDebited.schema.json",
+  "title": "WalletDebited",
+  "description": "EventBridge `detail` for a wallet debit (order payment). Producer: milkful.wallet (MA-130). Consumers: Reporting; Notification Service (future).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "occurredAt",
+    "correlationId",
+    "userId",
+    "walletId",
+    "orderId",
+    "amountPaise",
+    "balanceAfterPaise"
+  ],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1, "description": "Dedupe key for consumers." },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
+    "walletId": { "type": "string", "minLength": 1 },
+    "orderId": { "type": "string", "minLength": 1 },
+    "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
+    "balanceAfterPaise": { "type": "integer", "minimum": 0 }
+  }
+}

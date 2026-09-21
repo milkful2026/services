@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/OrderPaymentFailed.schema.json",
+  "title": "OrderPaymentFailed",
+  "description": "EventBridge `detail` for a subscription order that failed to materialize or be paid for. Producer: milkful.order (MA-132). Consumers: Notification Service (future); Reporting.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "occurredAt",
+    "correlationId",
+    "orderId",
+    "userId",
+    "subscriptionId",
+    "amountPaise",
+    "reason"
+  ],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1, "description": "Dedupe key for consumers." },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "minLength": 1 },
+    "orderId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
+    "subscriptionId": { "type": "string", "minLength": 1 },
+    "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
+    "reason": {
+      "type": "string",
+      "enum": ["INSUFFICIENT_BALANCE", "WALLET_NOT_ACTIVE", "PRODUCT_UNAVAILABLE", "DELIVERY_ADDRESS_UNKNOWN"]
+    }
+  }
+}

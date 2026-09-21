@@ -3,7 +3,7 @@ never imports SQLAlchemy or boto3 directly."""
 
 from typing import Protocol
 
-from domain.models import LedgerEntry, LedgerType, Wallet
+from domain.models import DebitOutcome, LedgerEntry, LedgerType, Wallet
 
 
 class WalletRepositoryPort(Protocol):
@@ -39,6 +39,32 @@ class WalletRepositoryPort(Protocol):
     def find_balance_invariant_violations(self) -> list[tuple[str, int, int]]:
         """Returns (wallet_id, balance_paise, ledger_sum_paise) for every
         wallet where they disagree."""
+        ...
+
+    def debit_for_order(
+        self,
+        *,
+        user_id: str,
+        order_id: str,
+        amount_paise: int,
+        ref: str,
+        correlation_id: str | None,
+        outbox_payload_builder,
+    ) -> DebitOutcome:
+        """One transaction: SELECT ... FOR UPDATE the wallet; no row ->
+        raises WalletProvisioningPendingError; not ACTIVE ->
+        WALLET_NOT_ACTIVE; `ref` already debited -> DEBITED replay (or
+        OrderUserMismatchError if it belongs to a different wallet);
+        insufficient balance -> INSUFFICIENT_BALANCE; otherwise inserts
+        the ORDER_DEBIT ledger row, decrements the balance, and enqueues
+        a WalletDebited outbox row built by
+        `outbox_payload_builder(wallet_id, balance_after_paise)`."""
+        ...
+
+    def enqueue_outbox_event(self, *, aggregate_id: str, event_type: str, payload: dict) -> None:
+        """A standalone one-row outbox insert, for events raised as a
+        secondary effect after another write already committed (e.g.
+        WalletLowBalance after debit_for_order)."""
         ...
 
 

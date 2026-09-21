@@ -5,8 +5,17 @@ shared ApiClient unwraps for every service."""
 import uuid
 from typing import Any
 
-from domain.models import LedgerEntry, TransactionsPage
+from pydantic import BaseModel, Field
+
+from domain.models import DebitOutcome, DebitResult, LedgerEntry, TransactionsPage
 from domain.wallet_service import render_description
+
+
+class DebitRequest(BaseModel):
+    userId: str  # noqa: N815 — wire contract casing
+    orderId: str  # noqa: N815
+    amountPaise: int = Field(gt=0)  # noqa: N815
+    correlationId: str | None = None  # noqa: N815
 
 
 def _iso(value) -> str | None:
@@ -30,6 +39,21 @@ def serialize_transactions(page: TransactionsPage) -> dict[str, Any]:
         "items": [serialize_entry(e) for e in page.items],
         "nextCursor": page.next_cursor,
     }
+
+
+def serialize_debit_outcome(outcome: DebitOutcome) -> dict[str, Any]:
+    """MA-130 §6 response shapes — all three results are 200s, branched
+    on `status`, never an HTTP error (Order Service's wallet_client_adapter
+    must not treat any of them as a failure)."""
+    if outcome.result == DebitResult.DEBITED:
+        return {"status": DebitResult.DEBITED.value, "balanceAfterPaise": outcome.balance_paise}
+    if outcome.result == DebitResult.INSUFFICIENT_BALANCE:
+        return {
+            "status": DebitResult.INSUFFICIENT_BALANCE.value,
+            "balancePaise": outcome.balance_paise,
+            "requiredPaise": outcome.required_paise,
+        }
+    return {"status": DebitResult.WALLET_NOT_ACTIVE.value}
 
 
 def success_envelope(data: dict[str, Any] | list[Any]) -> dict[str, Any]:

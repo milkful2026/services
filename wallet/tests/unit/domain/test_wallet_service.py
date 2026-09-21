@@ -1,7 +1,16 @@
 import pytest
 
 from adapters.wallet_repository import ledger_entries_table, wallets_table
-from domain.exceptions import InvalidCursorError, RetryableConsumerError, WalletNotFoundError
+from domain.exceptions import (
+    InvalidAmountError,
+    InvalidCursorError,
+    OrderUserMismatchError,
+    RetryableConsumerError,
+    ServiceUnavailableError,
+    WalletNotFoundError,
+    WalletProvisioningPendingError,
+)
+from domain.models import DebitResult
 from tests.conftest import seed_wallet
 
 
@@ -186,3 +195,247 @@ class TestBalanceInvariant:
                 .values(balance_paise=30000)
             )
         assert service.check_balance_invariant() == []
+
+
+class TestDebitForOrder:
+    def test_sufficient_debits_and_emits_walletdebited(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        outcome = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="corr-1"
+        )
+        assert outcome.result == DebitResult.DEBITED
+        assert outcome.balance_paise == 70000
+        w = repo.get_wallet_by_user("user-1")
+        assert w.balance_paise == 70000
+        entries = repo.list_ledger_entries(w.id, 10, None)
+        debit = [e for e in entries if e.type.value == "ORDER_DEBIT"]
+        assert len(debit) == 1
+        assert debit[0].amount_paise == -30000
+        assert debit[0].balance_after_paise == 70000
+        assert debit[0].ref == "order:order-1"
+        unpub = repo.fetch_unpublished()
+        debited_events = [e for e in unpub if e["event_type"] == "WalletDebited"]
+        assert len(debited_events) == 1
+        assert debited_events[0]["payload"]["amountPaise"] == 30000
+        assert debited_events[0]["payload"]["balanceAfterPaise"] == 70000
+        assert debited_events[0]["payload"]["orderId"] == "order-1"
+
+    def test_insufficient_balance_no_write(self, service, repo, engine):
+        # balance_paise above the default low-balance threshold (10000) so
+        # this test isolates "no ledger/balance write" from the separate
+        # low-balance-emission behavior covered below.
+        seed_wallet(engine, balance_paise=15000)
+        outcome = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        assert outcome.result == DebitResult.INSUFFICIENT_BALANCE
+        assert outcome.balance_paise == 15000
+        assert outcome.required_paise == 30000
+        assert repo.get_wallet_by_user("user-1").balance_paise == 15000  # unchanged
+        assert repo.fetch_unpublished() == []
+
+    def test_wallet_not_active_no_write(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000, status="FAILED")
+        outcome = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        assert outcome.result == DebitResult.WALLET_NOT_ACTIVE
+        assert outcome.balance_paise is None
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000  # unchanged
+        assert repo.fetch_unpublished() == []
+
+    def test_no_wallet_row_raises_provisioning_pending_not_wallet_not_active(self, service):
+        # Regression: a missing wallet row is a provisioning race (retryable,
+        # 503) — it must NOT be folded into the 200 WALLET_NOT_ACTIVE outcome,
+        # or Order Service would permanently fail a subscription's first-ever
+        # order instead of retrying once provisioning catches up.
+        with pytest.raises(WalletProvisioningPendingError):
+            service.debit_for_order(
+                user_id="ghost", order_id="order-1", amount_paise=30000, correlation_id=None
+            )
+
+    def test_replayed_debit_for_same_order_is_idempotent(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        first = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        second = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        assert first.result == second.result == DebitResult.DEBITED
+        assert first.balance_paise == second.balance_paise == 70000
+        # No second ledger row, no second WalletDebited.
+        entries = repo.list_ledger_entries(repo.get_wallet_by_user("user-1").id, 10, None)
+        assert len([e for e in entries if e.type.value == "ORDER_DEBIT"]) == 1
+        assert len([e for e in repo.fetch_unpublished() if e["event_type"] == "WalletDebited"]) == 1
+
+    def test_replayed_debit_for_different_user_raises_mismatch(self, service, engine):
+        seed_wallet(engine, user_id="user-1", wallet_id="wal_1", balance_paise=100000)
+        seed_wallet(engine, user_id="user-2", wallet_id="wal_2", balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        with pytest.raises(OrderUserMismatchError):
+            service.debit_for_order(
+                user_id="user-2", order_id="order-1", amount_paise=30000, correlation_id=None
+            )
+
+    def test_first_ever_call_for_new_order_never_raises_mismatch(self, service, engine):
+        # Regression: the mismatch check must never fire on a brand-new
+        # order_id — only on a genuine replay against a different wallet.
+        seed_wallet(engine, balance_paise=100000)
+        outcome = service.debit_for_order(
+            user_id="user-1", order_id="brand-new-order", amount_paise=100, correlation_id=None
+        )
+        assert outcome.result == DebitResult.DEBITED
+
+    def test_non_positive_amount_raises_before_any_repository_call(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        with pytest.raises(InvalidAmountError):
+            service.debit_for_order(
+                user_id="user-1", order_id="order-1", amount_paise=0, correlation_id=None
+            )
+
+    def test_post_debit_balance_under_threshold_emits_low_balance(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=15000)  # threshold default is 10000
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=10000, correlation_id=None
+        )
+        low_balance = [e for e in repo.fetch_unpublished() if e["event_type"] == "WalletLowBalance"]
+        assert len(low_balance) == 1
+        assert low_balance[0]["payload"]["reason"] == "LOW_AFTER_DEBIT"
+        assert low_balance[0]["payload"]["balancePaise"] == 5000
+
+    def test_refused_debit_under_threshold_emits_low_balance_debit_refused(
+        self, service, repo, engine
+    ):
+        seed_wallet(engine, balance_paise=5000)  # below threshold already, and insufficient
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        low_balance = [e for e in repo.fetch_unpublished() if e["event_type"] == "WalletLowBalance"]
+        assert len(low_balance) == 1
+        assert low_balance[0]["payload"]["reason"] == "DEBIT_REFUSED"
+
+    def test_wallet_not_active_never_emits_low_balance(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100, status="FAILED")
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        assert repo.fetch_unpublished() == []
+
+    def test_replay_after_wallet_deactivated_still_returns_debited(self, service, repo, engine):
+        # Regression: the ref-replay check must run before the wallet
+        # status check, or a replay of an already-debited order after
+        # the wallet's status later changes would wrongly return
+        # WALLET_NOT_ACTIVE instead of the idempotent DEBITED outcome.
+        seed_wallet(engine, balance_paise=100000)
+        first = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        assert first.result == DebitResult.DEBITED
+        with engine.begin() as conn:
+            conn.execute(
+                wallets_table.update()
+                .where(wallets_table.c.user_id == "user-1")
+                .values(status="FAILED")
+            )
+        second = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id=None
+        )
+        assert second.result == DebitResult.DEBITED
+        assert second.balance_paise == first.balance_paise
+
+    def test_replayed_debit_does_not_emit_duplicate_low_balance(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=15000)  # threshold default is 10000
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=10000, correlation_id=None
+        )
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=10000, correlation_id=None
+        )
+        low_balance = [e for e in repo.fetch_unpublished() if e["event_type"] == "WalletLowBalance"]
+        assert len(low_balance) == 1
+
+    def test_low_balance_enqueue_failure_does_not_fail_the_debit(
+        self, service, repo, engine, monkeypatch
+    ):
+        # Regression: a transient failure in the best-effort
+        # WalletLowBalance enqueue (a separate transaction from the
+        # debit itself) must not surface as a failed debit_for_order —
+        # the debit already committed.
+        seed_wallet(engine, balance_paise=15000)  # threshold default is 10000
+
+        def _boom(*args, **kwargs):
+            raise ServiceUnavailableError("transient enqueue failure")
+
+        monkeypatch.setattr(repo, "enqueue_outbox_event", _boom)
+
+        outcome = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=10000, correlation_id=None
+        )
+        assert outcome.result == DebitResult.DEBITED
+        assert outcome.balance_paise == 5000
+
+    def test_debited_outbox_correlation_id_defaults_when_caller_omits_it(
+        self, service, repo, engine
+    ):
+        # Regression: WalletDebited.schema.json requires a non-empty
+        # correlationId; publishing "" for an omitted correlation_id
+        # violates the schema this same PR added.
+        seed_wallet(engine, balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=1000, correlation_id=None
+        )
+        debited = [e for e in repo.fetch_unpublished() if e["event_type"] == "WalletDebited"]
+        assert len(debited) == 1
+        assert debited[0]["payload"]["correlationId"] != ""
+        assert len(debited[0]["payload"]["correlationId"]) > 0
+
+    def test_ref_race_across_wallets_recovers_via_integrity_error_not_503(
+        self, service, repo, engine, monkeypatch
+    ):
+        # Regression: the `ref` UNIQUE constraint (not the per-wallet
+        # `FOR UPDATE` lock) is what actually serializes two concurrent
+        # debit_for_order calls for the same order_id across *different*
+        # wallets. Simulate the race by making the first ledger_entries
+        # SELECT inside the transaction (the "is this ref already
+        # debited" check) miss a row that a concurrent call already
+        # committed, so the subsequent INSERT hits the UNIQUE constraint.
+        # The repository must recover with the same OrderUserMismatchError
+        # the pre-insert check would have raised, not a raw 503.
+        seed_wallet(engine, user_id="user-1", wallet_id="wal_1", balance_paise=100000)
+        seed_wallet(engine, user_id="user-2", wallet_id="wal_2", balance_paise=100000)
+
+        service.debit_for_order(
+            user_id="user-2", order_id="order-1", amount_paise=1000, correlation_id=None
+        )
+
+        from sqlalchemy.engine import Connection
+
+        real_execute = Connection.execute
+        state = {"skipped": False}
+
+        class _EmptyResult:
+            def fetchone(self):
+                return None
+
+        def patched_execute(self, statement, *args, **kwargs):
+            if (
+                not state["skipped"]
+                and getattr(statement, "is_select", False)
+                and "ledger_entries" in str(statement)
+            ):
+                state["skipped"] = True
+                return _EmptyResult()
+            return real_execute(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(Connection, "execute", patched_execute)
+
+        with pytest.raises(OrderUserMismatchError):
+            service.debit_for_order(
+                user_id="user-1", order_id="order-1", amount_paise=2000, correlation_id=None
+            )
+
+        monkeypatch.undo()
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000
