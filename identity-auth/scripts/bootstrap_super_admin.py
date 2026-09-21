@@ -25,6 +25,16 @@ Defaults to a DRY RUN (prints what it would do, touches nothing). Pass
 real AWS credentials and DB connectivity — this script is intentionally
 NOT covered by the offline pytest suite beyond a dry-run smoke test.
 
+By default the account is left exactly as spec §12 Q3 describes: Cognito
+FORCE_CHANGE_PASSWORD / Aurora status=Pending, since no Pending->Active
+activation endpoint exists yet (see this service's README). Pass
+--set-password to additionally set a permanent Cognito password and
+create the Aurora row as status=Active — an explicit, opt-in choice to
+get an immediately-usable account by setting a password out-of-band,
+for whoever is running this script (a local-dev environment, or a real
+one where that trade-off is acceptable); the default behavior for
+anyone who doesn't pass it is completely unchanged.
+
 Usage:
     python scripts/bootstrap_super_admin.py \\
         --email superadmin@milkful.example \\
@@ -32,7 +42,8 @@ Usage:
         --admin-pool-id ap-south-1_XXXXXXXXX \\
         --database-url postgresql+psycopg2://user:pass@host:5432/admin \\
         --region ap-south-1 \\
-        --execute
+        --execute \\
+        --set-password 'Sup3rS3cret!'
 """
 
 import argparse
@@ -56,6 +67,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--execute",
         action="store_true",
         help="Actually perform the bootstrap. Without this flag, only a dry-run preview is printed.",
+    )
+    parser.add_argument(
+        "--set-password",
+        default=None,
+        metavar="PASSWORD",
+        help=(
+            "Also set this as a permanent Cognito password and create the Aurora row as "
+            "status=Active, instead of the default Pending/FORCE_CHANGE_PASSWORD. Opt-in only — "
+            "see the module docstring."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -114,7 +135,18 @@ def main(argv: list[str] | None = None) -> int:
         client.admin_delete_user(UserPoolId=args.admin_pool_id, Username=email)
         return 1
 
+    if args.set_password:
+        try:
+            client.admin_set_user_password(
+                UserPoolId=args.admin_pool_id, Username=email, Password=args.set_password, Permanent=True
+            )
+        except ClientError as exc:
+            print(f"ERROR: admin_set_user_password failed, compensating (deleting Cognito user): {exc}")
+            client.admin_delete_user(UserPoolId=args.admin_pool_id, Username=email)
+            return 1
+
     cognito_sub = {a["Name"]: a["Value"] for a in created_user["UserAttributes"]}["sub"]
+    initial_status = AdminStatus.ACTIVE if args.set_password else AdminStatus.PENDING
 
     try:
         repo.create(
@@ -124,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
                 name=name,
                 email=email,
                 role=AdminRole.SUPER_ADMIN,
-                status=AdminStatus.PENDING,
+                status=initial_status,
                 ip_allowlist=[],
                 max_concurrent_sessions=None,
                 created_by=None,  # the one and only admin_user row with no creator (spec §7)
@@ -146,16 +178,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 1
 
-    print(
-        f"\nBootstrap complete. {email!r} exists in both the Admin Cognito Pool "
-        "(Pending — FORCE_CHANGE_PASSWORD) and admin_user (status=Pending).\n"
-        "This admin still needs to complete password-set + TOTP enrollment before "
-        "they can log in (spec's own gap — see this service's README "
-        "'Architecture decisions flagged for review' for the Pending -> Active "
-        "transition question) and the invite delivery mechanism itself is not "
-        "triggered by this script (no admin.user.created event is published "
-        "here — this bootstrap is intentionally out of band)."
-    )
+    if args.set_password:
+        print(
+            f"\nBootstrap complete. {email!r} exists in the Admin Cognito Pool with a permanent "
+            "password and admin_user (status=Active) — ready to log in immediately with that "
+            "password (2FA still applies per the real login flow, or its local-dev stand-in)."
+        )
+    else:
+        print(
+            f"\nBootstrap complete. {email!r} exists in both the Admin Cognito Pool "
+            "(Pending — FORCE_CHANGE_PASSWORD) and admin_user (status=Pending).\n"
+            "This admin still needs to complete password-set + TOTP enrollment before "
+            "they can log in (spec's own gap — see this service's README "
+            "'Architecture decisions flagged for review' for the Pending -> Active "
+            "transition question) and the invite delivery mechanism itself is not "
+            "triggered by this script (no admin.user.created event is published "
+            "here — this bootstrap is intentionally out of band)."
+        )
     return 0
 
 

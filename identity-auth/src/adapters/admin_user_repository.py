@@ -5,9 +5,15 @@ service's own, NEW Aurora database — never `user` service's database
 Same portable-types approach as services/user's user_repository.py: the
 same table definition runs against Postgres (production) and an
 in-memory SQLite engine (tests), a documented fidelity gap. `ip_allowlist`
-is `TEXT[]` in the production-authoritative migration
-(migrations/0001_admin_user.sql) but a portable JSON column here, exactly
-like that module's own `lines` column.
+is `JSONB` in the production-authoritative migration
+(migrations/0001_admin_user.sql), matching the `JSON` column here —
+exactly like that module's own `lines` column (`JSONB` in its
+migration, `JSON` here). An earlier version of this file's comment
+claimed the migration used `TEXT[]`; it did, briefly, and that was a
+real bug (a genuine Postgres type mismatch that broke every insert —
+SQLite's untyped columns never caught it) fixed by changing the
+migration to `JSONB` to actually match this table definition, not by
+changing this file.
 
 Per services/README.md §3.7: the only place allowed to import SQLAlchemy
 for this concern.

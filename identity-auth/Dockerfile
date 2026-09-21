@@ -11,7 +11,7 @@ COPY identity-auth/requirements.txt identity-auth/requirements-dev.txt ./identit
 RUN pip install --no-cache-dir --default-timeout=300 --retries=10 -r identity-auth/requirements-dev.txt
 
 COPY identity-auth/ ./identity-auth/
-COPY local-dev/_env_file.py local-dev/_lambda_local_server.py ./local-dev/
+COPY local-dev/_env_file.py local-dev/_lambda_local_server.py local-dev/_admin_local_dev.py ./local-dev/
 
 WORKDIR /app/identity-auth
 

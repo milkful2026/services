@@ -1,9 +1,10 @@
 # Local development environment
 
 Runs registration ([MA-1](https://milkfuldairyindia.atlassian.net/browse/MA-1)),
-login ([MA-21](https://milkfuldairyindia.atlassian.net/browse/MA-21)), and product catalog
-browsing ([MA-22](https://milkfuldairyindia.atlassian.net/browse/MA-22)) end-to-end on your own
-machine, with no real AWS account and no deploy. AWS is stood in for by
+login ([MA-21](https://milkfuldairyindia.atlassian.net/browse/MA-21)), product catalog
+browsing ([MA-22](https://milkfuldairyindia.atlassian.net/browse/MA-22)), and Admin RBAC
+([MA-47](https://milkfuldairyindia.atlassian.net/browse/MA-47)) end-to-end on your own machine,
+with no real AWS account and no deploy. AWS is stood in for by
 [`moto_server`](https://github.com/getmoto/moto) (Cognito, DynamoDB, SQS, EventBridge — one
 process, one port); Postgres and Redis are the real thing, just local containers.
 
@@ -232,6 +233,77 @@ curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d
 # -> 404, errorCode: PRODUCT_PRICING_UNKNOWN
 ```
 
+## Exercising Admin RBAC (MA-47)
+
+Two things moto and real AWS make impossible to run locally exactly as production code does are
+stood in for by `_admin_local_dev.py`, loaded only by `identity-auth/run_local.py` — see that
+file's module docstring for the full "why", confirmed empirically while wiring this up:
+
+- **The real TOTP MFA challenge never happens against moto** — `AdminInitiateAuth` returns
+  `AuthenticationResult` directly, no `ChallengeName`, no matter how the pool is configured
+  (confirmed by direct probe, including via `SetUserPoolMfaConfig`). The real adapter correctly
+  fails closed when that happens (a production safeguard against silently allowing single-factor
+  login), so it can never complete a login against moto. Locally, the 2FA code is always
+  **`123456`** (matching `portal-ui`'s own mock) instead of a real TOTP code — lockout after 5
+  wrong attempts still works, since that logic never touches Cognito.
+- **The admin authorizer's JWT signature check always fails against moto** — it fetches a *real*
+  AWS JWKS URL, which can't resolve anything for a fake local pool ID. Locally, the JWT is decoded
+  (claims only — `sub`, `role`, etc.) without verifying its signature, the same trust model
+  `_lambda_local_server.py` already documents for the consumer JWT authorizer.
+
+Bootstrapping the first Super-Admin is a manual, human-run step even locally (per
+`scripts/bootstrap_super_admin.py`'s own design — there's no Super-Admin yet to call the real
+invite API), but `--set-password` gives you an immediately-usable account rather than one stuck
+in `Pending`/`FORCE_CHANGE_PASSWORD` with no activation path:
+
+```bash
+cd identity-auth
+AWS_ENDPOINT_URL=http://localhost:5000 AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local \
+python scripts/bootstrap_super_admin.py \
+  --email superadmin@milkful.test \
+  --name "Local Super Admin" \
+  --admin-pool-id <IDENTITY_AUTH_ADMIN_COGNITO_USER_POOL_ID from .env.local> \
+  --database-url postgresql+psycopg2://milkful:milkful@localhost:5432/milkful_identity_auth \
+  --region us-east-1 \
+  --execute \
+  --set-password 'Passw0rd!'
+```
+
+Then, verified end-to-end against the real stack while building this:
+
+```bash
+# 1. Login (password step)
+curl -X POST localhost:8001/v1/admin/auth/login \
+  -d '{"email": "superadmin@milkful.test", "password": "Passw0rd!"}'
+# -> challengeToken, expiresIn
+
+# 2. 2FA verify — local code is always 123456
+curl -X POST localhost:8001/v1/admin/auth/2fa/verify \
+  -d '{"challengeToken": "<from step 1>", "code": "123456"}'
+# -> accessToken, refreshToken, idToken, expiresIn
+
+# 3. Admin CRUD — every /v1/admin/users* route needs the access token
+curl localhost:8001/v1/admin/users -H "Authorization: Bearer <accessToken>"
+curl -X POST localhost:8001/v1/admin/users -H "Authorization: Bearer <accessToken>" \
+  -d '{"name": "Test Ops", "email": "ops@milkful.test", "role": "Ops"}'
+curl -X POST localhost:8001/v1/admin/users/<id>/deactivate -H "Authorization: Bearer <accessToken>"
+```
+
+Without a token (or with a wrong 2FA code 5 times in 15 minutes), these correctly reject —
+`403 forbidden` and `401 ADMIN_ACCOUNT_LOCKED` respectively, both confirmed live.
+
+**portal-ui against this real backend, instead of its own MSW mocks:**
+
+```bash
+cd portal-ui
+VITE_USE_MOCKS=false npm run dev
+```
+
+`vite.config.ts`'s dev-server proxy forwards this app's relative `/v1/...` calls to
+`http://localhost:8001` — confirmed end-to-end (a bad-credentials login through the running Vite
+dev server returned the real backend's actual `401 INCORRECT_CREDENTIALS`, not a mock). Omit the
+env var (or set it to anything else) for the default, backend-independent MSW-mocked experience.
+
 ## How this fits together
 
 | Piece | What it does |
@@ -248,7 +320,8 @@ curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d
 | `_db.py` | Shared local-Postgres connection settings/helper used by every `seed_*.py` script, plus a friendly-error wrapper for "Postgres isn't up yet" / "migrations haven't been applied yet". |
 | `_zone_seed_data.py` | Shared zone/slot fixture data used by `seed_inventory_zones.py` and `seed_user_zone_slots.py`, so the two independently-seeded tables can't drift out of sync with each other. |
 | `_catalog_seed_data.py` | Shared category/product fixture data used by `seed_catalog_products.py` — category ids/icon names match the Flutter catalog screen's own icon-mapping switch exactly. |
-| `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. Binds `0.0.0.0`, not `127.0.0.1` — a loopback-only bind works for a native/host run (the process *is* the machine) but is unreachable from outside a container's own network namespace, which is what Option A's published ports need. |
+| `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table — a route's value is either a plain handler function, or a `(handler, authorizer)` tuple for routes behind a Lambda REQUEST authorizer (MA-129's admin routes; every other route in every service is unaffected). Binds `0.0.0.0`, not `127.0.0.1` — a loopback-only bind works for a native/host run (the process *is* the machine) but is unreachable from outside a container's own network namespace, which is what Option A's published ports need. |
+| `_admin_local_dev.py` | MA-129-only. Two local-dev-only compensating adapters — `LocalDevAdminCognitoAdapter` (fakes the TOTP MFA challenge moto can't do) and `LocalDevUnsignedJwtVerifier` (skips the real JWKS signature check the admin authorizer can't do against a fake local pool) — loaded only by `identity-auth/run_local.py`, never touching `identity-auth/src/`. See its own module docstring for the full empirical reasoning. |
 | `peek_otp.py` | Local-only OTP visibility, since there's no real SMS provider to read the code from. |
 | `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's and catalog's `main.py` each carry a small inline duplicate since `local-dev/` isn't shipped in their container images. All four accept `ENV_LOCAL_PATH` to override where `.env.local` is read from (defaulting to the service's own directory) — set by the app services in Option A to point at the shared docker volume `bootstrap` wrote into, instead of a host path. |
 | `AWS_ENDPOINT_URL` | The standard, unprefixed env var botocore already reads natively — no application code needed. `bootstrap.py` writes it into each generated `.env.local`, pointing at `http://localhost:5000` (native) or `http://moto:5000` (Option A, via `LOCAL_DEV_AWS_ENDPOINT_URL`); unset in every real deployment, so behavior there is unaffected. |
@@ -304,6 +377,14 @@ curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d
   from this: `sort=newest` currently falls back to name-order, since there's no recency column in
   the Postgres schema today (never added — the Aurora-only implementation didn't need one for
   price sort, and this was noticed only when writing this deviation note).
+- **Found and fixed while wiring this up: `identity-auth/migrations/0001_admin_user.sql`'s
+  `ip_allowlist` column was declared `TEXT[]`, but `admin_user_repository.py`'s SQLAlchemy Core
+  table declared it `JSON` — a genuine Postgres type mismatch (not a local-dev-only issue; this
+  would have broken every admin create/update against real Aurora too) that broke every insert.
+  The offline pytest suite (SQLite, which doesn't enforce this distinction) never caught it —
+  only running against real Postgres here did. Fixed by changing the migration to `JSONB`,
+  matching `user` service's own working `lines` column precedent this file's docstring already
+  claimed to follow.
 - **Catalog's `StockChanged` consumer has no real producer yet** — Inventory's reserve/commit/
   release (MA-95/MA-118) is spec'd but not implemented, so nothing publishes this event in normal
   operation. The consumer itself is implemented and tested (unit tests with a mocked SQS queue,
