@@ -34,7 +34,13 @@ class SubscriptionRepositoryPort(Protocol):
 
     def list_by_user(self, user_id: str) -> list[Subscription]: ...
 
-    def list_active(self) -> list[Subscription]: ...
+    def list_active(self) -> list[Subscription]:
+        """Daily Run candidates: every non-STOPPED subscription (ACTIVE or
+        PAUSED) — a future-dated pause is already PAUSED at the status
+        level ahead of `pause_from` arriving, so a stricter `status ==
+        ACTIVE` filter would wrongly drop it from the run before the
+        pause actually starts."""
+        ...
 
     def update_status(self, subscription_id: str, status: SubscriptionStatus) -> Subscription: ...
 
@@ -65,6 +71,12 @@ class SubscriptionRepositoryPort(Protocol):
     def insert_skip(self, subscription_id: str, skip_date: date) -> None: ...
 
     def list_skip_dates(self, subscription_id: str) -> set[date]: ...
+
+    def list_skip_dates_batch(self, subscription_ids: list[str]) -> dict[str, set[date]]:
+        """Batched — one query for every subscription's skip dates, keyed
+        by subscription_id (missing/no-skip ids map to an empty set), so
+        `run_daily` never queries skip dates per subscription."""
+        ...
 
     def list_logged_dates(self, subscription_id: str) -> set[date]:
         """Every `delivery_date` already recorded in `subscription_run_log`

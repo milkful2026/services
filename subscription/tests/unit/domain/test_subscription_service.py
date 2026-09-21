@@ -397,6 +397,20 @@ class TestPauseResumeStop:
         result = service.resume(sub_id, "user-1")
         assert result["pauseFrom"] is None
 
+    def test_future_dated_indefinite_pause_still_projects_dates_before_it_starts(self, service):
+        # Regression: a future-dated pause flips `status` to PAUSED
+        # immediately (see subscription_service.py's module docstring),
+        # but _next_delivery_date's indefinite-pause guard used to fire
+        # unconditionally on `pause_until is None`, ignoring whether
+        # `pause_from` was even reached yet — reporting nextDeliveryDate
+        # as null for days that are still legitimately due.
+        sub_id = self._create(service)
+        service.pause(
+            sub_id, "user-1", from_=TODAY + timedelta(days=5), until=None, now=BEFORE_CUTOFF
+        )
+        result = service.get(sub_id, "user-1", now=BEFORE_CUTOFF)
+        assert result["nextDeliveryDate"] == TODAY.isoformat()
+
     def test_resume_rejected_from_stopped(self, service):
         sub_id = self._create(service)
         service.stop(sub_id, "user-1")
@@ -456,6 +470,23 @@ class TestSkip:
         # Cutoff for `tomorrow` is today's cutoff hour (20:00 IST) — past it.
         with pytest.raises(CutoffPassedError):
             service.skip(sub_id, "user-1", tomorrow, now=AFTER_CUTOFF)
+
+    def test_skip_already_materialized_date_refused(self, service, repo):
+        # Regression: skip() must consult list_logged_dates like the
+        # other projection paths — a date already turned into a
+        # SubscriptionOrderDue must never be skippable, even when its
+        # own cutoff moment (far in the future here) hasn't passed yet,
+        # which is what makes this distinct from the plain cutoff check.
+        sub_id = self._create_daily(service)
+        far_future = TODAY + timedelta(days=30)
+        repo.insert_run_log_and_enqueue(
+            subscription_id=sub_id,
+            delivery_date=far_future,
+            outbox_event_type="SubscriptionOrderDue",
+            outbox_payload={"eventId": "evt-1", "occurredAt": "2026-01-15T00:00:00+05:30"},
+        )
+        with pytest.raises(CutoffPassedError):
+            service.skip(sub_id, "user-1", far_future, now=BEFORE_CUTOFF)
 
 
 class TestEdit:
@@ -537,6 +568,29 @@ class TestRunDaily:
         due_ids = service.run_daily(now=AFTER_CUTOFF)
         assert due_ids == []
 
+    def test_future_dated_pause_still_included_before_pause_starts(self, service):
+        # Regression: pause() sets status=PAUSED immediately even for a
+        # future `from_`, and run_daily() used to source candidates from
+        # list_active() filtered on status=='ACTIVE' — dropping the
+        # subscription from every Daily Run for the whole gap before the
+        # pause actually starts, not just during the real pause window.
+        sub_id = service.create(
+            user_id="user-1",
+            product_id="prod-1",
+            quantity=1,
+            schedule=_daily_schedule(),
+            start_date=TODAY,
+            slot_id="slot-1",
+            idempotency_key="key-1",
+            correlation_id=None,
+            now=AFTER_CUTOFF,
+        )["subscriptionId"]
+        service.pause(
+            sub_id, "user-1", from_=TODAY + timedelta(days=10), until=None, now=BEFORE_CUTOFF
+        )
+        due_ids = service.run_daily(now=AFTER_CUTOFF)  # targets tomorrow, well before pause_from
+        assert len(due_ids) == 1
+
     def test_skipped_date_excluded(self, service):
         sub_id = service.create(
             user_id="user-1",
@@ -578,6 +632,43 @@ class TestRunDaily:
         updated = repo.get_by_id(sub_id)
         assert updated.quantity == 7
         assert updated.pending_edit is None
+
+    def test_pending_edit_survives_enqueue_failure_for_next_run_to_retry(
+        self, service, repo, monkeypatch
+    ):
+        # Regression: apply_pending_edit and insert_run_log_and_enqueue
+        # are two separately-committed transactions. Applying the edit
+        # *before* the log/enqueue insert meant a failure in the latter
+        # left the edit permanently applied with no run-log row and no
+        # SubscriptionOrderDue ever emitted — a silently dropped delivery
+        # with nothing to retry it. The edit must only be applied once
+        # the log/enqueue insert has actually succeeded.
+        sub_id = service.create(
+            user_id="user-1",
+            product_id="prod-1",
+            quantity=1,
+            schedule=_daily_schedule(),
+            start_date=TODAY,
+            slot_id="slot-1",
+            idempotency_key="key-1",
+            correlation_id=None,
+            now=AFTER_CUTOFF,
+        )["subscriptionId"]
+        tomorrow = TODAY + timedelta(days=1)
+        service.edit(sub_id, "user-1", quantity=7, schedule=None, now=AFTER_CUTOFF)
+        repo.set_pending_edit(
+            sub_id, PendingEdit(quantity=7, schedule=_daily_schedule(), effective_from=tomorrow)
+        )
+
+        def _boom(**kwargs):
+            raise RuntimeError("simulated DB failure")
+
+        monkeypatch.setattr(repo, "insert_run_log_and_enqueue", _boom)
+        due_ids = service.run_daily(now=AFTER_CUTOFF)
+        assert due_ids == []
+        updated = repo.get_by_id(sub_id)
+        assert updated.quantity == 1  # edit NOT applied
+        assert updated.pending_edit is not None  # still pending — retried tomorrow
 
     def test_duplicate_run_for_same_cutoff_emits_nothing_new(self, service, repo):
         service.create(
@@ -624,15 +715,20 @@ class TestRunDaily:
             now=AFTER_CUTOFF,
         )
 
-        real_list_skip_dates = repo.list_skip_dates
+        # list_skip_dates is now fetched once for the whole run (batched
+        # via list_skip_dates_batch, outside the per-subscription
+        # try/except), so the "one bad row" isolation this test checks
+        # has to be injected into a call that's still inside the loop's
+        # try/except — insert_run_log_and_enqueue is exactly that.
+        real_insert_run_log_and_enqueue = repo.insert_run_log_and_enqueue
         call_count = {"n": 0}
 
-        def _flaky_list_skip_dates(subscription_id):
+        def _flaky_insert_run_log_and_enqueue(**kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise RuntimeError("simulated failure for the first subscription only")
-            return real_list_skip_dates(subscription_id)
+            return real_insert_run_log_and_enqueue(**kwargs)
 
-        monkeypatch.setattr(repo, "list_skip_dates", _flaky_list_skip_dates)
+        monkeypatch.setattr(repo, "insert_run_log_and_enqueue", _flaky_insert_run_log_and_enqueue)
         due_ids = service.run_daily(now=AFTER_CUTOFF)
         assert len(due_ids) == 1  # the second subscription still got processed

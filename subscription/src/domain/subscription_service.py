@@ -11,11 +11,16 @@ until `from` arrives. `is_due`/the Daily Run still correctly exclude only
 the actual `[pause_from, pause_until]` window regardless of the stored
 status, so due-date computation is unaffected — this trim only changes
 what the coarse `status` field reads as for the few days before a
-future-dated pause actually starts.
+future-dated pause actually starts. This *requires*
+`SubscriptionRepositoryPort.list_active()` to source the Daily Run from
+every non-STOPPED subscription (not `status == ACTIVE`) — a stricter
+filter would silently drop a not-yet-started PAUSED subscription from
+the run entirely instead of leaving the per-day decision to `is_due`.
 """
 
 import logging
 import uuid
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 
 from adapters.interfaces import CatalogClientPort, SubscriptionRepositoryPort
@@ -107,6 +112,15 @@ def _todays_cutoff_moment(now: datetime, cutoff_hour: int) -> datetime:
     return datetime.combine(now.astimezone(IST).date(), time(cutoff_hour), tzinfo=IST)
 
 
+def _is_before_todays_cutoff(now: datetime, cutoff_hour: int) -> bool:
+    """Shared by `create`'s same-day eligibility check and
+    `_project_next_delivery`'s same-day candidacy check — both ask the
+    same question ("is `now` still before today's own cutoff?") and must
+    stay in agreement, or `create`'s response could disagree with what a
+    following `GET` reports as `nextDeliveryDate` for the same moment."""
+    return now < _todays_cutoff_moment(now, cutoff_hour)
+
+
 def _next_delivery_date(
     subscription: Subscription,
     skipped_dates: frozenset[date],
@@ -123,8 +137,17 @@ def _next_delivery_date(
     say yes for it."""
     if subscription.status == SubscriptionStatus.STOPPED:
         return None
-    if subscription.pause_from is not None and subscription.pause_until is None:
-        return None  # indefinite pause, no resume date to project past
+    if (
+        subscription.pause_from is not None
+        and subscription.pause_until is None
+        and subscription.pause_from <= start_from
+    ):
+        # Indefinite pause already in effect as of `start_from` — no
+        # resume date to project past. A *future* `pause_from` must NOT
+        # short-circuit here: dates between `start_from` and `pause_from`
+        # are still legitimately due, and the loop below (via `is_due` /
+        # `_in_pause_window`) already handles them correctly.
+        return None
     for offset in range(horizon_days):
         candidate = start_from + timedelta(days=offset)
         if candidate in logged_dates:
@@ -201,7 +224,7 @@ class SubscriptionService:
         same_day_due = (
             start_date == today
             and is_due(subscription, today)
-            and now < _todays_cutoff_moment(now, self._settings.cutoff_hour_ist)
+            and _is_before_todays_cutoff(now, self._settings.cutoff_hour_ist)
         )
 
         outbox_payload = None
@@ -231,19 +254,27 @@ class SubscriptionService:
         )
         return self._create_response(result, now)
 
-    def _project_next_delivery(self, subscription: Subscription, now: datetime) -> date | None:
+    def _project_next_delivery(
+        self,
+        subscription: Subscription,
+        now: datetime,
+        skipped: frozenset[date] | None = None,
+    ) -> date | None:
         """Today is a valid candidate only while it's still before today's
         own cut-off (matching create's same-day rule); past it, today is
         no longer reachable regardless of what the schedule says (MA-131
         §9's own edge case). Already-materialized dates (`subscription_run_log`)
         are excluded so a just-emitted same-day/Daily-Run date is never
-        re-reported as still-upcoming."""
+        re-reported as still-upcoming. `skipped` may be passed in by a
+        caller that already fetched it (e.g. `_detail_response`) to avoid
+        querying the same skip dates twice."""
         today = now.astimezone(IST).date()
         start_from = (
-            today if now < _todays_cutoff_moment(now, self._settings.cutoff_hour_ist)
+            today if _is_before_todays_cutoff(now, self._settings.cutoff_hour_ist)
             else today + timedelta(days=1)
         )
-        skipped = frozenset(self._repo.list_skip_dates(subscription.id))
+        if skipped is None:
+            skipped = frozenset(self._repo.list_skip_dates(subscription.id))
         logged = frozenset(self._repo.list_logged_dates(subscription.id))
         return _next_delivery_date(subscription, skipped, start_from, logged)
 
@@ -311,6 +342,13 @@ class SubscriptionService:
         skipped = frozenset(self._repo.list_skip_dates(sub.id))
         if not is_due(sub, skip_date, skipped):
             raise DateNotDueError(f"{skip_date.isoformat()} is not a due date for this schedule")
+        if skip_date in self._repo.list_logged_dates(sub.id):
+            # Already materialized into a SubscriptionOrderDue (same-day
+            # create or a prior Daily Run) — same real-world condition
+            # the cutoff check below guards against, just reached by a
+            # path (e.g. a cutoff-timing change or a backfill Daily Run)
+            # where `now >= _cutoff_moment(...)` alone wouldn't catch it.
+            raise CutoffPassedError(f"{skip_date.isoformat()} has already been processed")
         if now >= _cutoff_moment(skip_date, self._settings.cutoff_hour_ist):
             raise CutoffPassedError(f"Cut-off has passed for {skip_date.isoformat()}")
         self._repo.insert_skip(sub.id, skip_date)
@@ -341,9 +379,16 @@ class SubscriptionService:
             self._repo.apply_edit_now(sub.id, new_quantity, new_schedule)
             return {"effectiveFrom": next_due.isoformat() if next_due else None}
 
-        after_next = _next_delivery_date(
-            sub, skipped, next_due + timedelta(days=1), logged
-        ) or (next_due + timedelta(days=1))
+        after_next = _next_delivery_date(sub, skipped, next_due + timedelta(days=1), logged)
+        if after_next is None:
+            # No due date within the horizon after `next_due` — e.g. an
+            # indefinite pause starting immediately after it. There's no
+            # better candidate to project onto, so fall back to the day
+            # right after `next_due`; `run_daily` applies a pending edit
+            # once `effective_from <= tomorrow` regardless of whether
+            # that specific day is itself due, so this still fires
+            # correctly once reached.
+            after_next = next_due + timedelta(days=1)
         self._repo.set_pending_edit(
             sub.id,
             PendingEdit(quantity=new_quantity, schedule=new_schedule, effective_from=after_next),
@@ -362,8 +407,8 @@ class SubscriptionService:
 
     def _detail_response(self, sub: Subscription, now: datetime | None = None) -> dict:
         now = now or datetime.now(IST)
-        skipped = self._repo.list_skip_dates(sub.id)
-        next_delivery = self._project_next_delivery(sub, now)
+        skipped = frozenset(self._repo.list_skip_dates(sub.id))
+        next_delivery = self._project_next_delivery(sub, now, skipped)
         return {
             "subscriptionId": sub.id,
             "productId": sub.product_id,
@@ -391,18 +436,32 @@ class SubscriptionService:
         run_correlation_id = str(uuid.uuid4())
 
         already_logged = self._repo.list_logged_subscription_ids(tomorrow)
+        active = self._repo.list_active()
+        skip_dates_by_sub = self._repo.list_skip_dates_batch([s.id for s in active])
         due_subscription_ids: list[str] = []
 
-        for sub in self._repo.list_active():
+        for sub in active:
             try:
                 if sub.id in already_logged:
                     continue
-                if sub.pending_edit is not None and sub.pending_edit.effective_from <= tomorrow:
-                    sub = self._repo.apply_pending_edit(
-                        sub.id, sub.pending_edit.quantity, sub.pending_edit.schedule
-                    )
-                skipped = frozenset(self._repo.list_skip_dates(sub.id))
-                if not is_due(sub, tomorrow, skipped):
+
+                pending = sub.pending_edit
+                edit_due = pending is not None and pending.effective_from <= tomorrow
+                quantity = pending.quantity if edit_due else sub.quantity
+                schedule = pending.schedule if edit_due else sub.schedule
+                # Due-check and the outbox payload use the *prospective*
+                # post-edit quantity/schedule without persisting them yet
+                # — apply_pending_edit only runs after insert_run_log_and_enqueue
+                # succeeds below, so a failure there leaves pending_edit
+                # in place for tomorrow's run to retry both together,
+                # instead of committing the edit while silently losing
+                # today's delivery.
+                effective_sub = replace(sub, quantity=quantity, schedule=schedule)
+
+                skipped = frozenset(skip_dates_by_sub.get(sub.id, set()))
+                if not is_due(effective_sub, tomorrow, skipped):
+                    if edit_due:
+                        sub = self._repo.apply_pending_edit(sub.id, quantity, schedule)
                     continue
                 emitted = self._repo.insert_run_log_and_enqueue(
                     subscription_id=sub.id,
@@ -414,12 +473,19 @@ class SubscriptionService:
                         "subscriptionId": sub.id,
                         "userId": sub.user_id,
                         "productId": sub.product_id,
-                        "quantity": sub.quantity,
+                        "quantity": quantity,
                         "deliveryDate": tomorrow.isoformat(),
                         "slotId": sub.slot_id,
                         "correlationId": run_correlation_id,
                     },
                 )
+                if edit_due:
+                    # Applied unconditionally once logged/enqueued
+                    # (whether freshly inserted or an idempotent replay
+                    # of an already-logged date) so a crash between the
+                    # two calls self-heals on the next run instead of
+                    # leaving the edit stuck pending forever.
+                    sub = self._repo.apply_pending_edit(sub.id, quantity, schedule)
                 if emitted:
                     due_subscription_ids.append(sub.id)
             except Exception:  # noqa: BLE001 — one bad row must not abort the run (MA-131 §5 NFR)

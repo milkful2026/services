@@ -24,6 +24,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     func,
     select,
@@ -39,6 +40,35 @@ logger = logging.getLogger(__name__)
 
 metadata = MetaData()
 
+
+class _JSONColumn(TypeDecorator):
+    """JSONB on Postgres, JSON-in-Text on SQLite. `with_variant(Text,
+    "sqlite")` alone isn't enough: SQLite's plain `Text` can't bind a raw
+    dict, so it needs `json.dumps`/`json.loads` on the Python side — but
+    doing that unconditionally and *also* using `JSONB` (which applies
+    its own dict<->jsonb serialization) double-encodes every value into
+    a JSON string scalar on Postgres. Dialect-aware here so callers just
+    pass/receive plain dicts on both."""
+
+    impl = JSONB
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "sqlite":
+            return dialect.type_descriptor(Text())
+        return dialect.type_descriptor(JSONB())
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return json.dumps(value) if dialect.name == "sqlite" else value
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return json.loads(value) if isinstance(value, str) else value
+
+
 subscriptions_table = Table(
     "subscriptions",
     metadata,
@@ -46,13 +76,13 @@ subscriptions_table = Table(
     Column("user_id", String(64), nullable=False),
     Column("product_id", String(64), nullable=False),
     Column("quantity", Integer, nullable=False),
-    Column("schedule", JSONB().with_variant(Text, "sqlite"), nullable=False),
+    Column("schedule", _JSONColumn(), nullable=False),
     Column("slot_id", String(64), nullable=False),
     Column("status", String(16), nullable=False, default=SubscriptionStatus.ACTIVE.value),
     Column("start_date", Date, nullable=False),
     Column("pause_from", Date, nullable=True),
     Column("pause_until", Date, nullable=True),
-    Column("pending_edit", JSONB().with_variant(Text, "sqlite"), nullable=True),
+    Column("pending_edit", _JSONColumn(), nullable=True),
     Column("idempotency_key", String(128), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column(
@@ -94,7 +124,7 @@ outbox_table = Table(
     ),
     Column("aggregate_id", String(64), nullable=False),
     Column("event_type", String(48), nullable=False),
-    Column("payload", JSONB().with_variant(Text, "sqlite"), nullable=False),
+    Column("payload", _JSONColumn(), nullable=False),
     Column("published_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
@@ -104,16 +134,6 @@ def create_schema(engine: Engine) -> None:
     """Test-only convenience — production schema ownership is the raw SQL
     migration file, not this."""
     metadata.create_all(engine)
-
-
-def _dump(payload: dict) -> str:
-    return json.dumps(payload)
-
-
-def _load(value) -> dict | None:
-    if value is None:
-        return None
-    return json.loads(value) if isinstance(value, str) else value
 
 
 class SqlAlchemySubscriptionRepository:
@@ -163,7 +183,7 @@ class SqlAlchemySubscriptionRepository:
                             user_id=subscription.user_id,
                             product_id=subscription.product_id,
                             quantity=subscription.quantity,
-                            schedule=_dump(subscription.schedule.to_dict()),
+                            schedule=subscription.schedule.to_dict(),
                             slot_id=subscription.slot_id,
                             status=subscription.status.value,
                             start_date=subscription.start_date,
@@ -181,7 +201,7 @@ class SqlAlchemySubscriptionRepository:
                             outbox_table.insert().values(
                                 aggregate_id=subscription.id,
                                 event_type=outbox_event_type,
-                                payload=_dump(outbox_payload),
+                                payload=outbox_payload,
                             )
                         )
                 return subscription, True
@@ -215,11 +235,19 @@ class SqlAlchemySubscriptionRepository:
         return [_row_to_subscription(r) for r in rows]
 
     def list_active(self) -> list[Subscription]:
+        """Daily Run candidates: everything except STOPPED. A future-dated
+        pause already flips `status` to PAUSED ahead of `pause_from`
+        arriving (see subscription_service.py's module docstring), so
+        filtering on `status == ACTIVE` here would drop those rows from
+        the Daily Run entirely for the days before the pause actually
+        starts — `is_due`/`_in_pause_window` (checked per-row afterward)
+        is what actually decides whether a PAUSED subscription is due
+        today, not this coarse status filter."""
         with self._db_operation("list_active", "Failed to load active subscriptions"):
             with self._engine.connect() as conn:
                 rows = conn.execute(
                     select(subscriptions_table).where(
-                        subscriptions_table.c.status == SubscriptionStatus.ACTIVE.value
+                        subscriptions_table.c.status != SubscriptionStatus.STOPPED.value
                     )
                 ).fetchall()
         return [_row_to_subscription(r) for r in rows]
@@ -268,7 +296,7 @@ class SqlAlchemySubscriptionRepository:
                     .where(subscriptions_table.c.id == subscription_id)
                     .values(
                         quantity=quantity,
-                        schedule=_dump(schedule.to_dict()),
+                        schedule=schedule.to_dict(),
                         pending_edit=None,
                         updated_at=func.now(),
                     )
@@ -281,7 +309,7 @@ class SqlAlchemySubscriptionRepository:
                 conn.execute(
                     subscriptions_table.update()
                     .where(subscriptions_table.c.id == subscription_id)
-                    .values(pending_edit=_dump(pending_edit.to_dict()), updated_at=func.now())
+                    .values(pending_edit=pending_edit.to_dict(), updated_at=func.now())
                 )
         return self.get_by_id(subscription_id)
 
@@ -310,6 +338,22 @@ class SqlAlchemySubscriptionRepository:
                     )
                 ).fetchall()
         return {r.skipped_date for r in rows}
+
+    def list_skip_dates_batch(self, subscription_ids: list[str]) -> dict[str, set[date]]:
+        if not subscription_ids:
+            return {}
+        with self._db_operation("list_skip_dates_batch", "Failed to load skips"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(
+                        subscription_skips_table.c.subscription_id,
+                        subscription_skips_table.c.skipped_date,
+                    ).where(subscription_skips_table.c.subscription_id.in_(subscription_ids))
+                ).fetchall()
+        result: dict[str, set[date]] = {sid: set() for sid in subscription_ids}
+        for r in rows:
+            result[r.subscription_id].add(r.skipped_date)
+        return result
 
     def list_logged_dates(self, subscription_id: str) -> set[date]:
         with self._db_operation("list_logged_dates", "Failed to load run log"):
@@ -353,7 +397,7 @@ class SqlAlchemySubscriptionRepository:
                         outbox_table.insert().values(
                             aggregate_id=subscription_id,
                             event_type=outbox_event_type,
-                            payload=_dump(outbox_payload),
+                            payload=outbox_payload,
                         )
                     )
                 return True
@@ -374,7 +418,7 @@ class SqlAlchemySubscriptionRepository:
                     .order_by(outbox_table.c.created_at)
                     .limit(limit)
                 ).fetchall()
-        return [{"id": r.id, "event_type": r.event_type, "payload": _load(r.payload)} for r in rows]
+        return [{"id": r.id, "event_type": r.event_type, "payload": r.payload} for r in rows]
 
     def mark_published(self, outbox_id: int) -> None:
         with self._db_operation("mark_published", "Failed to mark outbox row"):
@@ -392,13 +436,13 @@ def _row_to_subscription(row) -> Subscription:
         user_id=row.user_id,
         product_id=row.product_id,
         quantity=int(row.quantity),
-        schedule=Schedule.from_dict(_load(row.schedule)),
+        schedule=Schedule.from_dict(row.schedule),
         slot_id=row.slot_id,
         status=SubscriptionStatus(row.status),
         start_date=row.start_date,
         pause_from=row.pause_from,
         pause_until=row.pause_until,
-        pending_edit=PendingEdit.from_dict(_load(row.pending_edit)) if row.pending_edit else None,
+        pending_edit=PendingEdit.from_dict(row.pending_edit) if row.pending_edit else None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
