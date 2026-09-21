@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/SubscriptionOrderDue.schema.json",
+  "title": "SubscriptionOrderDue",
+  "description": "EventBridge `detail` for a subscription due for delivery. Producer: milkful.subscription (MA-131). Consumer: Order Service via `order-events-q` (MA-132).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "subscriptionId",
+    "userId",
+    "productId",
+    "quantity",
+    "deliveryDate",
+    "slotId",
+    "correlationId"
+  ],
+  "properties": {
+    "subscriptionId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
+    "productId": { "type": "string", "minLength": 1 },
+    "quantity": { "type": "integer", "exclusiveMinimum": 0 },
+    "deliveryDate": { "type": "string", "format": "date" },
+    "slotId": { "type": "string", "minLength": 1 },
+    "correlationId": { "type": "string", "minLength": 1 }
+  }
+}
