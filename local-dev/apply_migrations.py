@@ -29,6 +29,8 @@ _TARGETS = [
     ("catalog", "milkful_catalog"),
     ("wallet", "milkful_wallet"),
     ("payment", "milkful_payment"),
+    ("subscription", "milkful_subscription"),
+    ("order", "milkful_order"),
 ]
 
 

@@ -59,12 +59,28 @@ services:
       LOCAL_DEV_DB_HOST: postgres
       LOCAL_DEV_REDIS_HOST: redis
       LOCAL_DEV_INVENTORY_HTTP_URL: http://inventory:8000
+      # Container-network hostnames — bootstrap.py's own defaults are
+      # host-side "localhost:PORT" (correct for a native/non-Docker run),
+      # which inside this container would mean "this container", not the
+      # catalog/user/pricing-offer/wallet containers. Needed for the
+      # CART_*/ORDER_* base URLs bootstrap.py writes into cart/order's
+      # generated .env.local (subscription/order/wallet's own request-time
+      # calls, not bootstrap's).
+      LOCAL_DEV_CATALOG_HTTP_URL: http://catalog:8003
+      LOCAL_DEV_USER_HTTP_URL: http://user:8002
+      LOCAL_DEV_PRICING_HTTP_URL: http://pricing-offer:8005
+      LOCAL_DEV_WALLET_HTTP_URL: http://wallet:8006
       LOCAL_DEV_ENV_OUTPUT_ROOT: /shared
     volumes:
       - identity-auth-env:/shared/identity-auth
       - user-env:/shared/user
       - inventory-env:/shared/inventory
       - catalog-env:/shared/catalog
+      - subscription-env:/shared/subscription
+      - order-env:/shared/order
+      - cart-env:/shared/cart
+      - wallet-env:/shared/wallet
+      - payment-env:/shared/payment
 
   identity-auth:
     build:
@@ -124,9 +140,204 @@ services:
     volumes:
       - catalog-env:/shared/catalog
 
+  subscription:
+    build:
+      context: ..
+      dockerfile: subscription/Dockerfile
+    ports:
+      - "8008:8008"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      catalog:
+        condition: service_started
+    environment:
+      ENV_LOCAL_PATH: /shared/subscription/.env.local
+    volumes:
+      - subscription-env:/shared/subscription
+
+  # Drains subscription's outbox (SubscriptionOrderDue) to EventBridge —
+  # same image as `subscription`, different CMD. Stands in for a real
+  # rate(N) EventBridge Scheduler-triggered task (MA-131 §6/§11), same
+  # role user/cart/wallet/payment's outbox scripts already play locally.
+  subscription-outbox:
+    build:
+      context: ..
+      dockerfile: subscription/Dockerfile
+    command: ["python", "-m", "handlers.outbox_publisher"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/subscription/.env.local
+    volumes:
+      - subscription-env:/shared/subscription
+
+  order:
+    build:
+      context: ..
+      dockerfile: order/Dockerfile
+    ports:
+      - "8009:8009"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      user:
+        condition: service_started
+      wallet:
+        condition: service_started
+      pricing-offer:
+        condition: service_started
+    environment:
+      ENV_LOCAL_PATH: /shared/order/.env.local
+    volumes:
+      - order-env:/shared/order
+
+  # Drains order's outbox (OrderConfirmed/OrderPaymentFailed) to
+  # EventBridge — same image as `order`, different CMD.
+  order-outbox:
+    build:
+      context: ..
+      dockerfile: order/Dockerfile
+    command: ["python", "-m", "handlers.outbox_publisher"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/order/.env.local
+    volumes:
+      - order-env:/shared/order
+
+  # --- Pre-existing MA-24 compose gap, closed here (own commit — see
+  # git log): cart/payment/wallet/pricing-offer had .env.local generation
+  # (bootstrap.py) and real Dockerfiles (payment/wallet) or a working
+  # native run_local.py (cart) for a while, but no docker-compose entry,
+  # so Option A's "one command brings up the whole stack" never actually
+  # included them. cart additionally needed its own new Dockerfile (none
+  # existed before this commit) plus an ENV_LOCAL_PATH fix to
+  # run_local.py/run_local_outbox_publisher.py, mirroring the fix
+  # user/run_local.py already had — see those files' own comments. ---
+
+  cart:
+    build:
+      context: ..
+      dockerfile: cart/Dockerfile
+    ports:
+      - "8004:8004"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/cart/.env.local
+    volumes:
+      - cart-env:/shared/cart
+
+  cart-outbox:
+    build:
+      context: ..
+      dockerfile: cart/Dockerfile
+    command: ["python", "run_local_outbox_publisher.py"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/cart/.env.local
+    volumes:
+      - cart-env:/shared/cart
+
+  wallet:
+    build:
+      context: ..
+      dockerfile: wallet/Dockerfile
+    ports:
+      - "8006:8006"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/wallet/.env.local
+    volumes:
+      - wallet-env:/shared/wallet
+
+  # Drains wallet's outbox (WalletCreated/WalletCredited/WalletDebited/
+  # WalletLowBalance) to EventBridge — same image as `wallet`, different
+  # CMD. Nightly invariant-check sweep (invariant_check_handler.py) is
+  # deliberately NOT containerized here: it's a run-once cron-shaped job,
+  # not a long-running loop like this one, so it stays a documented
+  # by-hand step (see README) rather than a `restart: always` container
+  # that would just busy-loop re-running a "run once nightly" script.
+  wallet-outbox:
+    build:
+      context: ..
+      dockerfile: wallet/Dockerfile
+    command: ["python", "-m", "handlers.outbox_publisher"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/wallet/.env.local
+    volumes:
+      - wallet-env:/shared/wallet
+
+  payment:
+    build:
+      context: ..
+      dockerfile: payment/Dockerfile
+    ports:
+      - "8007:8007"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      wallet:
+        condition: service_started
+    environment:
+      ENV_LOCAL_PATH: /shared/payment/.env.local
+    volumes:
+      - payment-env:/shared/payment
+
+  # Drains payment's outbox (PaymentConfirmed/PaymentFailed) to
+  # EventBridge — same image as `payment`, different CMD. The
+  # reconciliation sweep is NOT a separate container: it already runs
+  # in-process as a background thread inside `payment`'s own `main.py`
+  # (see that file) — nothing else to containerize for it.
+  payment-outbox:
+    build:
+      context: ..
+      dockerfile: payment/Dockerfile
+    command: ["python", "-m", "handlers.outbox_publisher"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/payment/.env.local
+    volumes:
+      - payment-env:/shared/payment
+
+  # No DB, no AWS, no bootstrap-generated .env.local at all (see
+  # pricing-offer/src/config/env.py's own docstring) — every value here
+  # has a real default already; CORS is the one thing that must be set
+  # explicitly for a browser-based (Flutter web) caller, same as the
+  # native "Option B" instructions below.
+  pricing-offer:
+    build:
+      context: ../pricing-offer
+    ports:
+      - "8005:8005"
+    depends_on:
+      catalog:
+        condition: service_started
+    environment:
+      PRICING_CATALOG_BASE_URL: http://catalog:8003
+      PRICING_CORS_ALLOW_ALL: "true"
+
 volumes:
   milkful-postgres-data:
   identity-auth-env:
   user-env:
   inventory-env:
   catalog-env:
+  subscription-env:
+  order-env:
+  cart-env:
+  wallet-env:
+  payment-env:

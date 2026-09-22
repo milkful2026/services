@@ -12,7 +12,8 @@ never silently recreated — but moto_server keeps everything in memory,
 so a container restart clears it and this must be re-run.
 
 Writes one `.env.local` per service (identity-auth, user, inventory,
-catalog, cart, wallet, payment) with the resource IDs it just created. Each service's run_local.py-style entrypoint loads that file
+catalog, cart, wallet, payment, subscription, order) with the resource
+IDs it just created. Each service's run_local.py-style entrypoint loads that file
 into the real process environment at startup (see local-dev/_env_file.py)
 before constructing any client, so both this service's own settings and
 libraries that read env vars directly (e.g. boto3's native
@@ -304,6 +305,31 @@ def bootstrap_stock_changed_queue() -> str:
     return queue_url
 
 
+def bootstrap_order_events_queue() -> str:
+    """MA-25's `order-events-q` — Order Service's (MA-132) sole consumer
+    queue, fed by Subscription Service's (MA-131) `SubscriptionOrderDue`
+    on the same default bus, same queue-with-DLQ shape as the others."""
+    sqs = boto3.client("sqs", **_creds)
+    events = boto3.client("events", **_creds)
+
+    _dlq_url, dlq_arn = _get_or_create_queue(sqs, "order-events-q-dlq")
+    queue_url, queue_arn = _get_or_create_queue(
+        sqs,
+        "order-events-q",
+        Attributes={
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
+        },
+    )
+    _wire_rule(
+        events,
+        "SubscriptionOrderDueRule",
+        {"source": ["subscription"], "detail-type": ["SubscriptionOrderDue"]},
+        "subscription-order-due-target",
+        queue_arn,
+    )
+    return queue_url
+
+
 def bootstrap_wallet_events_queue() -> str:
     """MA-24's `wallet-events-q` — the single queue Wallet Service (MA-127)
     consumes: User Service's `UserRegistered` (MA-1 baseline) and Payment
@@ -377,6 +403,7 @@ def main() -> None:
     queue_url = bootstrap_sqs_and_eventbridge()
     stock_changed_queue_url = bootstrap_stock_changed_queue()
     wallet_events_queue_url = bootstrap_wallet_events_queue()
+    order_events_queue_url = bootstrap_order_events_queue()
 
     # AWS_ENDPOINT_URL (unprefixed): the standard env var name botocore
     # itself reads natively — written once per service's .env.local so
@@ -499,6 +526,40 @@ def main() -> None:
             # FakeGateway-backed unit/integration tests (real webhook
             # signature verification, real orders.create).
             "PAYMENT_CORS_ALLOW_ALL": "true",
+        },
+    )
+    _write_env_file(
+        "subscription",
+        {
+            "SUBSCRIPTION_DATABASE_URL": (
+                f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}"
+                "/milkful_subscription"
+            ),
+            "SUBSCRIPTION_AWS_REGION": REGION,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "SUBSCRIPTION_EVENT_BUS_NAME": "default",
+            "SUBSCRIPTION_CATALOG_BASE_URL": CATALOG_HTTP_URL,
+            # Local dev only — Flutter web's browser-origin CORS block,
+            # same reasoning as inventory/catalog/wallet's identical entries.
+            "SUBSCRIPTION_CORS_ALLOW_ALL": "true",
+        },
+    )
+    _write_env_file(
+        "order",
+        {
+            "ORDER_DATABASE_URL": (
+                f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/milkful_order"
+            ),
+            "ORDER_AWS_REGION": REGION,
+            "AWS_ENDPOINT_URL": ENDPOINT_URL,
+            "ORDER_EVENT_BUS_NAME": "default",
+            "ORDER_EVENTS_QUEUE_URL": order_events_queue_url,
+            "ORDER_USER_INTERNAL_BASE_URL": USER_HTTP_URL,
+            "ORDER_PRICING_BASE_URL": PRICING_HTTP_URL,
+            "ORDER_WALLET_INTERNAL_BASE_URL": WALLET_HTTP_URL,
+            # Local dev only — Flutter web's browser-origin CORS block,
+            # same reasoning as inventory/catalog/wallet's identical entries.
+            "ORDER_CORS_ALLOW_ALL": "true",
         },
     )
     print("\nDone. Next: python apply_migrations.py, then start each service.")
