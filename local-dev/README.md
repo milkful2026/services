@@ -16,11 +16,12 @@ them the way API Gateway would.
 - Docker Desktop running (`docker ps` should succeed)
 
 That's the only prerequisite for the all-Docker path below. The native (non-Docker) path further
-down additionally needs each service's own venv set up per its README (`identity-auth/README.md`,
-`user/README.md`, `inventory/README.md`, `catalog/README.md`) — `python -m venv .venv && pip
-install -r requirements-dev.txt` in each — and, from this directory, `pip install -r
-requirements.txt` (boto3, psycopg2-binary — used by `bootstrap.py`/`apply_migrations.py`/
-`peek_otp.py`, not by the services themselves).
+down additionally needs each service's own venv set up per its README (`identity-auth/`, `user/`,
+`inventory/`, `catalog/`, `cart/`, `pricing-offer/`, `wallet/`, `payment/`, `subscription/`,
+`order/`) — `python -m venv .venv && pip install -r requirements-dev.txt` in each — and, from
+this directory, `pip install -r requirements.txt` (boto3, psycopg2-binary, requests — used by
+`bootstrap.py`/`apply_migrations.py`/`peek_otp.py`/`run_daily_local.py`, not by the services
+themselves).
 
 ## Option A: everything in Docker (recommended)
 
@@ -31,10 +32,15 @@ docker compose up -d
 
 One command brings up the whole stack: `moto_server` (:5000), Postgres (:5432), Redis (:6379),
 a one-shot `bootstrap` container that waits for those to be healthy and then runs
-`bootstrap.py` + `apply_migrations.py` + all three `seed_*.py` scripts, and finally the four app
-services — identity-auth (:8001), user (:8002), inventory (:8000), catalog (:8003) — each built
-from its own `Dockerfile` (`identity-auth/Dockerfile`, `user/Dockerfile`, `catalog/Dockerfile`;
-`inventory/Dockerfile` already existed, it's also inventory's real production image).
+`bootstrap.py` + `apply_migrations.py` + all three `seed_*.py` scripts, and every app service —
+identity-auth (:8001), user (:8002), inventory (:8000), catalog (:8003), cart (:8004),
+pricing-offer (:8005), wallet (:8006), payment (:8007), subscription (:8008), order (:8009) —
+each built from its own `Dockerfile`, plus one outbox-drain sidecar per service that owns an
+outbox table (`cart-outbox`, `wallet-outbox`, `payment-outbox`, `subscription-outbox`,
+`order-outbox` — same image as the service, different `command:`). Until MA-25, only the first
+four of these had a compose entry at all (see "Known gaps" below for why cart/wallet/payment/
+pricing-offer's own entries, closed by MA-25's local-dev commit, were a real pre-existing gap and
+not something new to this feature).
 
 `bootstrap`'s output (`.env.local` per service, with `moto`/`postgres`/`redis`/`inventory`
 container hostnames instead of `localhost`) is written into a shared docker volume per service,
@@ -48,14 +54,23 @@ Same caveat as the native path: `moto_server` is in-memory, so `docker compose d
 compose up -d` re-runs `bootstrap` from scratch automatically; you don't need to do anything by
 hand. `docker compose down -v` additionally drops the Postgres data volume.
 
-**Not containerized**: `user/run_local_outbox_publisher.py` and `peek_otp.py` are one-off
-dev-only scripts, not long-running services — run those two natively (own venv) alongside the
-Docker stack, same as before:
+**Not containerized**: `user/run_local_outbox_publisher.py`, `wallet/src/handlers/
+invariant_check_handler.py`, and `peek_otp.py` are one-off dev-only scripts, not long-running
+services — run those natively (own venv) alongside the Docker stack, same as before:
 
 ```bash
 cd user && python run_local_outbox_publisher.py       # polls outbox every 5s (stands in for the
                                                        # real rate(1 minute) EventBridge Schedule)
+cd wallet && python src/handlers/invariant_check_handler.py   # nightly balance-invariant sweep;
+                                                       # run once by hand rather than waiting a
+                                                       # full day — not a long-running loop like
+                                                       # the outbox drains above, so it isn't one
+                                                       # of the containerized services either.
 ```
+
+Once Subscription/Order Service are both up (`docker compose up -d` already starts them),
+`python run_daily_local.py` fires Subscription Service's Daily Run on demand — see "Exercising
+subscriptions and orders" below.
 
 ## Option B: native (no service containers)
 
@@ -133,6 +148,25 @@ cd payment && python src/main.py                      # :8007 — Razorpay recha
                                                        # everything except those.
 cd payment && python src/handlers/outbox_publisher.py # drains PaymentConfirmed/PaymentFailed to
                                                        # EventBridge, same 5s-poll shape as cart's.
+cd subscription && python src/main.py                 # :8008 — subscriptions CRUD/lifecycle +
+                                                       # POST /internal/run-daily (MA-25 MA-131).
+                                                       # Real FastAPI app, no shim, no consumer
+                                                       # thread — nothing to consume.
+cd subscription && python src/handlers/outbox_publisher.py   # drains SubscriptionOrderDue to
+                                                       # EventBridge, same 5s-poll shape as cart's.
+cd order && python src/main.py                        # :8009 — orders/me + the order-events-q
+                                                       # consumer (MA-25 MA-132). Real FastAPI
+                                                       # app, no shim.
+cd order && python src/handlers/outbox_publisher.py   # drains OrderConfirmed/OrderPaymentFailed
+                                                       # to EventBridge, same 5s-poll shape as
+                                                       # cart's.
+cd local-dev && python run_daily_local.py             # fires POST :8008/internal/run-daily —
+                                                       # the documented Scheduler-emulation gap
+                                                       # (MA-131 §6/§11); run once per simulated
+                                                       # "day" once you have an ACTIVE subscription
+                                                       # due, then let the outbox drains above and
+                                                       # order's own consumer carry it the rest of
+                                                       # the way.
 ```
 
 ## Exercising registration + login
@@ -232,14 +266,59 @@ curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d
 # -> 404, errorCode: PRODUCT_PRICING_UNKNOWN
 ```
 
+## Exercising subscriptions and orders
+
+Full MA-25 chain, verified end-to-end against this exact Docker stack. Requires a registered
+user (see "Exercising registration + login" above) with an `<accessToken>`, and — since Wallet
+Service's own `UserRegistered` auto-provisioning has a real, separate bug (see "Known gaps"
+below) — a wallet you've funded some other way (`POST /wallet/me/recharge`'s real Razorpay path,
+or a direct `INSERT INTO wallets` for local testing only, keyed by the JWT `sub`, not the user
+service's own `userId`).
+
+```bash
+# 1. Create a DAILY subscription starting today. slotId isn't validated against real zone slots
+#    yet (MA-133's mobile slot picker — see the MA-25 implementation plan Step 6 — is what will
+#    resolve a real one; any non-empty string works here).
+curl -X POST localhost:8008/subscriptions -H "Authorization: Bearer <accessToken>" \
+  -H "Content-Type: application/json" -d '{
+    "productId": "cow-milk", "quantity": 1, "schedule": {"type": "DAILY"},
+    "startDate": "'"$(date +%Y-%m-%d)"'", "slotId": "morning-6-8",
+    "idempotencyKey": "local-test-1"
+  }'
+# -> subscriptionId, status: ACTIVE, nextDeliveryDate (today if before the IST cutoff hour,
+#    tomorrow otherwise — MA-131 §4's same-day-emission rule)
+
+# 2. Fire the Daily Run (stands in for the real EventBridge Scheduler rule — see run_daily_local.py)
+python run_daily_local.py
+# -> dueSubscriptionIds: [<subscriptionId>] if it's due on the run's target date (always
+#    "tomorrow" from the run's own perspective — see subscription_service.py's run_daily)
+
+# 3. The subscription-outbox/order-outbox containers (already running under Option A) drain
+#    SubscriptionOrderDue/OrderConfirmed within ~5s each; Order Service's own consumer thread
+#    picks the message up from order-events-q, resolves deliveryState via User Service, quotes
+#    via Pricing, debits via Wallet, all within the same request. Check the result:
+curl localhost:8009/orders/me -H "Authorization: Bearer <accessToken>"
+# -> one CONFIRMED order for the due delivery date, amountPaise matching the Pricing quote
+
+curl localhost:8006/wallet/me -H "Authorization: Bearer <accessToken>"
+# -> balancePaise decreased by exactly that amountPaise
+```
+
+Verified end-to-end against a real `moto_server` + Postgres while building the MA-25 local-dev
+wiring: subscription create → Daily Run → SubscriptionOrderDue → Order Service materialize →
+Pricing quote → Wallet debit → CONFIRMED order, wallet balance decremented by the exact quoted
+amount.
+
 ## How this fits together
 
 | Piece | What it does |
 |---|---|
-| `docker-compose.yml` | `moto_server` (all of Cognito/DynamoDB/SQS/EventBridge on one port), `postgres` (three databases, `milkful_user` + `milkful_inventory` + `milkful_catalog`, via `init-databases.sql`), `redis`, a one-shot `bootstrap` container, and (Option A) the four app services themselves — each built from its own `Dockerfile`. |
-| `Dockerfile.bootstrap` | Builds the one-shot `bootstrap` service's image (repo-root build context) — installs `local-dev/requirements.txt`, copies the whole repo in (needed for `apply_migrations.py`'s and the seed scripts' access to each service's `migrations/*.sql`), then runs `bootstrap.py && apply_migrations.py && seed_inventory_zones.py && seed_user_zone_slots.py && seed_catalog_products.py` and exits — the four app services' `depends_on: condition: service_completed_successfully` waits on that exit. |
-| `identity-auth/Dockerfile`, `user/Dockerfile` | Repo-root build context (so they can also copy `local-dev/_env_file.py` + `local-dev/_lambda_local_server.py`, which `run_local.py` needs) — otherwise just `pip install -r requirements-dev.txt` (needed for the shim's `PyJWT` dependency) then `python run_local.py`. |
+| `docker-compose.yml` | `moto_server` (all of Cognito/DynamoDB/SQS/EventBridge on one port), `postgres` (seven databases, via `init-databases.sql`), `redis`, a one-shot `bootstrap` container, and (Option A) every app service plus one outbox-drain sidecar per service that owns an outbox table — each built from its own `Dockerfile`. |
+| `Dockerfile.bootstrap` | Builds the one-shot `bootstrap` service's image (repo-root build context) — installs `local-dev/requirements.txt`, copies the whole repo in (needed for `apply_migrations.py`'s and the seed scripts' access to each service's `migrations/*.sql`), then runs `bootstrap.py && apply_migrations.py && seed_inventory_zones.py && seed_user_zone_slots.py && seed_catalog_products.py` and exits — every app service's `depends_on: condition: service_completed_successfully` waits on that exit. |
+| `identity-auth/Dockerfile`, `user/Dockerfile`, `cart/Dockerfile` | Repo-root build context (so they can also copy `local-dev/_env_file.py` + `local-dev/_lambda_local_server.py`, which `run_local.py` needs) — otherwise just `pip install -r requirements-dev.txt` (needed for the shim's `PyJWT` dependency) then `python run_local.py`. `cart/Dockerfile` is new (MA-25's local-dev commit) — cart never had one before, since it only ever ran natively. |
 | `catalog/Dockerfile` | Own-directory build context, same shape as the pre-existing `inventory/Dockerfile` — no `local-dev/` dependency, since `catalog/src/main.py`/`inventory/src/main.py` are real, self-contained FastAPI entrypoints. |
+| `wallet/Dockerfile`, `payment/Dockerfile`, `subscription/Dockerfile`, `order/Dockerfile` | Repo-root build context (so they can also copy `shared/` — `shared.adapters.retry`, `shared.adapters.outbox_event_publisher`, `shared.handlers.auth`) — `pip install -r requirements.txt` then `python main.py`. The outbox-drain sidecar for each reuses the same image with `command: ["python", "-m", "handlers.outbox_publisher"]` (`-m`, not a bare script path — a plain `python handlers/outbox_publisher.py` puts `handlers/` on `sys.path[0]` instead of `/app`, breaking every sibling import; caught by actually running the container, not just `docker compose config`). |
+| `pricing-offer/Dockerfile` | Own-directory build context, same shape as `catalog`/`inventory` — no DB, no AWS, no `.env.local` at all; `PRICING_CATALOG_BASE_URL`/`PRICING_CORS_ALLOW_ALL` are set directly in `docker-compose.yml`'s `environment:` block instead (see `pricing-offer/src/main.py`'s own docstring, which already anticipated this). |
 | `bootstrap.py` | Creates the Cognito pool/client, `otp_requests` DynamoDB table, `zone-updated`/`otp-requested-debug`/`stock-changed` SQS queues (each with a DLQ where applicable), and the EventBridge rules routing to them — the direct-boto3 equivalent of what `cdk deploy` provisions for real. Writes each service's `.env.local`, plus dummy `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (moto doesn't check these, but boto3's client construction raises `NoCredentialsError` without *something* present — true in a fresh container with no `~/.aws/credentials` even though it wasn't previously an issue on a host that already had these exported globally). `LOCAL_DEV_AWS_ENDPOINT_URL`/`LOCAL_DEV_DB_HOST`/`LOCAL_DEV_REDIS_HOST`/`LOCAL_DEV_INVENTORY_HTTP_URL` override the `localhost`-based defaults (used by the `bootstrap` compose service, pointing at `moto`/`postgres`/`redis`/`inventory` container hostnames instead); `LOCAL_DEV_ENV_OUTPUT_ROOT` overrides where `.env.local` gets written (a shared docker volume per service, for Option A, instead of the host path). |
 | `apply_migrations.py` | Runs each service's real `migrations/*.sql` against its local Postgres database, tracked in a `schema_migrations` table so re-runs only apply new files. |
 | `seed_inventory_zones.py` | Inserts one serviceability zone (pincode prefix `5600`) directly via SQL — there's no admin/write API for zones (MA-95 is read-only), so this is the only local option. Upserts, safe to re-run. |
@@ -250,6 +329,7 @@ curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d
 | `_catalog_seed_data.py` | Shared category/product fixture data used by `seed_catalog_products.py` — category ids/icon names match the Flutter catalog screen's own icon-mapping switch exactly. |
 | `_lambda_local_server.py` | Generic HTTP-to-Lambda-event shim (stdlib only). Each service's `run_local.py` supplies its own `{(method, path): handler}` table. Binds `0.0.0.0`, not `127.0.0.1` — a loopback-only bind works for a native/host run (the process *is* the machine) but is unreachable from outside a container's own network namespace, which is what Option A's published ports need. |
 | `peek_otp.py` | Local-only OTP visibility, since there's no real SMS provider to read the code from. |
+| `run_daily_local.py` | Fires Subscription Service's `POST /internal/run-daily` on demand — the documented Scheduler-emulation gap (MA-131 §6/§11); no local scheduler exists, so a developer triggers each simulated "day" by hand. |
 | `_env_file.py` | Loads `.env.local` into the real process environment (`os.environ`, via `setdefault` so real env vars always win) before any handler module is imported — used by each `run_local.py`/`run_local_outbox_publisher.py`; inventory's and catalog's `main.py` each carry a small inline duplicate since `local-dev/` isn't shipped in their container images. All four accept `ENV_LOCAL_PATH` to override where `.env.local` is read from (defaulting to the service's own directory) — set by the app services in Option A to point at the shared docker volume `bootstrap` wrote into, instead of a host path. |
 | `AWS_ENDPOINT_URL` | The standard, unprefixed env var botocore already reads natively — no application code needed. `bootstrap.py` writes it into each generated `.env.local`, pointing at `http://localhost:5000` (native) or `http://moto:5000` (Option A, via `LOCAL_DEV_AWS_ENDPOINT_URL`); unset in every real deployment, so behavior there is unaffected. |
 
@@ -257,9 +337,26 @@ curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d
 
 - ~~No Docker daemon was available in the sandbox this was built in~~ — since resolved: the full
   `docker compose up -d` path (Option A above, including the `bootstrap` one-shot container and
-  all four app services) has been verified end-to-end on a machine with Docker Desktop running —
-  cold `down` then `up` re-provisions everything and all four services respond correctly with no
-  manual steps.
+  every app service) has been verified end-to-end on a machine with Docker Desktop running — cold
+  `down` then `up` re-provisions everything and every service responds correctly with no manual
+  steps.
+- **`WalletService.create_wallet` reads `user_registered["userId"]`, but the real `UserRegistered`
+  event User Service emits never has that key** — `registration_service.py`'s own outbox payload
+  is `{"cognitoSub", "mobile", "defaultPincode"}`, so the consumer's `detail["userId"]` lookup
+  raises a `KeyError` every time, logged as `wallet_events_consumer: malformed message — left for
+  retry/DLQ`. Found by actually registering a user against this Docker stack and watching
+  `GET /wallet/me` stay stuck at `status: CREATING` / `balancePaise: 0` forever — every wallet's
+  auto-provisioning-on-registration path has apparently never worked against the real payload
+  shape (unit tests on both sides construct their own `detail` dicts directly, so the mismatch
+  was never exercised end-to-end before). `POST /wallet/me/retry` is unaffected — it calls
+  `create_wallet({"userId": user_id})` with the right key itself, using the JWT `sub` already
+  resolved by the HTTP layer. Likely a one-line fix (`registration_service.py`'s outbox payload
+  needs a `"userId": request.cognito_sub` entry — `wallet_events_consumer.py` confirms wallet
+  rows are keyed by the Cognito sub, same as every other service's `current_user_id()`), but it's
+  MA-1/MA-24 registration code, out of this local-dev-wiring commit's own scope — flagging here
+  rather than bundling an unrelated core-domain fix into an infra PR. The "Exercising
+  subscriptions and orders" recipe above works around it with a direct SQL insert for local
+  testing only.
 - **`moto[server]` must be a recent version (>=5.2.2) if you're running it standalone instead of
   via `docker compose`** (e.g. because Docker isn't available, same fallback used while building
   and testing MA-21's login flow this session). `moto[server]==5.0.21` has a real bug where
