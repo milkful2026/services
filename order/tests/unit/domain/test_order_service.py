@@ -19,7 +19,6 @@ def _materialize(service, **overrides):
         product_id="prod-1",
         quantity=2,
         delivery_date=DELIVERY_DATE,
-        slot_id="slot-1",
         correlation_id="corr-1",
     )
     kwargs.update(overrides)
@@ -149,6 +148,25 @@ class TestRedelivery:
         _materialize(service)
         _materialize(service)  # redelivered
         assert len(wallet_client.calls) == 1
+
+    def test_redelivered_message_for_pre_pricing_failure_is_noop(
+        self, service, repo, user_client, pricing_client, wallet_client
+    ):
+        # Regression: DELIVERY_ADDRESS_UNKNOWN/PRODUCT_UNAVAILABLE are now
+        # inserted directly as a terminal PAYMENT_FAILED row (one atomic
+        # write, no CREATED intermediate state) — a redelivery must see
+        # the order already resolved and no-op, never re-attempt the
+        # user-address lookup or a debit.
+        user_client.address_states["user-1"] = None
+        _materialize(service)
+        _materialize(service)  # redelivered
+        order = repo.get_by_subscription_and_date("sub-1", DELIVERY_DATE)
+        assert order.status == OrderStatus.PAYMENT_FAILED
+        assert wallet_client.calls == []
+        failed_events = [
+            e for e in repo.fetch_unpublished() if e["event_type"] == "OrderPaymentFailed"
+        ]
+        assert len(failed_events) == 1  # not duplicated
 
     def test_crash_between_insert_and_debit_resumes_at_debit_not_reinsert(
         self, service, repo, pricing_client, wallet_client

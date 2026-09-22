@@ -25,7 +25,9 @@ class OrderRepositoryPort(Protocol):
         self, order_id: str, confirmed_at: datetime, outbox_event_type: str, outbox_payload: dict
     ) -> Order:
         """One transaction: status -> CONFIRMED, confirmed_at set, and the
-        one OrderConfirmed outbox row inserted."""
+        one OrderConfirmed outbox row inserted — but only if the order is
+        still CREATED. A concurrent redelivery that already transitioned
+        this order is a no-op: no second update, no second outbox row."""
         ...
 
     def mark_payment_failed(
@@ -36,7 +38,20 @@ class OrderRepositoryPort(Protocol):
         outbox_payload: dict,
     ) -> Order:
         """One transaction: status -> PAYMENT_FAILED, failure_reason set,
-        and the one OrderPaymentFailed outbox row inserted."""
+        and the one OrderPaymentFailed outbox row inserted — but only if
+        the order is still CREATED, same concurrent-redelivery guard as
+        mark_confirmed."""
+        ...
+
+    def insert_payment_failed(
+        self, order: Order, outbox_event_type: str, outbox_payload: dict
+    ) -> Order:
+        """One transaction: inserts the order row already PAYMENT_FAILED
+        (amount_paise=0) plus its OrderPaymentFailed outbox row — for a
+        pre-pricing failure, where there is no CREATED intermediate state
+        to resume from. A concurrent duplicate insert (the same
+        UNIQUE(subscription_id, delivery_date) race insert_created
+        guards against) returns the winner's row rather than raising."""
         ...
 
     def get(self, order_id: str) -> Order | None: ...

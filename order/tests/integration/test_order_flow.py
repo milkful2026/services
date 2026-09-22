@@ -114,6 +114,27 @@ def test_insufficient_balance_flow_schema_validated(client, service, repo, walle
     assert detail["failureReason"] == "INSUFFICIENT_BALANCE"
 
 
+def test_pre_pricing_failure_flow_schema_validated(client, service, repo, user_client):
+    # Regression: OrderPaymentFailed.schema.json previously required
+    # amountPaise > 0, but DELIVERY_ADDRESS_UNKNOWN/PRODUCT_UNAVAILABLE
+    # always publish amountPaise=0 (no price was ever obtained) — this
+    # is the schema-validation coverage the review found missing (only
+    # INSUFFICIENT_BALANCE, which always has a real amount, was covered).
+    user_client.address_states["user-1"] = None
+    _consume(service, _sod())
+
+    order = repo.get_by_subscription_and_date("sub-1", DELIVERY_DATE)
+    assert order.status.value == "PAYMENT_FAILED"
+    assert order.failure_reason == "DELIVERY_ADDRESS_UNKNOWN"
+    assert order.amount_paise == 0
+
+    unpub = repo.fetch_unpublished()
+    failed = [e for e in unpub if e["event_type"] == "OrderPaymentFailed"]
+    assert len(failed) == 1
+    assert failed[0]["payload"]["amountPaise"] == 0
+    jsonschema.validate(failed[0]["payload"], load_schema("OrderPaymentFailed"))
+
+
 def test_get_someone_elses_order_is_404(client, service):
     _consume(service, _sod())
     r = client.get("/orders/me", headers=_bearer())

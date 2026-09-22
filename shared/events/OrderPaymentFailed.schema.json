@@ -22,7 +22,11 @@
     "orderId": { "type": "string", "minLength": 1 },
     "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
     "subscriptionId": { "type": "string", "minLength": 1 },
-    "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
+    "amountPaise": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "0 for DELIVERY_ADDRESS_UNKNOWN/PRODUCT_UNAVAILABLE — the order failed before a price was ever obtained. Strictly positive for INSUFFICIENT_BALANCE/WALLET_NOT_ACTIVE, which always have a real quoted amount."
+    },
     "reason": {
       "type": "string",
       "enum": ["INSUFFICIENT_BALANCE", "WALLET_NOT_ACTIVE", "PRODUCT_UNAVAILABLE", "DELIVERY_ADDRESS_UNKNOWN"]

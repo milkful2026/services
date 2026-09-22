@@ -81,9 +81,17 @@ class HttpPricingClient:
                     ) from exc
             if response.status_code == 404:
                 try:
-                    error_code = response.json().get("data", {}).get("errorCode")
+                    error_body = response.json()
                 except ValueError:
-                    error_code = None
+                    error_body = None
+                # A malformed 404 (valid JSON but not the expected
+                # object shape at either level — a bare list/string/null
+                # body, or a non-dict "data" — e.g. from a misbehaving
+                # proxy or an API Gateway default error page) must fall
+                # through to the generic retryable branch below, not
+                # raise an uncaught AttributeError.
+                error_data = error_body.get("data") if isinstance(error_body, dict) else None
+                error_code = error_data.get("errorCode") if isinstance(error_data, dict) else None
                 if error_code == "PRODUCT_PRICING_UNKNOWN":
                     # Not retryable and not a transport failure — a
                     # definite fact this attempt reports up as a typed

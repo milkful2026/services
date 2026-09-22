@@ -23,12 +23,22 @@ A `PAYMENT_FAILED` order created before a price was ever obtained (the
 address-unknown and product-unavailable cases, both necessarily *before*
 `amount_paise` exists) is recorded with `amount_paise = 0` — the
 migration's `CHECK` is `>= 0`, not `> 0`, specifically to allow this;
-every `CONFIRMED` order still has a real, positive amount.
+every `CONFIRMED` order still has a real, positive amount. Unlike the
+priced/debit path (insert `CREATED`, then a separate `mark_confirmed`/
+`mark_payment_failed` transition once a price and a debit outcome
+exist), these two pre-pricing reasons insert the order *already*
+`PAYMENT_FAILED`, atomically with their outbox row — there's no useful
+"resume" action for a redelivery to take mid-way through a case that
+was never going to reach the debit step, and `materialize`'s own
+crash-resume path always resumes a `CREATED` order at the debit step,
+which would otherwise attempt to debit the `amount_paise = 0`
+placeholder.
 """
 
 import logging
 import uuid
 from datetime import UTC, datetime
+from decimal import ROUND_HALF_UP, Decimal
 
 from adapters.interfaces import (
     PricingClientPort,
@@ -66,7 +76,6 @@ class OrderService:
         product_id: str,
         quantity: int,
         delivery_date,
-        slot_id: str,
         correlation_id: str | None,
     ) -> None:
         existing = self._repo.get_by_subscription_and_date(subscription_id, delivery_date)
@@ -88,43 +97,41 @@ class OrderService:
         delivery_state = self._user_client.get_delivery_address_state(user_id)
 
         if delivery_state is None:
-            order = self._repo.insert_created(
-                Order(
-                    id=new_order_id(),
-                    user_id=user_id,
-                    subscription_id=subscription_id,
-                    product_id=product_id,
-                    quantity=quantity,
-                    amount_paise=0,
-                    delivery_date=delivery_date,
-                    status=OrderStatus.CREATED,
-                )
+            self._insert_payment_failed_before_pricing(
+                subscription_id=subscription_id,
+                user_id=user_id,
+                product_id=product_id,
+                quantity=quantity,
+                delivery_date=delivery_date,
+                reason="DELIVERY_ADDRESS_UNKNOWN",
+                correlation_id=correlation_id,
             )
-            self._fail_payment(order, "DELIVERY_ADDRESS_UNKNOWN", correlation_id)
             return
 
         try:
             quote = self._pricing_client.quote(product_id, quantity, delivery_state)
         except ProductPricingUnknownError:
-            order = self._repo.insert_created(
-                Order(
-                    id=new_order_id(),
-                    user_id=user_id,
-                    subscription_id=subscription_id,
-                    product_id=product_id,
-                    quantity=quantity,
-                    amount_paise=0,
-                    delivery_date=delivery_date,
-                    status=OrderStatus.CREATED,
-                )
+            self._insert_payment_failed_before_pricing(
+                subscription_id=subscription_id,
+                user_id=user_id,
+                product_id=product_id,
+                quantity=quantity,
+                delivery_date=delivery_date,
+                reason="PRODUCT_UNAVAILABLE",
+                correlation_id=correlation_id,
             )
-            self._fail_payment(order, "PRODUCT_UNAVAILABLE", correlation_id)
             return
         # PricingUnavailableError propagates uncaught — message unacked.
 
         # Pricing/Catalog return rupees; this service (and Wallet's debit
         # call) are paise throughout, matching every other service.
-        amount_paise = round(quote.net_payable * 100)
+        # Decimal, not round() on the float directly — net_payable is
+        # already rounded to 2dp by Pricing Service, but binary-float
+        # representation error on that value can shift round(x*100) off
+        # by one paise for a value that lands near a rounding boundary.
+        amount_paise = int(
+            (Decimal(str(quote.net_payable)) * 100).to_integral_value(rounding=ROUND_HALF_UP)
+        )
         order = self._repo.insert_created(
             Order(
                 id=new_order_id(),
@@ -138,6 +145,47 @@ class OrderService:
             )
         )
         self._debit_and_finalize(order, correlation_id)
+
+    def _insert_payment_failed_before_pricing(
+        self,
+        *,
+        subscription_id: str,
+        user_id: str,
+        product_id: str,
+        quantity: int,
+        delivery_date,
+        reason: str,
+        correlation_id: str | None,
+    ) -> None:
+        """Shared by the two failure paths that precede ever getting a
+        price (no default address on file; Catalog has no such product)
+        — both necessarily amount_paise=0. Inserted directly as a
+        terminal PAYMENT_FAILED row (see insert_payment_failed's own
+        docstring for why this must be one atomic write rather than
+        insert-CREATED-then-fail)."""
+        order = Order(
+            id=new_order_id(),
+            user_id=user_id,
+            subscription_id=subscription_id,
+            product_id=product_id,
+            quantity=quantity,
+            amount_paise=0,
+            delivery_date=delivery_date,
+            status=OrderStatus.PAYMENT_FAILED,
+            failure_reason=reason,
+        )
+        payload = {
+            "eventId": str(uuid.uuid4()),
+            "occurredAt": datetime.now(UTC).isoformat(),
+            "correlationId": correlation_id or "",
+            "orderId": order.id,
+            "userId": user_id,
+            "subscriptionId": subscription_id,
+            "amountPaise": 0,
+            "reason": reason,
+        }
+        order = self._repo.insert_payment_failed(order, "OrderPaymentFailed", payload)
+        logger.info("order.payment_failed", extra={"orderId": order.id, "reason": reason})
 
     def _debit_and_finalize(self, order: Order, correlation_id: str | None) -> None:
         # Deliberately outside any DB transaction — an external HTTP call

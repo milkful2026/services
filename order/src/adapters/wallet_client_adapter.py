@@ -71,9 +71,11 @@ class HttpWalletClient:
             if response.status_code == 200:
                 try:
                     data = response.json()["data"]
-                    return DebitResult(
-                        status=data["status"], balance_after_paise=data.get("balanceAfterPaise")
-                    )
+                    # DEBITED carries balanceAfterPaise; INSUFFICIENT_BALANCE
+                    # carries balancePaise instead (wallet/src/handlers/dto.py's
+                    # serialize_debit_outcome) — WALLET_NOT_ACTIVE has neither.
+                    balance = data.get("balanceAfterPaise", data.get("balancePaise"))
+                    return DebitResult(status=data["status"], balance_after_paise=balance)
                 except (ValueError, KeyError, TypeError) as exc:
                     raise _RetryableWalletError(
                         f"malformed 200 body from Wallet: {exc}"

@@ -177,18 +177,29 @@ class SqlAlchemyOrderRepository:
     ) -> Order:
         with self._db_operation("mark_confirmed", "Failed to confirm order"):
             with self._engine.begin() as conn:
-                conn.execute(
+                result = conn.execute(
                     orders_table.update()
-                    .where(orders_table.c.id == order_id)
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.status == OrderStatus.CREATED.value,
+                    )
                     .values(status=OrderStatus.CONFIRMED.value, confirmed_at=confirmed_at)
                 )
-                conn.execute(
-                    outbox_table.insert().values(
-                        aggregate_id=order_id,
-                        event_type=outbox_event_type,
-                        payload=outbox_payload,
+                if result.rowcount:
+                    # Only the caller that actually transitions
+                    # CREATED -> CONFIRMED publishes the event — two
+                    # concurrent redeliveries both resuming the same
+                    # CREATED order (materialize's own race window) must
+                    # not each publish an OrderConfirmed with a fresh
+                    # eventId for an order the other one already
+                    # confirmed.
+                    conn.execute(
+                        outbox_table.insert().values(
+                            aggregate_id=order_id,
+                            event_type=outbox_event_type,
+                            payload=outbox_payload,
+                        )
                     )
-                )
         return self.get(order_id)
 
     def mark_payment_failed(
@@ -200,19 +211,75 @@ class SqlAlchemyOrderRepository:
     ) -> Order:
         with self._db_operation("mark_payment_failed", "Failed to fail order"):
             with self._engine.begin() as conn:
-                conn.execute(
+                result = conn.execute(
                     orders_table.update()
-                    .where(orders_table.c.id == order_id)
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.status == OrderStatus.CREATED.value,
+                    )
                     .values(status=OrderStatus.PAYMENT_FAILED.value, failure_reason=failure_reason)
                 )
-                conn.execute(
-                    outbox_table.insert().values(
-                        aggregate_id=order_id,
-                        event_type=outbox_event_type,
-                        payload=outbox_payload,
+                if result.rowcount:
+                    # Same concurrent-redelivery guard as mark_confirmed.
+                    conn.execute(
+                        outbox_table.insert().values(
+                            aggregate_id=order_id,
+                            event_type=outbox_event_type,
+                            payload=outbox_payload,
+                        )
                     )
-                )
         return self.get(order_id)
+
+    def insert_payment_failed(
+        self, order: Order, outbox_event_type: str, outbox_payload: dict
+    ) -> Order:
+        """Inserts a *terminal* PAYMENT_FAILED order and its outbox row
+        atomically, in one transaction — for a pre-pricing failure
+        (DELIVERY_ADDRESS_UNKNOWN/PRODUCT_UNAVAILABLE), always
+        amount_paise=0. Unlike insert_created (which always starts a row
+        at CREATED for the priced/debit path, later transitioned by
+        mark_confirmed/mark_payment_failed), this never leaves a crash
+        window where the row sits CREATED with no real amount — either
+        both writes land together or neither does. That matters because
+        materialize()'s crash-resume path (`existing.status == CREATED`)
+        always resumes at the *debit* step; a CREATED row with
+        amount_paise=0 left behind by a crash between a separate insert
+        and a separate fail-payment call would resume by debiting 0
+        paise, which Wallet's own validation rejects."""
+        with self._db_operation("insert_payment_failed", "Failed to record order failure"):
+            try:
+                with self._engine.begin() as conn:
+                    conn.execute(
+                        orders_table.insert().values(
+                            id=order.id,
+                            user_id=order.user_id,
+                            subscription_id=order.subscription_id,
+                            product_id=order.product_id,
+                            quantity=order.quantity,
+                            amount_paise=order.amount_paise,
+                            delivery_date=order.delivery_date,
+                            status=OrderStatus.PAYMENT_FAILED.value,
+                            failure_reason=order.failure_reason,
+                        )
+                    )
+                    conn.execute(
+                        outbox_table.insert().values(
+                            aggregate_id=order.id,
+                            event_type=outbox_event_type,
+                            payload=outbox_payload,
+                        )
+                    )
+                return order
+            except IntegrityError:
+                # Same narrow concurrent-redelivery race insert_created
+                # guards against — the winner's atomic insert+outbox
+                # already landed, so there's nothing further to do.
+                existing = self.get_by_subscription_and_date(
+                    order.subscription_id, order.delivery_date
+                )
+                if existing is None:
+                    raise
+                return existing
 
     def get(self, order_id: str) -> Order | None:
         with self._db_operation("get", "Failed to load order"):

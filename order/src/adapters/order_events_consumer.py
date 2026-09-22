@@ -103,7 +103,6 @@ class OrderEventsConsumer:
                 product_id=detail["productId"],
                 quantity=detail["quantity"],
                 delivery_date=date.fromisoformat(detail["deliveryDate"]),
-                slot_id=detail["slotId"],
                 correlation_id=detail.get("correlationId"),
             )
             return
