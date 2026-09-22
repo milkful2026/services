@@ -4,7 +4,9 @@ task in prod. Never invoked from the request or SQS-consumer path.
 """
 
 import logging
+import os
 import time
+from pathlib import Path
 
 from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from sqlalchemy import create_engine
@@ -14,6 +16,23 @@ from adapters.order_repository import SqlAlchemyOrderRepository
 from config.env import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _load_local_env_file() -> None:
+    # Same shim main.py carries — needed here too, since this runs as its
+    # own process/container (services/local-dev's order-outbox service),
+    # not imported by main.py, so main.py's own call to this never runs
+    # for this entrypoint.
+    path = Path(
+        os.environ.get("ENV_LOCAL_PATH", str(Path(__file__).resolve().parents[2] / ".env.local"))
+    )
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
 
 
 def run_once(repo: SqlAlchemyOrderRepository, publisher: EventBridgeOutboxPublisher) -> int:
@@ -49,5 +68,6 @@ def run_forever(interval_seconds: float = 5.0, engine: Engine | None = None) -> 
 
 
 if __name__ == "__main__":
+    _load_local_env_file()
     logging.basicConfig(level=logging.INFO)
     run_forever()
