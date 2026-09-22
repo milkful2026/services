@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/OrderConfirmed.schema.json",
+  "title": "OrderConfirmed",
+  "description": "EventBridge `detail` for a subscription order successfully paid via wallet debit. Producer: milkful.order (MA-132). Consumers: Notification Service (future); Reporting.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "occurredAt",
+    "correlationId",
+    "orderId",
+    "userId",
+    "subscriptionId",
+    "productId",
+    "quantity",
+    "amountPaise",
+    "deliveryDate"
+  ],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1, "description": "Dedupe key for consumers." },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "minLength": 1 },
+    "orderId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
+    "subscriptionId": { "type": "string", "minLength": 1 },
+    "productId": { "type": "string", "minLength": 1 },
+    "quantity": { "type": "integer", "exclusiveMinimum": 0 },
+    "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
+    "deliveryDate": { "type": "string", "format": "date" }
+  }
+}

@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [cart, catalog, identity-auth, inventory, user, pricing-offer, wallet, payment, subscription]
+        service: [cart, catalog, identity-auth, inventory, user, pricing-offer, wallet, payment, subscription, order]
     defaults:
       run:
         working-directory: ${{ matrix.service }}
