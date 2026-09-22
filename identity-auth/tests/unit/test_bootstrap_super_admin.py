@@ -35,6 +35,30 @@ def test_dry_run_makes_no_changes_and_returns_zero(capsys):
     assert "No changes made" in captured.out
 
 
+def test_dry_run_with_set_password_makes_no_changes(capsys):
+    # --set-password only changes behavior on the --execute path (see
+    # module docstring) — a dry run must still touch nothing.
+    exit_code = bootstrap_super_admin.main(
+        [
+            "--email",
+            "superadmin@milkful.test",
+            "--name",
+            "First Super Admin",
+            "--admin-pool-id",
+            "ap-south-1_fake",
+            "--database-url",
+            "postgresql+psycopg2://user:pass@host:5432/admin",
+            "--set-password",
+            "Sup3rS3cret!",
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "DRY RUN" in captured.out
+    assert "No changes made" in captured.out
+
+
 def test_missing_required_argument_exits_nonzero():
     with pytest.raises(SystemExit):
         bootstrap_super_admin.main(["--email", "x@milkful.test"])

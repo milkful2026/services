@@ -16,6 +16,19 @@ real authorizer anywhere else. Requires PyJWT — already a dependency of
 identity-auth; added to user/inventory's requirements-dev.txt purely for
 this shim (their own handler code never imports it).
 
+Lambda REQUEST authorizers (distinct from the built-in JWT authorizer
+type above): a route's value may be a plain `handler(event, context)`
+function (every existing route in every service — unchanged), or a
+`(handler, authorizer)` tuple. When an `authorizer` is given, it's
+invoked first with the same `event`; a `{"isAuthorized": False, ...}`
+result short-circuits to 403 without calling `handler`, and a `True`
+result merges the authorizer's returned `context` dict into
+`event["requestContext"]["authorizer"]["lambda"]` — the exact shape API
+Gateway HTTP API v2 produces for a real Lambda REQUEST authorizer —
+before `handler` runs. Real API Gateway invokes the authorizer as a
+genuinely separate Lambda; here it's just a second Python call in the
+same process, but the event shape `handler` sees is the same either way.
+
 CORS: a real API Gateway deployment sits behind whatever origin the
 Flutter app is served from, so cross-origin isn't a concern there. This
 shim serves the Flutter web build (a different localhost port) directly
@@ -78,7 +91,7 @@ def _decode_jwt_claims(auth_header: str | None) -> dict:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Max-Age": "86400",
 }
@@ -106,15 +119,16 @@ def _make_handler(routes: dict):
 
         def _dispatch(self, method: str) -> None:
             parsed = urlsplit(self.path)
-            route_fn = routes.get((method, parsed.path))
+            route_entry = routes.get((method, parsed.path))
             path_params: dict[str, str] = {}
-            if route_fn is None:
-                route_fn, path_params = _match_parameterized_route(routes, method, parsed.path)
+            if route_entry is None:
+                route_entry, path_params = _match_parameterized_route(routes, method, parsed.path)
                 path_params = path_params or {}
-            if route_fn is None:
+            if route_entry is None:
                 body = json.dumps({"error": f"no local route for {method} {parsed.path}"}).encode()
                 self._write(404, body, {"Content-Type": "application/json"})
                 return
+            route_fn, authorizer_fn = route_entry if isinstance(route_entry, tuple) else (route_entry, None)
 
             content_length = int(self.headers.get("Content-Length", 0) or 0)
             request_body = self.rfile.read(content_length).decode("utf-8") if content_length else ""
@@ -131,6 +145,13 @@ def _make_handler(routes: dict):
             }
 
             try:
+                if authorizer_fn is not None:
+                    auth_result = authorizer_fn(event, None)
+                    if not auth_result.get("isAuthorized"):
+                        body = json.dumps({"error": "forbidden"}).encode()
+                        self._write(403, body, {"Content-Type": "application/json"})
+                        return
+                    event["requestContext"]["authorizer"]["lambda"] = auth_result.get("context") or {}
                 response = route_fn(event, None)
             except Exception:
                 # Real API Gateway would never see this — Lambda's own
@@ -161,6 +182,9 @@ def _make_handler(routes: dict):
 
         def do_PUT(self) -> None:
             self._dispatch("PUT")
+
+        def do_PATCH(self) -> None:
+            self._dispatch("PATCH")
 
         def do_DELETE(self) -> None:
             self._dispatch("DELETE")
