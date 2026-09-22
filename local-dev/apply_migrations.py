@@ -29,6 +29,7 @@ _TARGETS = [
     ("catalog", "milkful_catalog"),
     ("wallet", "milkful_wallet"),
     ("payment", "milkful_payment"),
+    ("identity-auth", "milkful_identity_auth"),
     ("subscription", "milkful_subscription"),
     ("order", "milkful_order"),
 ]

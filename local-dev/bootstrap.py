@@ -154,6 +154,76 @@ def bootstrap_cognito() -> tuple[str, str]:
     return pool_id, client_id
 
 
+_ADMIN_GROUPS = ["Ops", "Finance", "Support", "Marketing", "SuperAdmin"]
+
+
+def bootstrap_admin_cognito() -> tuple[str, str]:
+    """MA-129's Admin Pool — a second, separate Cognito User Pool from
+    the consumer one above (spec §11.1's explicit human decision:
+    isolates a small set of highly-privileged accounts from the
+    OTP-based consumer pool). Same look-before-create idempotency
+    reasoning as bootstrap_cognito() above.
+
+    Does NOT set MfaConfiguration/SoftwareTokenMfaConfiguration —
+    confirmed empirically that moto's AdminInitiateAuth returns
+    AuthenticationResult directly regardless (no SOFTWARE_TOKEN_MFA
+    ChallengeName ever appears), so configuring it here would be
+    cosmetic only and could mislead a developer inspecting the pool
+    into expecting enforcement that doesn't happen. The real MFA step
+    is stood in for locally by _admin_local_dev.py's
+    LocalDevAdminCognitoAdapter (see identity-auth/run_local.py) — the
+    same "moto can't do this, so local-dev tooling fakes it" pattern
+    peek_otp.py already uses for SMS OTP delivery.
+    """
+    client = boto3.client("cognito-idp", **_creds)
+
+    pools = client.list_user_pools(MaxResults=60)["UserPools"]
+    existing_pool = next((p for p in pools if p["Name"] == "milkful-admin-local"), None)
+    if existing_pool is not None:
+        pool_id = existing_pool["Id"]
+        print(f"[cognito] admin user pool milkful-admin-local already exists ({pool_id}), skipping")
+    else:
+        try:
+            pool = client.create_user_pool(
+                PoolName="milkful-admin-local",
+                UsernameAttributes=["email"],
+                AutoVerifiedAttributes=["email"],
+            )
+            pool_id = pool["UserPool"]["Id"]
+            print(f"[cognito] created admin user pool {pool_id}")
+        except ClientError as exc:
+            print(f"[cognito] create_user_pool (admin) failed: {exc}", file=sys.stderr)
+            raise
+
+    for group_name in _ADMIN_GROUPS:
+        try:
+            client.create_group(UserPoolId=pool_id, GroupName=group_name)
+            print(f"[cognito] created admin group {group_name}")
+        except ClientError as exc:
+            if _ignore_already_exists(exc, "GroupExistsException"):
+                print(f"[cognito] admin group {group_name} already exists, skipping")
+            else:
+                raise
+
+    pool_clients = client.list_user_pool_clients(UserPoolId=pool_id, MaxResults=60)["UserPoolClients"]
+    existing_client = next(
+        (c for c in pool_clients if c["ClientName"] == "milkful-admin-local-client"), None
+    )
+    if existing_client is not None:
+        client_id = existing_client["ClientId"]
+        print(f"[cognito] admin app client milkful-admin-local-client already exists ({client_id}), skipping")
+    else:
+        client_resp = client.create_user_pool_client(
+            UserPoolId=pool_id,
+            ClientName="milkful-admin-local-client",
+            GenerateSecret=False,
+            ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        )
+        client_id = client_resp["UserPoolClient"]["ClientId"]
+        print(f"[cognito] created admin app client {client_id}")
+    return pool_id, client_id
+
+
 def bootstrap_dynamodb() -> str:
     client = boto3.client("dynamodb", **_creds)
     table_name = "otp_requests"
@@ -398,6 +468,7 @@ def _write_env_file(service_dir: str, values: dict[str, str]) -> None:
 
 def main() -> None:
     pool_id, client_id = bootstrap_cognito()
+    admin_pool_id, admin_client_id = bootstrap_admin_cognito()
     table_name = bootstrap_dynamodb()
     cart_table_name = bootstrap_cart_table()
     queue_url = bootstrap_sqs_and_eventbridge()
@@ -422,6 +493,11 @@ def main() -> None:
             "IDENTITY_AUTH_REDIS_PORT": str(REDIS_PORT),
             "IDENTITY_AUTH_REDIS_USE_TLS": "false",
             "IDENTITY_AUTH_EVENT_BUS_NAME": "default",
+            "IDENTITY_AUTH_ADMIN_COGNITO_USER_POOL_ID": admin_pool_id,
+            "IDENTITY_AUTH_ADMIN_COGNITO_CLIENT_ID": admin_client_id,
+            "IDENTITY_AUTH_ADMIN_DATABASE_URL": (
+                f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/milkful_identity_auth"
+            ),
         },
     )
     _write_env_file(
