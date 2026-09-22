@@ -214,6 +214,21 @@ def test_get_me_after_registration_returns_b2c_profile(wired_env, cognito_user_p
     assert data["mobile"] == resolved_mobile == "+919876543210"
     assert data["accountType"] == "B2C"
     assert data["defaultAddressId"]
+    assert data["defaultAddressZoneId"] is None
+
+
+@responses_lib.activate
+def test_get_me_returns_zone_id_when_address_supplied_it(wired_env, cognito_user_pool):
+    _mock_inventory_serviceable(True)
+    sub, _ = _register_cognito_user(cognito_user_pool, mobile="+919876543299")
+    body = json.loads(json.dumps(_VALID_BODY))
+    body["addresses"][0]["zoneId"] = "zone-blr-1"
+
+    register_handler.handler(_event(body, sub=sub), None)
+    response = get_me_handler.handler(_get_me_event(sub), None)
+
+    data = json.loads(response["body"])["data"]
+    assert data["defaultAddressZoneId"] == "zone-blr-1"
 
 
 def test_get_me_for_unregistered_sub_returns_404(wired_env):

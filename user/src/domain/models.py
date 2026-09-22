@@ -13,6 +13,7 @@ class Address:
     lng: float
     landmark: str | None = None
     is_default: bool = False
+    zone_id: str | None = None
     id: str | None = None  # assigned on insert
 
 
@@ -59,3 +60,5 @@ class UserProfile:
     account_type: str  # "B2C" | "B2B" — always "B2C" until a B2B onboarding path exists
     default_address_id: str
     default_address_state: str | None = None  # None when no default address is set
+    # None when no default address, or it predates zone_id
+    default_address_zone_id: str | None = None

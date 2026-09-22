@@ -35,6 +35,7 @@ class AddressDto(BaseModel):
     lng: float
     landmark: str | None = None
     is_default: bool = Field(alias="isDefault", default=False)
+    zone_id: str | None = Field(alias="zoneId", default=None)
 
     model_config = {"populate_by_name": True}
 
@@ -73,6 +74,7 @@ class RegisterRequestDto(BaseModel):
                     lng=a.lng,
                     landmark=a.landmark,
                     is_default=a.is_default,
+                    zone_id=a.zone_id,
                 )
                 for a in self.addresses
             ],
@@ -107,6 +109,7 @@ def serialize_user_profile(profile: UserProfile) -> dict[str, Any]:
         "accountType": profile.account_type,
         "defaultAddressId": profile.default_address_id,
         "defaultAddressState": profile.default_address_state,
+        "defaultAddressZoneId": profile.default_address_zone_id,
     }
 
 

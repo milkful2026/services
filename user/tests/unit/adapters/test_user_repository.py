@@ -4,7 +4,12 @@ import pytest
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from adapters.user_repository import SqlAlchemyUserRepository, users_table, zone_slots_table
+from adapters.user_repository import (
+    SqlAlchemyUserRepository,
+    addresses_table,
+    users_table,
+    zone_slots_table,
+)
 from domain.exceptions import ExternalServiceUnavailableError
 from domain.models import Address, Consent
 
@@ -228,6 +233,51 @@ def test_get_profile_by_sub_returns_profile_defaulting_to_b2c(repository):
     assert profile.account_type == "B2C"
     assert profile.default_address_id == registered.default_address_id
     assert profile.default_address_state == "Karnataka"
+    assert profile.default_address_zone_id is None
+
+
+def test_register_persists_zone_id_on_address_row(repository, sqlite_engine):
+    registered = repository.register(
+        cognito_sub="sub-zone",
+        mobile="+919876543212",
+        name="Zoya Khan",
+        email=None,
+        addresses=[_address(zone_id="zone-blr-1")],
+        preferred_slot_id=None,
+        consents=_consents(),
+        outbox_event_type="UserRegistered",
+        outbox_payload={},
+    )
+
+    with sqlite_engine.connect() as conn:
+        address_row = conn.execute(
+            addresses_table.select().where(addresses_table.c.id == registered.default_address_id)
+        ).fetchone()
+    assert address_row.zone_id == "zone-blr-1"
+
+    profile = repository.get_profile_by_sub("sub-zone")
+    assert profile.default_address_zone_id == "zone-blr-1"
+
+
+def test_register_persists_null_zone_id_when_not_supplied(repository, sqlite_engine):
+    # Backward-compatible with any client that predates this field.
+    registered = repository.register(
+        cognito_sub="sub-no-zone",
+        mobile="+919876543213",
+        name="No Zone",
+        email=None,
+        addresses=[_address()],
+        preferred_slot_id=None,
+        consents=_consents(),
+        outbox_event_type="UserRegistered",
+        outbox_payload={},
+    )
+
+    with sqlite_engine.connect() as conn:
+        address_row = conn.execute(
+            addresses_table.select().where(addresses_table.c.id == registered.default_address_id)
+        ).fetchone()
+    assert address_row.zone_id is None
 
 
 def test_get_profile_by_sub_returns_null_state_when_no_default_address(repository):
@@ -249,6 +299,7 @@ def test_get_profile_by_sub_returns_null_state_when_no_default_address(repositor
     assert registered.default_address_id == ""
     assert profile.default_address_id == ""
     assert profile.default_address_state is None
+    assert profile.default_address_zone_id is None
 
 
 def test_account_type_check_constraint_rejects_invalid_value(repository, sqlite_engine):

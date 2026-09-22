@@ -65,6 +65,10 @@ addresses_table = Table(
     Column("lng", Float, nullable=False),
     Column("landmark", String(255), nullable=True),
     Column("is_default", Boolean, nullable=False, default=False),
+    # Added by migrations/0003_add_zone_id.sql — MA-25 Step 6 companion
+    # change. Nullable: existing rows, and any registration predating
+    # the mobile client sending zoneId, have none.
+    Column("zone_id", String(64), nullable=True),
 )
 
 user_consents_table = Table(
@@ -182,6 +186,7 @@ class SqlAlchemyUserRepository:
             account_type=user_row.account_type,
             default_address_id=default_row.id if default_row else "",
             default_address_state=default_row.state if default_row else None,
+            default_address_zone_id=default_row.zone_id if default_row else None,
         )
 
     def register(
@@ -243,6 +248,7 @@ class SqlAlchemyUserRepository:
                             lng=address.lng,
                             landmark=address.landmark,
                             is_default=address.is_default,
+                            zone_id=address.zone_id,
                         )
                     )
 
