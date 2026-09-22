@@ -9,6 +9,7 @@ Authoritative JSON Schema (draft 2020-12) definitions for the EventBridge
 | `PaymentFailed` | Payment Service | Notification Service; Reporting |
 | `WalletCredited` | Wallet Service (`milkful.wallet`, MA-127) | Notification Service (optional push); Reporting |
 | `SubscriptionOrderDue` | Subscription Service (`milkful.subscription`, MA-131) | Order Service `order-events-q` |
+| `OrderConfirmed` | Order Service (`milkful.order`, MA-132) | Notification Service (future); Reporting |
 | `OrderPaymentFailed` | Order Service (`milkful.order`, MA-132) | Notification Service (future); Reporting |
 | `WalletDebited` | Wallet Service (MA-130 debit extension) | Reporting; Notification Service (future) |
 | `WalletLowBalance` | Wallet Service (MA-130 debit extension) | Notification Service (future); Reporting |

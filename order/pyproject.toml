@@ -1,0 +1,26 @@
+[project]
+name = "order"
+version = "0.1.0"
+description = "Milkful Order Service — materializes a subscription's due delivery into a real, paid Order (MA-99 / MA-25 MA-132)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "src" for this service's own modules; ".." (services/) so
+# `from shared.events import load_schema` and `shared.adapters.retry`
+# resolve the cross-service shared/ package — matches every other service.
+pythonpath = ["src", ".."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI's `Depends(...)` / `Query(...)` in parameter defaults is the
+# framework's required idiom, not a bug (same pattern across every service).
+ignore = ["B008"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
