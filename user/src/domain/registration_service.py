@@ -112,7 +112,17 @@ class RegistrationService:
             consents=request.consents,
             outbox_event_type="UserRegistered",
             outbox_payload={
-                "cognitoSub": request.cognito_sub,
+                # Wallet Service's create_wallet() reads `userId` (MA-134 —
+                # every real UserRegistered event previously raised a
+                # KeyError there, since this payload never had that key at
+                # all, only `cognitoSub`). Every service's own
+                # current_user_id() resolves identity from the Cognito sub,
+                # so wallet rows (and any other consumer's identity-keyed
+                # state) are keyed by it too, not User Service's internal
+                # user_id — renamed rather than added alongside, since
+                # nothing else in this codebase reads `cognitoSub` off this
+                # specific event (confirmed via a full repo grep).
+                "userId": request.cognito_sub,
                 "mobile": request.mobile,
                 "defaultPincode": default_address.pincode,
             },

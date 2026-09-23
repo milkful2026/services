@@ -271,11 +271,10 @@ curl -X POST localhost:8005/pricing/quote -H "Content-Type: application/json" -d
 ## Exercising subscriptions and orders
 
 Full MA-25 chain, verified end-to-end against this exact Docker stack. Requires a registered
-user (see "Exercising registration + login" above) with an `<accessToken>`, and — since Wallet
-Service's own `UserRegistered` auto-provisioning has a real, separate bug (see "Known gaps"
-below) — a wallet you've funded some other way (`POST /wallet/me/recharge`'s real Razorpay path,
-or a direct `INSERT INTO wallets` for local testing only, keyed by the JWT `sub`, not the user
-service's own `userId`).
+user (see "Exercising registration + login" above) with an `<accessToken>` — registration now
+auto-provisions a wallet for the new user via `UserRegistered` (MA-134, see "Known gaps" below
+for the history), so no manual funding step is needed before recharging it:
+`POST /wallet/me/recharge`'s real Razorpay path.
 
 ```bash
 # 1. Create a DAILY subscription starting today. slotId isn't validated against real zone slots
@@ -414,23 +413,21 @@ env var (or set it to anything else) for the default, backend-independent MSW-mo
   every app service) has been verified end-to-end on a machine with Docker Desktop running — cold
   `down` then `up` re-provisions everything and every service responds correctly with no manual
   steps.
-- **`WalletService.create_wallet` reads `user_registered["userId"]`, but the real `UserRegistered`
-  event User Service emits never has that key** — `registration_service.py`'s own outbox payload
-  is `{"cognitoSub", "mobile", "defaultPincode"}`, so the consumer's `detail["userId"]` lookup
-  raises a `KeyError` every time, logged as `wallet_events_consumer: malformed message — left for
-  retry/DLQ`. Found by actually registering a user against this Docker stack and watching
-  `GET /wallet/me` stay stuck at `status: CREATING` / `balancePaise: 0` forever — every wallet's
-  auto-provisioning-on-registration path has apparently never worked against the real payload
-  shape (unit tests on both sides construct their own `detail` dicts directly, so the mismatch
-  was never exercised end-to-end before). `POST /wallet/me/retry` is unaffected — it calls
-  `create_wallet({"userId": user_id})` with the right key itself, using the JWT `sub` already
-  resolved by the HTTP layer. Likely a one-line fix (`registration_service.py`'s outbox payload
-  needs a `"userId": request.cognito_sub` entry — `wallet_events_consumer.py` confirms wallet
-  rows are keyed by the Cognito sub, same as every other service's `current_user_id()`), but it's
-  MA-1/MA-24 registration code, out of this local-dev-wiring commit's own scope — flagging here
-  rather than bundling an unrelated core-domain fix into an infra PR. The "Exercising
-  subscriptions and orders" recipe above works around it with a direct SQL insert for local
-  testing only.
+- ~~`WalletService.create_wallet` reads `user_registered["userId"]`, but the real `UserRegistered`
+  event User Service emits never has that key~~ — fixed (MA-134). Two real bugs, found by actually
+  registering a user against this Docker stack and watching `GET /wallet/me` stay stuck at
+  `status: CREATING` / `balancePaise: 0` forever (unit tests on both sides construct their own
+  `detail` dicts directly, so neither mismatch was ever exercised end-to-end before): (1)
+  `registration_service.py`'s own outbox payload had `cognitoSub`, not `userId` — renamed, since
+  every service's own `current_user_id()` resolves identity from the Cognito sub, so wallet rows
+  are keyed by it too; and (2) User Service publishes `UserRegistered` through its own, older
+  `adapters/outbox_event_publisher.py` (predates `shared/`'s, and Cart still has an identical
+  copy), which wraps the actual domain payload one level deeper than every event published via
+  the shared publisher does — `wallet_events_consumer.py` now unwraps that shape generically for
+  every detail_type it handles, not just `UserRegistered`, so the next event type published
+  through a legacy-shaped publisher doesn't reintroduce the same `KeyError`. `POST /wallet/me/retry`
+  was never affected by either bug — it calls `create_wallet({"userId": user_id})` directly with
+  the right key and no envelope, using the JWT `sub` already resolved by the HTTP layer.
 - **`moto[server]` must be a recent version (>=5.2.2) if you're running it standalone instead of
   via `docker compose`** (e.g. because Docker isn't available, same fallback used while building
   and testing MA-21's login flow this session). `moto[server]==5.0.21` has a real bug where
