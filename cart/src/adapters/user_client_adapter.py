@@ -9,11 +9,11 @@ unauthenticated (see `user_stack.py`'s docstring point 7 for why
 "network isolation" was rejected as the boundary). A plain unsigned
 `requests.get()` — the pattern every other adapter here uses — would
 get a 403 from API Gateway before User's handler ever runs; it isn't a
-bug in the request itself. `_sign_request` signs using this Lambda's
-own execution role credentials (resolved via `boto3.Session()`'s
-default credential chain — no explicit key material handled here),
-service `execute-api`, the same mechanism `user_stack.py`'s
-`internal_caller_role_arns` grants access for.
+bug in the request itself. `shared.adapters.sigv4.sign_get_request`
+signs using this Lambda's own execution role credentials (resolved via
+`boto3.Session()`'s default credential chain — no explicit key material
+handled here), service `execute-api`, the same mechanism
+`user_stack.py`'s `internal_caller_role_arns` grants access for.
 
 Correlation-id header note: sent as `x-request-id`, matching what
 `internal_address_state_handler.py` actually reads
@@ -28,11 +28,9 @@ to a different story.
 
 import logging
 
-import boto3
 import requests
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
 from requests.exceptions import RequestException
+from shared.adapters.sigv4 import sign_get_request
 
 from adapters.retry import call_with_retry
 from domain.exceptions import AddressLookupUnavailableError
@@ -70,7 +68,7 @@ class HttpUserClient:
 
         def _attempt() -> str | None:
             try:
-                auth_headers = self._sign_request(url, params)
+                auth_headers = sign_get_request(url, params, self._region_name)
             except Exception as exc:
                 # Credential resolution failure (e.g. no execution role
                 # attached, moto/local dev without any creds at all) is
@@ -137,11 +135,3 @@ class HttpUserClient:
                 "User service address-state lookup failed after retries",
                 details={"cause": str(exc)},
             ) from exc
-
-    def _sign_request(self, url: str, params: dict[str, str]) -> dict[str, str]:
-        credentials = boto3.Session().get_credentials()
-        if credentials is None:
-            raise RuntimeError("no AWS credentials available to sign the request")
-        request = AWSRequest(method="GET", url=url, params=params)
-        SigV4Auth(credentials, "execute-api", self._region_name).add_auth(request)
-        return dict(request.headers)

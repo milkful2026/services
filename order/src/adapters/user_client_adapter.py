@@ -8,10 +8,10 @@ SigV4 signing.
 **This call must be SigV4-signed** — unlike every other adapter in this
 service (Pricing, Wallet), this specific route is protected by
 `HttpIamAuthorizer` (AWS_IAM). A plain unsigned `requests.get()` gets a
-403 from API Gateway before User's handler ever runs. `_sign_request`
-signs using this service's own execution role credentials (resolved via
-`boto3.Session()`'s default credential chain — no explicit key material
-handled here).
+403 from API Gateway before User's handler ever runs.
+`shared.adapters.sigv4.sign_get_request` signs using this service's own
+execution role credentials (resolved via `boto3.Session()`'s default
+credential chain — no explicit key material handled here).
 
 Correlation-id header: sent as `x-request-id`, matching what
 `internal_address_state_handler.py` actually reads — same fix cart's own
@@ -20,12 +20,10 @@ pre-existing bug in catalog/inventory's own adapters elsewhere)."""
 
 import logging
 
-import boto3
 import requests
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
 from requests.exceptions import RequestException
 from shared.adapters.retry import call_with_retry
+from shared.adapters.sigv4 import sign_get_request
 
 from domain.exceptions import AddressLookupUnavailableError
 
@@ -59,7 +57,7 @@ class HttpUserClient:
 
         def _attempt() -> str | None:
             try:
-                auth_headers = self._sign_request(url, params)
+                auth_headers = sign_get_request(url, params, self._region_name)
             except Exception as exc:
                 raise _RetryableUserError(f"failed to sign request: {exc}") from exc
 
@@ -110,11 +108,3 @@ class HttpUserClient:
                 "User service address-state lookup failed after retries",
                 details={"cause": str(exc)},
             ) from exc
-
-    def _sign_request(self, url: str, params: dict[str, str]) -> dict[str, str]:
-        credentials = boto3.Session().get_credentials()
-        if credentials is None:
-            raise RuntimeError("no AWS credentials available to sign the request")
-        request = AWSRequest(method="GET", url=url, params=params)
-        SigV4Auth(credentials, "execute-api", self._region_name).add_auth(request)
-        return dict(request.headers)

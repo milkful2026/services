@@ -17,6 +17,7 @@ from pathlib import Path
 _SERVICE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SERVICE_DIR / "src"))
 sys.path.insert(0, str(_SERVICE_DIR.parent / "local-dev"))
+sys.path.insert(0, str(_SERVICE_DIR.parent))  # for `shared/` (repo root on host, /app in Docker)
 
 from _env_file import load_env_file  # noqa: E402
 from _lambda_local_server import serve  # noqa: E402

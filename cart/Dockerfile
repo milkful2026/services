@@ -11,6 +11,7 @@ COPY cart/requirements.txt cart/requirements-dev.txt ./cart/
 RUN pip install --no-cache-dir --default-timeout=300 --retries=10 -r cart/requirements-dev.txt
 
 COPY cart/ ./cart/
+COPY shared/ ./shared/
 COPY local-dev/_env_file.py local-dev/_lambda_local_server.py ./local-dev/
 
 WORKDIR /app/cart
