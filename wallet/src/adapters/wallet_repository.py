@@ -8,11 +8,10 @@ migrations/0001_wallets_ledger.sql by hand.
 
 import base64
 import json
-import logging
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 
+from shared.adapters.db_operation import SqlAlchemyOperationMixin
+from shared.adapters.json_column import JSONColumn
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -26,9 +25,8 @@ from sqlalchemy import (
     func,
     select,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 
 from domain.exceptions import (
     OrderUserMismatchError,
@@ -37,8 +35,6 @@ from domain.exceptions import (
     WalletProvisioningPendingError,
 )
 from domain.models import DebitOutcome, DebitResult, LedgerEntry, LedgerType, Wallet, WalletStatus
-
-logger = logging.getLogger(__name__)
 
 metadata = MetaData()
 
@@ -89,7 +85,7 @@ outbox_table = Table(
     ),
     Column("aggregate_id", String(64), nullable=False),
     Column("event_type", String(48), nullable=False),
-    Column("payload", JSONB().with_variant(Text, "sqlite"), nullable=False),
+    Column("payload", JSONColumn(), nullable=False),
     Column("published_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
@@ -101,25 +97,13 @@ def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
 
 
-def _dump_payload(payload: dict) -> object:
-    return json.dumps(payload)
+class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
+    _unavailable_error = ServiceUnavailableError
+    _log_prefix = "wallet_repository"
 
-
-class SqlAlchemyWalletRepository:
     def __init__(self, engine: Engine, correlation_id: str = "") -> None:
         self._engine = engine
         self._correlation_id = correlation_id
-
-    @contextmanager
-    def _db_operation(self, operation: str, failure_message: str) -> Iterator[None]:
-        try:
-            yield
-        except SQLAlchemyError as exc:
-            logger.error(
-                f"wallet_repository.{operation} failed",
-                extra={"correlationId": self._correlation_id, "error": str(exc)},
-            )
-            raise ServiceUnavailableError(failure_message) from exc
 
     def get_wallet_by_user(self, user_id: str) -> Wallet | None:
         with self._db_operation("get_wallet_by_user", "Failed to load wallet"):
@@ -213,7 +197,7 @@ class SqlAlchemyWalletRepository:
                     outbox_table.insert().values(
                         aggregate_id=wallet.id,
                         event_type="WalletCredited",
-                        payload=_dump_payload(payload),
+                        payload=payload,
                     )
                 )
                 wallet.balance_paise = new_balance
@@ -310,7 +294,7 @@ class SqlAlchemyWalletRepository:
                         outbox_table.insert().values(
                             aggregate_id=wallet.id,
                             event_type="WalletDebited",
-                            payload=_dump_payload(payload),
+                            payload=payload,
                         )
                     )
                     return DebitOutcome(
@@ -338,7 +322,7 @@ class SqlAlchemyWalletRepository:
                     outbox_table.insert().values(
                         aggregate_id=aggregate_id,
                         event_type=event_type,
-                        payload=_dump_payload(payload),
+                        payload=payload,
                     )
                 )
 
@@ -400,13 +384,7 @@ class SqlAlchemyWalletRepository:
                     .order_by(outbox_table.c.created_at)
                     .limit(limit)
                 ).fetchall()
-        out = []
-        for r in rows:
-            payload = r.payload
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            out.append({"id": r.id, "event_type": r.event_type, "payload": payload})
-        return out
+        return [{"id": r.id, "event_type": r.event_type, "payload": r.payload} for r in rows]
 
     def mark_published(self, outbox_id: int) -> None:
         with self._db_operation("mark_published", "Failed to mark outbox row"):
