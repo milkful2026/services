@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from adapters.wallet_events_consumer import WalletEventsConsumer
+from adapters.wallet_events_consumer import WalletEventsConsumer, _unwrap_legacy_envelope
 from tests.conftest import seed_wallet
 
 
@@ -94,6 +94,36 @@ def test_user_registered_real_envelope_shape_creates_wallet_and_acks(consumer_fa
     c.poll_once()
     assert repo.get_wallet_by_user("user-1") is not None
     assert c._sqs.deleted == ["rh-1"]
+
+
+def test_unwrap_legacy_envelope_is_generic_not_userregistered_specific():
+    # Regression: the unwrap must apply to *any* detail_type, not just
+    # UserRegistered — otherwise the next event type this consumer
+    # subscribes to from a legacy-shaped publisher (User Service's own,
+    # or Cart's identical copy) reintroduces the same KeyError this PR
+    # fixed, just for a different event.
+    legacy = {
+        "eventId": "e1",
+        "eventType": "SomeFutureEvent",
+        "source": "user",
+        "correlationId": "c1",
+        "payload": {"userId": "user-1", "someField": "x"},
+    }
+    assert _unwrap_legacy_envelope(legacy) == {"userId": "user-1", "someField": "x"}
+
+
+def test_unwrap_legacy_envelope_leaves_flat_detail_unchanged():
+    flat = {"userId": "user-1", "amountPaise": 100}
+    assert _unwrap_legacy_envelope(flat) == flat
+
+
+def test_unwrap_legacy_envelope_ignores_a_non_dict_payload_field():
+    # A real domain field literally named "payload" would be unusual
+    # (no schema in this codebase has one), but if it were ever a
+    # non-dict scalar, that's not the legacy envelope shape — leave
+    # `detail` untouched rather than unwrapping onto a non-dict.
+    detail = {"userId": "user-1", "payload": "not-a-dict"}
+    assert _unwrap_legacy_envelope(detail) == detail
 
 
 def test_recharge_credits_and_acks(consumer_factory, engine, repo):

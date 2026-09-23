@@ -108,20 +108,9 @@ class WalletEventsConsumer:
             logger.error("wallet_events_consumer.delete_message failed", extra={"error": str(exc)})
 
     def _dispatch(self, detail_type: str | None, detail: dict) -> None:
+        detail = _unwrap_legacy_envelope(detail)
         if detail_type == "UserRegistered":
-            # User Service publishes this one through its own, older
-            # adapters/outbox_event_publisher.py (predates shared/'s), which
-            # wraps the actual domain payload one level deeper than every
-            # other event here does:
-            # {eventId, eventType, eventVersion, source, timestamp,
-            #  correlationId, payload: {...}} — vs. PaymentConfirmed etc.
-            # (published via shared.adapters.outbox_event_publisher),
-            # which puts the payload's own fields directly on `detail`.
-            # Confirmed by inspecting a real message on wallet-events-q's
-            # DLQ (MA-134) — `detail["userId"]` alone always KeyErrored,
-            # since the real key only ever existed at `detail["payload"]
-            # ["userId"]`.
-            self._wallet_service.create_wallet(detail.get("payload", detail))
+            self._wallet_service.create_wallet(detail)
             return
         if detail_type == "PaymentConfirmed" and detail.get("purpose") == "WALLET_RECHARGE":
             if jsonschema is not None and _PAYMENT_CONFIRMED_SCHEMA is not None:
@@ -132,3 +121,26 @@ class WalletEventsConsumer:
             logger.info("wallet_events_consumer: unhandled (MA-97)", extra={"dt": detail_type})
             return
         logger.info("wallet_events_consumer: unhandled", extra={"dt": detail_type})
+
+
+def _unwrap_legacy_envelope(detail: dict) -> dict:
+    """Some producers wrap the actual domain payload one level deeper
+    than every event published via shared.adapters.outbox_event_publisher
+    does. User Service's own adapters/outbox_event_publisher.py (predates
+    shared/'s) is one — Cart's own copy has the identical shape:
+    {eventId, eventType, eventVersion, source, timestamp, correlationId,
+     payload: {...}} instead of putting the payload's own fields directly
+    on `detail`. Confirmed by inspecting a real UserRegistered message on
+    wallet-events-q's DLQ (MA-134) — `detail["userId"]` alone always
+    KeyErrored, since the real key only ever existed at
+    `detail["payload"]["userId"]`.
+
+    Applied generically to every detail_type here, not special-cased to
+    UserRegistered, so the next event type this consumer subscribes to
+    from a legacy-shaped publisher doesn't reintroduce the same KeyError.
+    Safe to key off `payload` alone: every flat-shape event schema in
+    this codebase declares `additionalProperties: false` and none uses a
+    top-level field literally named `payload`, so its presence is an
+    unambiguous "legacy envelope" signal, never a real domain field."""
+    payload = detail.get("payload")
+    return payload if isinstance(payload, dict) else detail
