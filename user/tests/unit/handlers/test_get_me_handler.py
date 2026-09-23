@@ -16,6 +16,7 @@ class FakeRegistrationService:
             account_type="B2C",
             default_address_id="addr-1",
             default_address_state="Karnataka",
+            default_address_zone_id="zone-blr-1",
         )
         self.raises = raises
         self.calls: list[str] = []
@@ -63,6 +64,7 @@ def test_get_me_success_returns_profile():
         "accountType": "B2C",
         "defaultAddressId": "addr-1",
         "defaultAddressState": "Karnataka",
+        "defaultAddressZoneId": "zone-blr-1",
     }
     assert service.calls == ["sub-123"]
 
@@ -75,6 +77,7 @@ def test_get_me_no_default_address_returns_null_state():
         account_type="B2C",
         default_address_id="",
         default_address_state=None,
+        default_address_zone_id=None,
     )
     service = _inject(profile=profile)
 
@@ -83,6 +86,7 @@ def test_get_me_no_default_address_returns_null_state():
     data = json.loads(response["body"])["data"]
     assert data["defaultAddressId"] == ""
     assert data["defaultAddressState"] is None
+    assert data["defaultAddressZoneId"] is None
     assert service.calls == ["sub-123"]
 
 

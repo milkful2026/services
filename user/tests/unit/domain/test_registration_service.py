@@ -12,6 +12,7 @@ from domain.models import (
     DeliverySlot,
     RegistrationRequest,
     RegistrationResult,
+    ServiceabilityResult,
     UserProfile,
 )
 from domain.registration_service import RegistrationService
@@ -56,15 +57,22 @@ class FakeUserRepository:
 
 
 class FakeInventoryClient:
-    """Mirrors the real HttpInventoryClient's contract: returns a bool,
-    never raises NotServiceableError itself — the domain service is
-    responsible for turning `False` into that exception. An earlier
-    version of this fake raised on `serviceable=False`, which masked a
-    real bug where registration_service.register() called
-    check_serviceability() but never checked its return value."""
+    """Mirrors the real HttpInventoryClient's contract: returns a
+    ServiceabilityResult, never raises NotServiceableError itself — the
+    domain service is responsible for turning `serviceable=False` into
+    that exception. An earlier version of this fake raised on
+    `serviceable=False`, which masked a real bug where
+    registration_service.register() called check_serviceability() but
+    never checked its return value."""
 
-    def __init__(self, serviceable: bool = True, raises: Exception | None = None):
+    def __init__(
+        self,
+        serviceable: bool = True,
+        zone_id: str | None = "blr-central",
+        raises: Exception | None = None,
+    ):
         self.serviceable = serviceable
+        self.zone_id = zone_id
         self.raises = raises
         self.calls: list[tuple] = []
         self.correlation_id = ""
@@ -76,7 +84,9 @@ class FakeInventoryClient:
         self.calls.append((pincode, lat, lng))
         if self.raises:
             raise self.raises
-        return self.serviceable
+        return ServiceabilityResult(
+            serviceable=self.serviceable, zone_id=self.zone_id if self.serviceable else None
+        )
 
 
 class FakeCognitoAttributes:
@@ -173,6 +183,31 @@ def test_register_success_calls_inventory_repo_and_cognito_in_order(
     assert len(repo.register_calls) == 1
     assert repo.register_calls[0]["cognito_sub"] == "sub-123"
     assert cognito.calls == [("sub-123", "Priya Sharma", "560001")]
+
+
+def test_register_persists_inventorys_zone_id_not_a_client_supplied_one(
+    service, repo, inventory
+):
+    # Regression: a client-supplied zoneId must never be trusted/persisted
+    # as-is — it's never cross-validated against the pincode/lat/lng that
+    # Inventory actually checked. Only Inventory's own authoritative
+    # zone_id (from check_serviceability's result) may be persisted.
+    inventory.zone_id = "blr-central"
+    addr = Address(
+        lines=["12 MG Road"],
+        city="Bangalore",
+        state="Karnataka",
+        pincode="560001",
+        lat=12.9716,
+        lng=77.5946,
+        is_default=True,
+        zone_id="attacker-supplied-zone",
+    )
+
+    service.register(_valid_request(addresses=[addr]))
+
+    persisted_addresses = repo.register_calls[0]["addresses"]
+    assert persisted_addresses[0].zone_id == "blr-central"
 
 
 def test_register_existing_cognito_sub_short_circuits_before_inventory_or_cognito(

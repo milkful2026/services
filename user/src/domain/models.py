@@ -13,7 +13,20 @@ class Address:
     lng: float
     landmark: str | None = None
     is_default: bool = False
+    zone_id: str | None = None
     id: str | None = None  # assigned on insert
+
+
+@dataclass
+class ServiceabilityResult:
+    """Inventory's own answer for a pincode/lat/lng — `zone_id` (None
+    when not serviceable) is the authoritative zone for that location.
+    Never substitute a client-supplied zoneId for this: the client's
+    value is never cross-validated against the coordinates that were
+    actually checked."""
+
+    serviceable: bool
+    zone_id: str | None = None
 
 
 @dataclass
@@ -59,3 +72,5 @@ class UserProfile:
     account_type: str  # "B2C" | "B2B" — always "B2C" until a B2B onboarding path exists
     default_address_id: str
     default_address_state: str | None = None  # None when no default address is set
+    # None when no default address, or it predates zone_id
+    default_address_zone_id: str | None = None

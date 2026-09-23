@@ -87,13 +87,20 @@ class RegistrationService:
 
         # Must complete and pass BEFORE the DB transaction — a
         # non-serviceable address must never reach the database.
-        serviceable = self._inventory_client.check_serviceability(
+        serviceability = self._inventory_client.check_serviceability(
             default_address.pincode, default_address.lat, default_address.lng
         )
-        if not serviceable:
+        if not serviceability.serviceable:
             raise NotServiceableError(
                 f"Address with pincode {default_address.pincode!r} is not serviceable"
             )
+        # Inventory's own zone_id for this pincode/lat/lng is the only
+        # value actually verified against the coordinates that were just
+        # checked — a client-supplied zoneId on the request is never
+        # cross-validated against them, so it must never be persisted or
+        # later trusted by downstream zone-based logic (pricing/delivery
+        # routing) as if it were.
+        default_address.zone_id = serviceability.zone_id
 
         result = self._user_repository.register(
             cognito_sub=request.cognito_sub,

@@ -3,7 +3,14 @@ only, never on SQLAlchemy/requests/boto3 directly."""
 
 from typing import Protocol
 
-from domain.models import Address, Consent, DeliverySlot, RegistrationResult, UserProfile
+from domain.models import (
+    Address,
+    Consent,
+    DeliverySlot,
+    RegistrationResult,
+    ServiceabilityResult,
+    UserProfile,
+)
 
 
 class UserRepositoryPort(Protocol):
@@ -60,9 +67,12 @@ class UserRepositoryPort(Protocol):
 class InventoryClientPort(Protocol):
     def set_correlation_id(self, correlation_id: str) -> None: ...
 
-    def check_serviceability(self, pincode: str, lat: float, lng: float) -> bool:
+    def check_serviceability(self, pincode: str, lat: float, lng: float) -> ServiceabilityResult:
         """Raises ExternalServiceUnavailableError on failure/timeout
-        after retries. Returns whether the location is serviceable."""
+        after retries. Returns whether the location is serviceable, and
+        Inventory's own authoritative zone_id for it — the caller must
+        use this zone_id, never a client-supplied one, since it's the
+        only value actually verified against pincode/lat/lng."""
         ...
 
 
