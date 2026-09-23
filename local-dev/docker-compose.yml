@@ -144,6 +144,7 @@ services:
     build:
       context: ..
       dockerfile: subscription/Dockerfile
+    image: milkful-subscription:local
     ports:
       - "8008:8008"
     depends_on:
@@ -160,10 +161,13 @@ services:
   # same image as `subscription`, different CMD. Stands in for a real
   # rate(N) EventBridge Scheduler-triggered task (MA-131 §6/§11), same
   # role user/cart/wallet/payment's outbox scripts already play locally.
+  # `image:` matches `subscription`'s own tag so compose builds this
+  # identical Dockerfile once, not twice.
   subscription-outbox:
     build:
       context: ..
       dockerfile: subscription/Dockerfile
+    image: milkful-subscription:local
     command: ["python", "-m", "handlers.outbox_publisher"]
     depends_on:
       bootstrap:
@@ -177,6 +181,7 @@ services:
     build:
       context: ..
       dockerfile: order/Dockerfile
+    image: milkful-order:local
     ports:
       - "8009:8009"
     depends_on:
@@ -194,11 +199,13 @@ services:
       - order-env:/shared/order
 
   # Drains order's outbox (OrderConfirmed/OrderPaymentFailed) to
-  # EventBridge — same image as `order`, different CMD.
+  # EventBridge — same image as `order`, different CMD. `image:` matches
+  # `order`'s own tag so compose builds this identical Dockerfile once.
   order-outbox:
     build:
       context: ..
       dockerfile: order/Dockerfile
+    image: milkful-order:local
     command: ["python", "-m", "handlers.outbox_publisher"]
     depends_on:
       bootstrap:
@@ -222,20 +229,30 @@ services:
     build:
       context: ..
       dockerfile: cart/Dockerfile
+    image: milkful-cart:local
     ports:
       - "8004:8004"
     depends_on:
       bootstrap:
         condition: service_completed_successfully
+      catalog:
+        condition: service_started
+      user:
+        condition: service_started
+      pricing-offer:
+        condition: service_started
     environment:
       ENV_LOCAL_PATH: /shared/cart/.env.local
     volumes:
       - cart-env:/shared/cart
 
+  # Same image as `cart`, different CMD — `image:` matches `cart`'s own
+  # tag so compose builds this identical Dockerfile once.
   cart-outbox:
     build:
       context: ..
       dockerfile: cart/Dockerfile
+    image: milkful-cart:local
     command: ["python", "run_local_outbox_publisher.py"]
     depends_on:
       bootstrap:
@@ -249,6 +266,7 @@ services:
     build:
       context: ..
       dockerfile: wallet/Dockerfile
+    image: milkful-wallet:local
     ports:
       - "8006:8006"
     depends_on:
@@ -270,6 +288,7 @@ services:
     build:
       context: ..
       dockerfile: wallet/Dockerfile
+    image: milkful-wallet:local
     command: ["python", "-m", "handlers.outbox_publisher"]
     depends_on:
       bootstrap:
@@ -283,6 +302,7 @@ services:
     build:
       context: ..
       dockerfile: payment/Dockerfile
+    image: milkful-payment:local
     ports:
       - "8007:8007"
     depends_on:
@@ -304,6 +324,7 @@ services:
     build:
       context: ..
       dockerfile: payment/Dockerfile
+    image: milkful-payment:local
     command: ["python", "-m", "handlers.outbox_publisher"]
     depends_on:
       bootstrap:

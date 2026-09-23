@@ -23,7 +23,14 @@ DEFAULT_BASE_URL = "http://localhost:8008"
 
 def main() -> None:
     base_url = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BASE_URL
-    response = requests.post(f"{base_url}/internal/run-daily", timeout=30)
+    try:
+        response = requests.post(f"{base_url}/internal/run-daily", timeout=30)
+    except requests.exceptions.ConnectionError:
+        print(
+            f"Could not reach {base_url} — is Subscription Service running?",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     response.raise_for_status()
     data = response.json()["data"]
     due_ids = data["dueSubscriptionIds"]
@@ -45,12 +52,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except requests.exceptions.ConnectionError:
-        print(
-            f"Could not reach {sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BASE_URL} — "
-            "is Subscription Service running?",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    main()
