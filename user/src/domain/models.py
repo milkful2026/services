@@ -18,6 +18,18 @@ class Address:
 
 
 @dataclass
+class ServiceabilityResult:
+    """Inventory's own answer for a pincode/lat/lng — `zone_id` (None
+    when not serviceable) is the authoritative zone for that location.
+    Never substitute a client-supplied zoneId for this: the client's
+    value is never cross-validated against the coordinates that were
+    actually checked."""
+
+    serviceable: bool
+    zone_id: str | None = None
+
+
+@dataclass
 class Consent:
     type: str  # "TERMS" | "PRIVACY" | "PUSH_NOTIFICATIONS"
     accepted_at: str  # ISO-8601

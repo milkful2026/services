@@ -114,10 +114,13 @@ def _register_cognito_user(cognito_user_pool: dict, mobile: str = "+919876543210
     return attrs["sub"], attrs["phone_number"]
 
 
-def _mock_inventory_serviceable(serviceable: bool = True) -> None:
+def _mock_inventory_serviceable(serviceable: bool = True, zone_id: str | None = None) -> None:
+    data = {"serviceable": serviceable}
+    if zone_id is not None:
+        data["zoneId"] = zone_id
     responses_lib.get(
         INVENTORY_CHECK_URL,
-        json={"requestId": "r1", "status": "success", "data": {"serviceable": serviceable}},
+        json={"requestId": "r1", "status": "success", "data": data},
         status=200,
     )
 
@@ -218,11 +221,31 @@ def test_get_me_after_registration_returns_b2c_profile(wired_env, cognito_user_p
 
 
 @responses_lib.activate
-def test_get_me_returns_zone_id_when_address_supplied_it(wired_env, cognito_user_pool):
-    _mock_inventory_serviceable(True)
+def test_get_me_returns_inventorys_zone_id_from_serviceability_check(
+    wired_env, cognito_user_pool
+):
+    _mock_inventory_serviceable(True, zone_id="zone-blr-1")
     sub, _ = _register_cognito_user(cognito_user_pool, mobile="+919876543299")
+
+    register_handler.handler(_event(_VALID_BODY, sub=sub), None)
+    response = get_me_handler.handler(_get_me_event(sub), None)
+
+    data = json.loads(response["body"])["data"]
+    assert data["defaultAddressZoneId"] == "zone-blr-1"
+
+
+@responses_lib.activate
+def test_get_me_ignores_a_client_supplied_zone_id_in_favor_of_inventorys(
+    wired_env, cognito_user_pool
+):
+    # Regression: a client-supplied zoneId is never cross-validated
+    # against the address's own pincode/lat/lng — it must be silently
+    # overridden by Inventory's own authoritative zone_id for that
+    # location, never persisted or returned as-is.
+    _mock_inventory_serviceable(True, zone_id="zone-blr-1")
+    sub, _ = _register_cognito_user(cognito_user_pool, mobile="+919876543298")
     body = json.loads(json.dumps(_VALID_BODY))
-    body["addresses"][0]["zoneId"] = "zone-blr-1"
+    body["addresses"][0]["zoneId"] = "attacker-supplied-zone"
 
     register_handler.handler(_event(body, sub=sub), None)
     response = get_me_handler.handler(_get_me_event(sub), None)

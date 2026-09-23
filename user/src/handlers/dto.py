@@ -35,6 +35,10 @@ class AddressDto(BaseModel):
     lng: float
     landmark: str | None = None
     is_default: bool = Field(alias="isDefault", default=False)
+    # Accepted but never trusted as-is: registration_service.register()
+    # overwrites this with Inventory's own zone_id for the address's
+    # pincode/lat/lng before persisting — a client-supplied value here
+    # is never cross-validated against those coordinates.
     zone_id: str | None = Field(alias="zoneId", default=None)
 
     model_config = {"populate_by_name": True}

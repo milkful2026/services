@@ -15,6 +15,7 @@ from requests.exceptions import RequestException
 
 from adapters.retry import call_with_retry
 from domain.exceptions import ExternalServiceUnavailableError, ValidationError
+from domain.models import ServiceabilityResult
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +42,11 @@ class HttpInventoryClient:
     def set_correlation_id(self, correlation_id: str) -> None:
         self._correlation_id = correlation_id
 
-    def check_serviceability(self, pincode: str, lat: float, lng: float) -> bool:
+    def check_serviceability(self, pincode: str, lat: float, lng: float) -> ServiceabilityResult:
         url = f"{self._base_url}/v1/internal/serviceability/check"
         params = {"pincode": pincode, "lat": lat, "lng": lng}
 
-        def _attempt() -> bool:
+        def _attempt() -> ServiceabilityResult:
             try:
                 response = requests.get(
                     url,
@@ -57,7 +58,10 @@ class HttpInventoryClient:
                 raise _RetryableInventoryError(str(exc)) from exc
 
             if response.status_code == 200:
-                return bool(response.json()["data"]["serviceable"])
+                data = response.json()["data"]
+                return ServiceabilityResult(
+                    serviceable=bool(data["serviceable"]), zone_id=data.get("zoneId")
+                )
             if response.status_code == 400:
                 raise ValidationError(
                     "Inventory rejected pincode/coordinates",

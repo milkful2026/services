@@ -14,25 +14,29 @@ def client():
 
 
 @responses_lib.activate
-def test_check_serviceability_true(client):
+def test_check_serviceability_true_returns_inventorys_zone_id(client):
     responses_lib.get(
         CHECK_URL,
         json={"requestId": "r1", "status": "success", "data": {"serviceable": True, "zoneId": "blr-central"}},
         status=200,
     )
 
-    assert client.check_serviceability("560001", 12.97, 77.59) is True
+    result = client.check_serviceability("560001", 12.97, 77.59)
+    assert result.serviceable is True
+    assert result.zone_id == "blr-central"
 
 
 @responses_lib.activate
-def test_check_serviceability_false(client):
+def test_check_serviceability_false_has_no_zone_id(client):
     responses_lib.get(
         CHECK_URL,
         json={"requestId": "r1", "status": "success", "data": {"serviceable": False}},
         status=200,
     )
 
-    assert client.check_serviceability("110001", 28.6, 77.2) is False
+    result = client.check_serviceability("110001", 28.6, 77.2)
+    assert result.serviceable is False
+    assert result.zone_id is None
 
 
 @responses_lib.activate
@@ -68,4 +72,4 @@ def test_check_serviceability_succeeds_after_transient_500(client):
         status=200,
     )
 
-    assert client.check_serviceability("560001", 12.97, 77.59) is True
+    assert client.check_serviceability("560001", 12.97, 77.59).serviceable is True
