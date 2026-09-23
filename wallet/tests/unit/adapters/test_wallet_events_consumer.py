@@ -67,6 +67,35 @@ def test_user_registered_creates_wallet_and_acks(consumer_factory, repo):
     assert c._sqs.deleted == ["rh-1"]
 
 
+def test_user_registered_real_envelope_shape_creates_wallet_and_acks(consumer_factory, repo):
+    # Regression (MA-134): User Service publishes UserRegistered through
+    # its own, older adapters/outbox_event_publisher.py (predates
+    # shared/'s), which wraps the actual domain payload one level deeper
+    # than every other event this consumer handles —
+    # {eventId, eventType, eventVersion, source, timestamp, correlationId,
+    # payload: {...}} — not a flat `{"userId": ...}` detail as the test
+    # above (and this consumer's own dispatch logic, before this fix)
+    # assumed. A hand-rolled flat detail here masked the mismatch from
+    # ever being caught until a real docker-compose run surfaced it.
+    real_detail = {
+        "eventId": "0f00136f-3b79-413f-8ae6-31b7f712b02e",
+        "eventType": "UserRegistered",
+        "eventVersion": "1.0",
+        "source": "user",
+        "timestamp": "2026-09-23T13:57:36.528341+00:00",
+        "correlationId": "13b32911-106b-4fa0-b307-a03206fbeb40",
+        "payload": {
+            "mobile": "+919812340088",
+            "userId": "user-1",
+            "defaultPincode": "560001",
+        },
+    }
+    c = consumer_factory([_msg("UserRegistered", real_detail)])
+    c.poll_once()
+    assert repo.get_wallet_by_user("user-1") is not None
+    assert c._sqs.deleted == ["rh-1"]
+
+
 def test_recharge_credits_and_acks(consumer_factory, engine, repo):
     seed_wallet(engine, balance_paise=1000)
     c = consumer_factory([_msg("PaymentConfirmed", _pc())])

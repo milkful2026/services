@@ -185,6 +185,18 @@ def test_register_success_calls_inventory_repo_and_cognito_in_order(
     assert cognito.calls == [("sub-123", "Priya Sharma", "560001")]
 
 
+def test_register_emits_user_registered_with_userid_key(service, repo, inventory, cognito):
+    # Regression (MA-134): Wallet Service's create_wallet() reads
+    # detail["userId"] off the consumed UserRegistered event — this
+    # payload previously had no such key at all (only "cognitoSub"), so
+    # every real registration raised a KeyError in Wallet's consumer and
+    # no wallet ever auto-provisioned past CREATING.
+    service.register(_valid_request())
+
+    outbox_payload = repo.register_calls[0]["outbox_payload"]
+    assert outbox_payload["userId"] == "sub-123"
+
+
 def test_register_persists_inventorys_zone_id_not_a_client_supplied_one(
     service, repo, inventory
 ):

@@ -109,7 +109,19 @@ class WalletEventsConsumer:
 
     def _dispatch(self, detail_type: str | None, detail: dict) -> None:
         if detail_type == "UserRegistered":
-            self._wallet_service.create_wallet(detail)
+            # User Service publishes this one through its own, older
+            # adapters/outbox_event_publisher.py (predates shared/'s), which
+            # wraps the actual domain payload one level deeper than every
+            # other event here does:
+            # {eventId, eventType, eventVersion, source, timestamp,
+            #  correlationId, payload: {...}} — vs. PaymentConfirmed etc.
+            # (published via shared.adapters.outbox_event_publisher),
+            # which puts the payload's own fields directly on `detail`.
+            # Confirmed by inspecting a real message on wallet-events-q's
+            # DLQ (MA-134) — `detail["userId"]` alone always KeyErrored,
+            # since the real key only ever existed at `detail["payload"]
+            # ["userId"]`.
+            self._wallet_service.create_wallet(detail.get("payload", detail))
             return
         if detail_type == "PaymentConfirmed" and detail.get("purpose") == "WALLET_RECHARGE":
             if jsonschema is not None and _PAYMENT_CONFIRMED_SCHEMA is not None:
