@@ -114,7 +114,8 @@ services:
 
   inventory:
     build:
-      context: ../inventory
+      context: ..
+      dockerfile: inventory/Dockerfile
     ports:
       - "8000:8000"
     depends_on:
@@ -129,7 +130,8 @@ services:
 
   catalog:
     build:
-      context: ../catalog
+      context: ..
+      dockerfile: catalog/Dockerfile
     ports:
       - "8003:8003"
     depends_on:
@@ -341,7 +343,8 @@ services:
   # native "Option B" instructions below.
   pricing-offer:
     build:
-      context: ../pricing-offer
+      context: ..
+      dockerfile: pricing-offer/Dockerfile
     ports:
       - "8005:8005"
     depends_on:
