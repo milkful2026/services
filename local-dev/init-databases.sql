@@ -7,3 +7,5 @@ CREATE DATABASE milkful_catalog;
 CREATE DATABASE milkful_wallet;
 CREATE DATABASE milkful_payment;
 CREATE DATABASE milkful_identity_auth;
+CREATE DATABASE milkful_subscription;
+CREATE DATABASE milkful_order;

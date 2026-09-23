@@ -30,7 +30,31 @@ _TARGETS = [
     ("wallet", "milkful_wallet"),
     ("payment", "milkful_payment"),
     ("identity-auth", "milkful_identity_auth"),
+    ("subscription", "milkful_subscription"),
+    ("order", "milkful_order"),
 ]
+
+
+def _ensure_database_exists(database: str) -> None:
+    # init-databases.sql only runs once, on a completely fresh Postgres
+    # data volume (docker-entrypoint-initdb.d semantics) — a contributor
+    # who already had `milkful-postgres-data` from before a new database
+    # was added there would otherwise never get it created, and _apply's
+    # own connect() would fail with a bare "database does not exist"
+    # OperationalError easily mistaken for "Postgres isn't running".
+    # Idempotent: a no-op once the database exists.
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, dbname="postgres"
+    )
+    conn.autocommit = True  # CREATE DATABASE cannot run inside a transaction block
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+            if cur.fetchone() is None:
+                print(f"[{database}] database does not exist yet, creating it")
+                cur.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        conn.close()
 
 
 def _apply(service_dir: str, database: str) -> None:
@@ -39,6 +63,7 @@ def _apply(service_dir: str, database: str) -> None:
         print(f"[{service_dir}] no migrations/ directory, skipping")
         return
 
+    _ensure_database_exists(database)
     conn = psycopg2.connect(
         host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, dbname=database
     )

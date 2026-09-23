@@ -5,6 +5,7 @@ deployments — see services/local-dev/README.md.
     python run_local_outbox_publisher.py
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,8 +18,11 @@ from _env_file import load_env_file  # noqa: E402
 
 # Before importing the handler module — populates real env vars
 # (including the standard AWS_ENDPOINT_URL boto3 already reads
-# natively) from bootstrap.py's generated .env.local.
-load_env_file(_SERVICE_DIR / ".env.local")
+# natively) from bootstrap.py's generated .env.local. ENV_LOCAL_PATH
+# lets this run as its own docker-compose container, reading from the
+# same shared volume run_local.py's container reads from, rather than a
+# host path — see run_local.py's identical fix.
+load_env_file(Path(os.environ.get("ENV_LOCAL_PATH", str(_SERVICE_DIR / ".env.local"))))
 
 import handlers.outbox_publisher_handler as outbox_publisher_handler  # noqa: E402
 
