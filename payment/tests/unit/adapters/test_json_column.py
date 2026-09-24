@@ -32,6 +32,16 @@ def test_sqlite_bind_param_serializes_to_json_string():
     assert isinstance(bound, str)
 
 
+def test_bind_param_passes_none_through_on_both_dialects():
+    assert JSONColumn().process_bind_param(None, _POSTGRES) is None
+    assert JSONColumn().process_bind_param(None, _SQLITE) is None
+
+
 def test_result_value_round_trips_on_both_dialects():
     assert JSONColumn().process_result_value('{"a": 1}', _SQLITE) == {"a": 1}
     assert JSONColumn().process_result_value({"a": 1}, _POSTGRES) == {"a": 1}
+
+
+def test_result_value_none_on_both_dialects():
+    assert JSONColumn().process_result_value(None, _POSTGRES) is None
+    assert JSONColumn().process_result_value(None, _SQLITE) is None
