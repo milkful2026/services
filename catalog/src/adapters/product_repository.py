@@ -19,10 +19,9 @@ either side depends on.
 """
 
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import UTC, datetime
 
+from shared.adapters.db_operation import SqlAlchemyOperationMixin
 from sqlalchemy import (
     Boolean,
     Column,
@@ -41,7 +40,6 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
 
 from domain.exceptions import ServiceUnavailableError
 from domain.models import Category, Product, SearchFilters, SortOrder, StockState
@@ -103,25 +101,13 @@ def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
 
 
-class SqlAlchemyProductRepository:
+class SqlAlchemyProductRepository(SqlAlchemyOperationMixin):
+    _unavailable_error = ServiceUnavailableError
+    _log_prefix = "product_repository"
+
     def __init__(self, engine: Engine, correlation_id: str = "") -> None:
         self._engine = engine
         self._correlation_id = correlation_id
-
-    @contextmanager
-    def _db_operation(self, operation: str, failure_message: str) -> Iterator[None]:
-        """Every DB-touching method wraps its query in this: same
-        log-then-translate-to-ServiceUnavailableError shape everywhere,
-        rather than five near-identical try/except blocks that could each
-        independently drift."""
-        try:
-            yield
-        except SQLAlchemyError as exc:
-            logger.error(
-                f"product_repository.{operation} failed",
-                extra={"correlationId": self._correlation_id, "error": str(exc)},
-            )
-            raise ServiceUnavailableError(failure_message) from exc
 
     def get_categories(self) -> list[Category]:
         with self._db_operation("get_categories", "Failed to load categories"):

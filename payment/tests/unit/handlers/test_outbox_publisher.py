@@ -9,8 +9,10 @@ from datetime import UTC, datetime, timedelta
 import boto3
 import pytest
 from moto import mock_aws
+from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from sqlalchemy import create_engine
 
+from adapters.logging_metrics import LoggingMetricsRecorder
 from adapters.payment_repository import SqlAlchemyPaymentRepository, create_schema, payments_table
 from handlers import outbox_publisher
 
@@ -23,6 +25,23 @@ def engine(monkeypatch, tmp_path):
     create_schema(eng)
     yield eng
     eng.dispose()
+
+
+@pytest.fixture
+def repo(engine):
+    return SqlAlchemyPaymentRepository(engine)
+
+
+@pytest.fixture
+def publisher():
+    return EventBridgeOutboxPublisher(
+        event_bus_name="milkful-events", event_source="milkful.payment", region_name="ap-south-1"
+    )
+
+
+@pytest.fixture
+def metrics():
+    return LoggingMetricsRecorder()
 
 
 def _seed_payment_and_outbox_row(engine, created_at):
@@ -48,12 +67,12 @@ def _mock_bus():
         yield
 
 
-def test_publish_lag_metric_reflects_oldest_row_age(engine, caplog):
+def test_publish_lag_metric_reflects_oldest_row_age(engine, repo, publisher, metrics, caplog):
     old_ts = datetime.now(UTC) - timedelta(seconds=42)
     _seed_payment_and_outbox_row(engine, old_ts)
 
     with _mock_bus(), caplog.at_level(logging.INFO, logger="payment.metrics"):
-        published = outbox_publisher.run_once()
+        published = outbox_publisher.run_once(repo, publisher, metrics)
 
     assert published == 1
     lag_records = [
@@ -63,18 +82,35 @@ def test_publish_lag_metric_reflects_oldest_row_age(engine, caplog):
     assert lag_records[0].value >= 42
 
 
-def test_no_unpublished_rows_emits_no_lag_metric(engine, caplog):
+def test_no_unpublished_rows_emits_no_lag_metric(repo, publisher, metrics, caplog):
     with _mock_bus(), caplog.at_level(logging.INFO, logger="payment.metrics"):
-        published = outbox_publisher.run_once()
+        published = outbox_publisher.run_once(repo, publisher, metrics)
     assert published == 0
     assert not any(
         getattr(r, "metric", None) == "outbox.publish_lag_seconds" for r in caplog.records
     )
 
 
-def test_row_marked_published_after_success(engine):
+def test_row_marked_published_after_success(engine, repo, publisher, metrics):
     _seed_payment_and_outbox_row(engine, datetime.now(UTC))
-    repo = SqlAlchemyPaymentRepository(engine)
     with _mock_bus():
-        outbox_publisher.run_once()
+        outbox_publisher.run_once(repo, publisher, metrics)
     assert repo.fetch_unpublished() == []
+
+
+def test_run_once_never_touches_create_engine_or_get_settings(
+    repo, publisher, metrics, monkeypatch
+):
+    # Regression: run_once() used to build its own engine/publisher/
+    # metrics recorder on every call — a fresh engine/connection pool
+    # every 5s tick from run_forever's loop. After the fix, run_once
+    # takes already-built dependencies and must never touch create_engine
+    # or get_settings itself — only run_forever's one-time setup does.
+    def _boom(*args, **kwargs):
+        raise AssertionError("run_once must not call create_engine")
+
+    monkeypatch.setattr(outbox_publisher, "create_engine", _boom)
+    monkeypatch.setattr(outbox_publisher, "get_settings", _boom)
+
+    published = outbox_publisher.run_once(repo, publisher, metrics)
+    assert published == 0

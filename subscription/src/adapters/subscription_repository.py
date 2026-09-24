@@ -7,12 +7,10 @@ engine (tests). Table columns are kept column-for-column compatible with
 migrations/0001_subscriptions.sql by hand.
 """
 
-import json
-import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import date
 
+from shared.adapters.db_operation import SqlAlchemyOperationMixin
+from shared.adapters.json_column import JSONColumn
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -23,50 +21,17 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
-    Text,
-    TypeDecorator,
     UniqueConstraint,
     func,
     select,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 
 from domain.exceptions import ServiceUnavailableError
 from domain.models import PendingEdit, Schedule, Subscription, SubscriptionStatus
 
-logger = logging.getLogger(__name__)
-
 metadata = MetaData()
-
-
-class _JSONColumn(TypeDecorator):
-    """JSONB on Postgres, JSON-in-Text on SQLite. `with_variant(Text,
-    "sqlite")` alone isn't enough: SQLite's plain `Text` can't bind a raw
-    dict, so it needs `json.dumps`/`json.loads` on the Python side — but
-    doing that unconditionally and *also* using `JSONB` (which applies
-    its own dict<->jsonb serialization) double-encodes every value into
-    a JSON string scalar on Postgres. Dialect-aware here so callers just
-    pass/receive plain dicts on both."""
-
-    impl = JSONB
-    cache_ok = True
-
-    def load_dialect_impl(self, dialect):
-        if dialect.name == "sqlite":
-            return dialect.type_descriptor(Text())
-        return dialect.type_descriptor(JSONB())
-
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        return json.dumps(value) if dialect.name == "sqlite" else value
-
-    def process_result_value(self, value, dialect):
-        if value is None:
-            return None
-        return json.loads(value) if isinstance(value, str) else value
 
 
 subscriptions_table = Table(
@@ -76,13 +41,13 @@ subscriptions_table = Table(
     Column("user_id", String(64), nullable=False),
     Column("product_id", String(64), nullable=False),
     Column("quantity", Integer, nullable=False),
-    Column("schedule", _JSONColumn(), nullable=False),
+    Column("schedule", JSONColumn(), nullable=False),
     Column("slot_id", String(64), nullable=False),
     Column("status", String(16), nullable=False, default=SubscriptionStatus.ACTIVE.value),
     Column("start_date", Date, nullable=False),
     Column("pause_from", Date, nullable=True),
     Column("pause_until", Date, nullable=True),
-    Column("pending_edit", _JSONColumn(), nullable=True),
+    Column("pending_edit", JSONColumn(), nullable=True),
     Column("idempotency_key", String(128), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column(
@@ -124,7 +89,7 @@ outbox_table = Table(
     ),
     Column("aggregate_id", String(64), nullable=False),
     Column("event_type", String(48), nullable=False),
-    Column("payload", _JSONColumn(), nullable=False),
+    Column("payload", JSONColumn(), nullable=False),
     Column("published_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
@@ -136,21 +101,13 @@ def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
 
 
-class SqlAlchemySubscriptionRepository:
+class SqlAlchemySubscriptionRepository(SqlAlchemyOperationMixin):
+    _unavailable_error = ServiceUnavailableError
+    _log_prefix = "subscription_repository"
+
     def __init__(self, engine: Engine, correlation_id: str = "") -> None:
         self._engine = engine
         self._correlation_id = correlation_id
-
-    @contextmanager
-    def _db_operation(self, operation: str, failure_message: str) -> Iterator[None]:
-        try:
-            yield
-        except SQLAlchemyError as exc:
-            logger.error(
-                f"subscription_repository.{operation} failed",
-                extra={"correlationId": self._correlation_id, "error": str(exc)},
-            )
-            raise ServiceUnavailableError(failure_message) from exc
 
     # --- create / idempotency ---
 

@@ -2,8 +2,9 @@
 services/README.md §5 — identical to every other service's own
 `{requestId, status, data}` shape."""
 
-import uuid
 from typing import Any
+
+from shared.handlers.dto import error_envelope, success_envelope  # noqa: F401
 
 from domain.models import Quote
 
@@ -22,18 +23,4 @@ def serialize_quote(quote: Quote) -> dict[str, Any]:
         "monthlyEstimate": quote.monthly_estimate,
         "discountAmount": None,
         "appliedOfferId": None,
-    }
-
-
-def success_envelope(data: dict[str, Any]) -> dict[str, Any]:
-    return {"requestId": str(uuid.uuid4()), "status": "success", "data": data}
-
-
-def error_envelope(
-    error_code: str, message: str, details: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return {
-        "requestId": str(uuid.uuid4()),
-        "status": "error",
-        "data": {"errorCode": error_code, "message": message, **(details or {})},
     }

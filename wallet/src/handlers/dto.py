@@ -2,10 +2,10 @@
 data}` shape per services/README.md §5 — the shape the mobile app's
 shared ApiClient unwraps for every service."""
 
-import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
+from shared.handlers.dto import error_envelope, success_envelope  # noqa: F401
 
 from domain.models import DebitOutcome, DebitResult, LedgerEntry, TransactionsPage
 from domain.wallet_service import render_description
@@ -54,17 +54,3 @@ def serialize_debit_outcome(outcome: DebitOutcome) -> dict[str, Any]:
             "requiredPaise": outcome.required_paise,
         }
     return {"status": DebitResult.WALLET_NOT_ACTIVE.value}
-
-
-def success_envelope(data: dict[str, Any] | list[Any]) -> dict[str, Any]:
-    return {"requestId": str(uuid.uuid4()), "status": "success", "data": data}
-
-
-def error_envelope(
-    error_code: str, message: str, details: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return {
-        "requestId": str(uuid.uuid4()),
-        "status": "error",
-        "data": {"errorCode": error_code, "message": message, **(details or {})},
-    }

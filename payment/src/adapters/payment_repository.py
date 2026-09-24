@@ -6,13 +6,13 @@ engine (tests). Columns are kept column-for-column compatible with
 migrations/0001_payments.sql by hand.
 """
 
-import json
-import logging
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
+from shared.adapters.db_operation import SqlAlchemyOperationMixin
+from shared.adapters.json_column import JSONColumn
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -25,14 +25,10 @@ from sqlalchemy import (
     func,
     select,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
 
 from domain.exceptions import ServiceUnavailableError
 from domain.models import Payment, PaymentMethod, PaymentStatus, Purpose
-
-logger = logging.getLogger(__name__)
 
 metadata = MetaData()
 
@@ -72,7 +68,7 @@ payment_events_table = Table(
     ),
     Column("payment_id", String(64), nullable=False),
     Column("source", Text, nullable=False),
-    Column("raw_payload", JSONB().with_variant(Text, "sqlite"), nullable=False),
+    Column("raw_payload", JSONColumn(), nullable=False),
     Column("received_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
@@ -84,7 +80,7 @@ outbox_table = Table(
     ),
     Column("aggregate_id", String(64), nullable=False),
     Column("event_type", String(48), nullable=False),
-    Column("payload", JSONB().with_variant(Text, "sqlite"), nullable=False),
+    Column("payload", JSONColumn(), nullable=False),
     Column("published_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
@@ -98,10 +94,6 @@ def create_schema(engine: Engine) -> None:
 
 def new_payment_id() -> str:
     return f"pay_{uuid.uuid4().hex}"
-
-
-def _dump(payload: dict) -> object:
-    return json.dumps(payload)
 
 
 def _status_values(
@@ -173,33 +165,25 @@ class LockedPayment:
     def append_event(self, source: str, raw_payload: dict) -> None:
         self._conn.execute(
             payment_events_table.insert().values(
-                payment_id=self._payment_id, source=source, raw_payload=_dump(raw_payload)
+                payment_id=self._payment_id, source=source, raw_payload=raw_payload
             )
         )
 
     def enqueue_outbox(self, event_type: str, payload: dict) -> None:
         self._conn.execute(
             outbox_table.insert().values(
-                aggregate_id=self._payment_id, event_type=event_type, payload=_dump(payload)
+                aggregate_id=self._payment_id, event_type=event_type, payload=payload
             )
         )
 
 
-class SqlAlchemyPaymentRepository:
+class SqlAlchemyPaymentRepository(SqlAlchemyOperationMixin):
+    _unavailable_error = ServiceUnavailableError
+    _log_prefix = "payment_repository"
+
     def __init__(self, engine: Engine, correlation_id: str = "") -> None:
         self._engine = engine
         self._correlation_id = correlation_id
-
-    @contextmanager
-    def _db_operation(self, operation: str, failure_message: str) -> Iterator[None]:
-        try:
-            yield
-        except SQLAlchemyError as exc:
-            logger.error(
-                f"payment_repository.{operation} failed",
-                extra={"correlationId": self._correlation_id, "error": str(exc)},
-            )
-            raise ServiceUnavailableError(failure_message) from exc
 
     def get_by_user_idem(self, user_id: str, idempotency_key: str) -> Payment | None:
         with self._db_operation("get_by_user_idem", "Failed to load payment"):
@@ -323,7 +307,7 @@ class SqlAlchemyPaymentRepository:
             with self._engine.begin() as conn:
                 conn.execute(
                     payment_events_table.insert().values(
-                        payment_id=payment_id, source=source, raw_payload=_dump(raw_payload)
+                        payment_id=payment_id, source=source, raw_payload=raw_payload
                     )
                 )
 
@@ -332,7 +316,7 @@ class SqlAlchemyPaymentRepository:
             with self._engine.begin() as conn:
                 conn.execute(
                     outbox_table.insert().values(
-                        aggregate_id=payment_id, event_type=event_type, payload=_dump(payload)
+                        aggregate_id=payment_id, event_type=event_type, payload=payload
                     )
                 )
 
@@ -370,20 +354,15 @@ class SqlAlchemyPaymentRepository:
                     .order_by(outbox_table.c.created_at)
                     .limit(limit)
                 ).fetchall()
-        out = []
-        for r in rows:
-            payload = r.payload
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            out.append(
-                {
-                    "id": r.id,
-                    "event_type": r.event_type,
-                    "payload": payload,
-                    "created_at": r.created_at,
-                }
-            )
-        return out
+        return [
+            {
+                "id": r.id,
+                "event_type": r.event_type,
+                "payload": r.payload,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
 
     def mark_published(self, outbox_id: int) -> None:
         with self._db_operation("mark_published", "Failed to mark outbox row"):

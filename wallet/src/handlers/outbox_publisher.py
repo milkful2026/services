@@ -10,6 +10,7 @@ from pathlib import Path
 
 from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
 from adapters.wallet_repository import SqlAlchemyWalletRepository
 from config.env import get_settings
@@ -34,15 +35,7 @@ def _load_local_env_file() -> None:
             os.environ.setdefault(key.strip(), value.strip())
 
 
-def run_once() -> int:
-    settings = get_settings()
-    engine = create_engine(settings.database_url)
-    repo = SqlAlchemyWalletRepository(engine)
-    publisher = EventBridgeOutboxPublisher(
-        event_bus_name=settings.event_bus_name,
-        event_source=settings.event_source,
-        region_name=settings.aws_region,
-    )
+def run_once(repo: SqlAlchemyWalletRepository, publisher: EventBridgeOutboxPublisher) -> int:
     rows = repo.fetch_unpublished()
     published = 0
     for row in rows:
@@ -52,10 +45,21 @@ def run_once() -> int:
     return published
 
 
-def run_forever(interval_seconds: float = 5.0) -> None:
+def run_forever(interval_seconds: float = 5.0, engine: Engine | None = None) -> None:
+    # Built once, outside the loop — a fresh engine (and connection pool)
+    # per tick would pay a blocking DB connection setup every
+    # `interval_seconds` for the life of the process.
+    settings = get_settings()
+    engine = engine or create_engine(settings.database_url)
+    repo = SqlAlchemyWalletRepository(engine)
+    publisher = EventBridgeOutboxPublisher(
+        event_bus_name=settings.event_bus_name,
+        event_source=settings.event_source,
+        region_name=settings.aws_region,
+    )
     while True:
         try:
-            n = run_once()
+            n = run_once(repo, publisher)
             if n:
                 logger.info("wallet outbox: published %d events", n)
         except Exception:  # noqa: BLE001 — keep the loop alive; retry next tick

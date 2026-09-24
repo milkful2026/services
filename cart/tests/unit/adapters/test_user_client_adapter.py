@@ -24,7 +24,7 @@ def _fake_credentials(monkeypatch):
     # own dummy "local"/"local" pair for moto.
     fake_credentials = Credentials("AKIAFAKE", "fakesecret")
     monkeypatch.setattr(
-        "adapters.user_client_adapter.boto3.Session",
+        "shared.adapters.sigv4.boto3.Session",
         lambda: type(
             "FakeSession", (), {"get_credentials": staticmethod(lambda: fake_credentials)}
         )(),
@@ -119,7 +119,7 @@ def test_malformed_200_body_becomes_address_lookup_unavailable_not_raw(body_kwar
 
 def test_no_credentials_available_raises_address_lookup_unavailable(monkeypatch):
     monkeypatch.setattr(
-        "adapters.user_client_adapter.boto3.Session",
+        "shared.adapters.sigv4.boto3.Session",
         lambda: type("FakeSession", (), {"get_credentials": staticmethod(lambda: None)})(),
     )
 

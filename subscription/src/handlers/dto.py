@@ -2,11 +2,10 @@
 (services/README.md §5 — the shape the mobile app's shared ApiClient
 unwraps for every service)."""
 
-import uuid
 from datetime import date
-from typing import Any
 
 from pydantic import BaseModel, Field
+from shared.handlers.dto import error_envelope, success_envelope  # noqa: F401
 
 from domain.exceptions import InvalidScheduleError
 from domain.models import Schedule, ScheduleType
@@ -47,17 +46,3 @@ class SkipRequest(BaseModel):
 class EditRequest(BaseModel):
     quantity: int | None = Field(default=None, gt=0)
     schedule: ScheduleDto | None = None
-
-
-def success_envelope(data: dict[str, Any] | list[Any]) -> dict[str, Any]:
-    return {"requestId": str(uuid.uuid4()), "status": "success", "data": data}
-
-
-def error_envelope(
-    error_code: str, message: str, details: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return {
-        "requestId": str(uuid.uuid4()),
-        "status": "error",
-        "data": {"errorCode": error_code, "message": message, **(details or {})},
-    }

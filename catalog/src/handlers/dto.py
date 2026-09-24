@@ -3,8 +3,9 @@ services/README.md §5 — identical to identity-auth/user/inventory's own
 `{requestId, status, data}` shape, which is exactly what lets the mobile
 app's shared `ApiClient` unwrap every service's responses the same way."""
 
-import uuid
 from typing import Any
+
+from shared.handlers.dto import error_envelope, success_envelope  # noqa: F401
 
 from domain.models import Category, Product
 
@@ -33,10 +34,6 @@ def serialize_product(product: Product) -> dict[str, Any]:
     }
 
 
-def success_envelope(data: dict[str, Any] | list[Any]) -> dict[str, Any]:
-    return {"requestId": str(uuid.uuid4()), "status": "success", "data": data}
-
-
 # `/categories`'s `data` is a bare array — matches the mobile client's
 # `ApiClient.requestList` (see its own docstring: the same bare-array
 # convention `/delivery/slots` already uses elsewhere in this platform),
@@ -44,13 +41,3 @@ def success_envelope(data: dict[str, Any] | list[Any]) -> dict[str, Any]:
 # key (`{"products": [...]}`). Named separately at call sites purely to
 # document that distinction — the wrapper itself is identical either way.
 success_list_envelope = success_envelope
-
-
-def error_envelope(
-    error_code: str, message: str, details: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return {
-        "requestId": str(uuid.uuid4()),
-        "status": "error",
-        "data": {"errorCode": error_code, "message": message, **(details or {})},
-    }

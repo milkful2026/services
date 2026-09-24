@@ -14,6 +14,7 @@ from pathlib import Path
 
 from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
 from adapters.logging_metrics import LoggingMetricsRecorder
 from adapters.payment_repository import SqlAlchemyPaymentRepository
@@ -39,17 +40,15 @@ def _load_local_env_file() -> None:
             os.environ.setdefault(key.strip(), value.strip())
 
 
-def run_once() -> int:
-    settings = get_settings()
-    engine = create_engine(settings.database_url)
-    repo = SqlAlchemyPaymentRepository(engine)
-    publisher = EventBridgeOutboxPublisher(
-        event_bus_name=settings.event_bus_name,
-        event_source=settings.event_source,
-        region_name=settings.aws_region,
-    )
-    metrics = LoggingMetricsRecorder()
-
+def run_once(
+    repo: SqlAlchemyPaymentRepository,
+    publisher: EventBridgeOutboxPublisher,
+    metrics: LoggingMetricsRecorder,
+) -> int:
+    # `metrics` is payment-specific (the publish-lag alarm, MA-126 §5) —
+    # every other service's run_once is the generic (repo, publisher)
+    # shape; this one deliberately keeps a third parameter rather than
+    # forcing a shared hook API onto callers that don't need it.
     rows = repo.fetch_unpublished()
     if rows:
         oldest = min(r["created_at"] for r in rows)
@@ -65,10 +64,22 @@ def run_once() -> int:
     return published
 
 
-def run_forever(interval_seconds: float = 5.0) -> None:
+def run_forever(interval_seconds: float = 5.0, engine: Engine | None = None) -> None:
+    # Built once, outside the loop — a fresh engine (and connection pool)
+    # per tick would pay a blocking DB connection setup every
+    # `interval_seconds` for the life of the process.
+    settings = get_settings()
+    engine = engine or create_engine(settings.database_url)
+    repo = SqlAlchemyPaymentRepository(engine)
+    publisher = EventBridgeOutboxPublisher(
+        event_bus_name=settings.event_bus_name,
+        event_source=settings.event_source,
+        region_name=settings.aws_region,
+    )
+    metrics = LoggingMetricsRecorder()
     while True:
         try:
-            n = run_once()
+            n = run_once(repo, publisher, metrics)
             if n:
                 logger.info("payment outbox: published %d events", n)
         except Exception:  # noqa: BLE001 — keep the loop alive; retry next tick

@@ -8,12 +8,11 @@ compatible with migrations/0001_orders.sql by hand.
 
 import base64
 import json
-import logging
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import date, datetime
 
+from shared.adapters.db_operation import SqlAlchemyOperationMixin
+from shared.adapters.json_column import JSONColumn
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -24,47 +23,17 @@ from sqlalchemy import (
     String,
     Table,
     Text,
-    TypeDecorator,
     UniqueConstraint,
     func,
     select,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 
 from domain.exceptions import ServiceUnavailableError
 from domain.models import Order, OrdersPage, OrderStatus
 
-logger = logging.getLogger(__name__)
-
 metadata = MetaData()
-
-
-class _JSONColumn(TypeDecorator):
-    """JSONB on Postgres, JSON-in-Text on SQLite — see subscription
-    service's own `_JSONColumn` for why `with_variant(Text, "sqlite")`
-    alone isn't enough (SQLite can't bind a raw dict into a plain `Text`
-    column, and unconditional `json.dumps` would double-encode on
-    Postgres's real JSONB)."""
-
-    impl = JSONB
-    cache_ok = True
-
-    def load_dialect_impl(self, dialect):
-        if dialect.name == "sqlite":
-            return dialect.type_descriptor(Text())
-        return dialect.type_descriptor(JSONB())
-
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        return json.dumps(value) if dialect.name == "sqlite" else value
-
-    def process_result_value(self, value, dialect):
-        if value is None:
-            return None
-        return json.loads(value) if isinstance(value, str) else value
 
 
 orders_table = Table(
@@ -100,7 +69,7 @@ outbox_table = Table(
     ),
     Column("aggregate_id", String(64), nullable=False),
     Column("event_type", String(48), nullable=False),
-    Column("payload", _JSONColumn(), nullable=False),
+    Column("payload", JSONColumn(), nullable=False),
     Column("published_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
@@ -112,21 +81,13 @@ def create_schema(engine: Engine) -> None:
     metadata.create_all(engine)
 
 
-class SqlAlchemyOrderRepository:
+class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
+    _unavailable_error = ServiceUnavailableError
+    _log_prefix = "order_repository"
+
     def __init__(self, engine: Engine, correlation_id: str = "") -> None:
         self._engine = engine
         self._correlation_id = correlation_id
-
-    @contextmanager
-    def _db_operation(self, operation: str, failure_message: str) -> Iterator[None]:
-        try:
-            yield
-        except SQLAlchemyError as exc:
-            logger.error(
-                f"order_repository.{operation} failed",
-                extra={"correlationId": self._correlation_id, "error": str(exc)},
-            )
-            raise ServiceUnavailableError(failure_message) from exc
 
     def get_by_subscription_and_date(
         self, subscription_id: str, delivery_date: date
