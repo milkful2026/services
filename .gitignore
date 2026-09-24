@@ -2,3 +2,7 @@
 .env
 .env.local
 .claude/settings.local.json
+
+# Python build artifacts
+__pycache__/
+*.pyc
