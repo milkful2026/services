@@ -27,6 +27,10 @@ class LineItem:
     frequency: Frequency
     start_date: date | None
     added_at: datetime
+    # MA-135 FR-1 — the delivery slot chosen on the product screen;
+    # required for subscription lines, always None for ONE_TIME. Lines
+    # written before this field existed read back as None.
+    slot_id: str | None = None
 
 
 @dataclass
@@ -63,3 +67,9 @@ class CartView:
 
     cart: Cart
     quote: Quote | None
+    # MA-135 FR-2 — the same cart split for the review screen: one-time
+    # lines (charged at checkout) and subscription lines (one delivery of
+    # each, charged later by the Daily Run). None when that partition is
+    # empty, since Pricing rejects an empty item list.
+    pay_now_quote: Quote | None = None
+    per_delivery_quote: Quote | None = None

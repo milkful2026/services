@@ -338,3 +338,115 @@ def test_mark_outbox_published_sets_a_ttl_on_the_drained_row(cart_table, repo):
     )["Item"]
     assert "publishedAt" in row
     assert "expiresAt" in row  # so drained rows don't accumulate forever
+
+
+# -- MA-135 FR-1: slotId persistence -----------------------------------------
+
+
+def test_add_item_slot_id_round_trips(repo):
+    added = repo.add_item(
+        "user-1", "cow-milk", 1, Frequency.DAILY, "2026-09-27", None, slot_id="slot-am"
+    )
+
+    [fetched] = repo.get_cart("user-1").line_items
+
+    assert added.slot_id == "slot-am"
+    assert fetched.slot_id == "slot-am"
+
+
+def test_add_item_idempotent_replay_keeps_slot_id(repo):
+    first = repo.add_item(
+        "user-1", "cow-milk", 1, Frequency.DAILY, "2026-09-27", "key-1", slot_id="slot-am"
+    )
+    replay = repo.add_item(
+        "user-1", "cow-milk", 1, Frequency.DAILY, "2026-09-27", "key-1", slot_id="slot-am"
+    )
+
+    assert replay == first
+
+
+def test_replace_cart_slot_id_round_trips(repo):
+    repo.replace_cart(
+        "user-1",
+        items=[{"product_id": "cow-milk", "quantity": 1, "frequency": Frequency.DAILY,
+                "start_date": "2026-09-27", "slot_id": "slot-pm"}],
+        if_version=0,
+    )
+
+    [fetched] = repo.get_cart("user-1").line_items
+    assert fetched.slot_id == "slot-pm"
+
+
+def test_one_time_line_reads_back_with_no_slot(repo):
+    repo.add_item("user-1", "cow-milk", 1, Frequency.ONE_TIME, None, None)
+
+    [fetched] = repo.get_cart("user-1").line_items
+    assert fetched.slot_id is None
+
+
+# -- MA-135 FR-4: remove_items --------------------------------------------------
+
+
+def _seed_two_lines(repo):
+    a = repo.add_item("user-1", "buffalo-milk", 1, Frequency.ONE_TIME, None, None)
+    b = repo.add_item(
+        "user-1", "cow-milk", 1, Frequency.DAILY, "2026-09-27", None, slot_id="slot-am"
+    )
+    return a, b, repo.get_cart("user-1").cart_version
+
+
+def test_remove_items_removes_listed_lines_and_bumps_version(repo):
+    a, b, version = _seed_two_lines(repo)
+
+    result = repo.remove_items("user-1", [a.id], version, reason="CHECKOUT", checkout_id="chk_1")
+
+    stored = repo.get_cart("user-1")
+    assert [li.id for li in stored.line_items] == [b.id]
+    assert stored.cart_version == version + 1
+    assert result.cart_version == version + 1
+    assert [li.id for li in result.line_items] == [b.id]
+
+
+def test_remove_items_stale_version_raises_and_removes_nothing(repo):
+    a, _, version = _seed_two_lines(repo)
+
+    with pytest.raises(CartVersionMismatchError):
+        repo.remove_items("user-1", [a.id], version - 1, reason="CHECKOUT", checkout_id=None)
+
+    assert len(repo.get_cart("user-1").line_items) == 2
+
+
+def test_remove_items_retry_after_success_is_a_no_op(repo):
+    a, b, version = _seed_two_lines(repo)
+    repo.remove_items("user-1", [a.id, b.id], version, reason="CHECKOUT", checkout_id="chk_1")
+
+    # Same call again (a retried checkout): items already gone, version moved on.
+    result = repo.remove_items(
+        "user-1", [a.id, b.id], version, reason="CHECKOUT", checkout_id="chk_1"
+    )
+
+    assert result.line_items == []
+    assert result.cart_version == version + 1
+
+
+def test_remove_items_skips_ids_already_gone(repo):
+    a, b, version = _seed_two_lines(repo)
+
+    result = repo.remove_items(
+        "user-1", [a.id, "not-there"], version, reason="CHECKOUT", checkout_id=None
+    )
+
+    assert [li.id for li in result.line_items] == [b.id]
+
+
+def test_remove_items_outbox_row_carries_checkout_reason(repo):
+    a, _, version = _seed_two_lines(repo)
+    for event in repo.get_unpublished_outbox_events(limit=10):
+        repo.mark_outbox_published(event["userId"], event["eventId"])
+
+    repo.remove_items("user-1", [a.id], version, reason="CHECKOUT", checkout_id="chk_1")
+
+    [event] = repo.get_unpublished_outbox_events(limit=10)
+    assert event["payload"]["changeType"] == "ITEMS_REMOVED"
+    assert event["payload"]["reason"] == "CHECKOUT"
+    assert event["payload"]["checkoutId"] == "chk_1"

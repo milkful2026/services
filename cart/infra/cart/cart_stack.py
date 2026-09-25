@@ -68,6 +68,8 @@ class CartStack(Stack):
         catalog_internal_base_url: str = "http://PLACEHOLDER-catalog-internal.local",
         user_internal_base_url: str = "http://PLACEHOLDER-user-internal.local",
         pricing_internal_base_url: str = "http://PLACEHOLDER-pricing-internal.local",
+        wallet_internal_base_url: str = "http://PLACEHOLDER-wallet-internal.local",
+        internal_caller_role_arns: tuple[str, ...] = (),
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -84,6 +86,7 @@ class CartStack(Stack):
             "CART_CATALOG_INTERNAL_BASE_URL": catalog_internal_base_url,
             "CART_USER_INTERNAL_BASE_URL": user_internal_base_url,
             "CART_PRICING_INTERNAL_BASE_URL": pricing_internal_base_url,
+            "CART_WALLET_INTERNAL_BASE_URL": wallet_internal_base_url,
         }
 
         execution_role = self._build_execution_role(cart_table, event_bus_name)
@@ -121,6 +124,19 @@ class CartStack(Stack):
             handler="handlers.delete_item_handler.handler",
             **common_lambda_kwargs,
         )
+        # MA-135 FR-3/FR-4 — Order Service's checkout read/clear.
+        internal_get_cart_fn = lambda_.Function(
+            self,
+            "InternalGetCartFunction",
+            handler="handlers.internal_get_cart_handler.handler",
+            **common_lambda_kwargs,
+        )
+        internal_remove_items_fn = lambda_.Function(
+            self,
+            "InternalRemoveItemsFunction",
+            handler="handlers.internal_remove_items_handler.handler",
+            **common_lambda_kwargs,
+        )
         outbox_publisher_fn = lambda_.Function(
             self,
             "OutboxPublisherFunction",
@@ -128,8 +144,11 @@ class CartStack(Stack):
             **common_lambda_kwargs,
         )
 
-        self._build_http_api(
+        http_api = self._build_http_api(
             get_cart_fn, add_item_fn, put_cart_fn, delete_item_fn, cognito_client_id
+        )
+        self._build_internal_routes(
+            http_api, internal_get_cart_fn, internal_remove_items_fn, internal_caller_role_arns
         )
         self._build_outbox_scheduler(outbox_publisher_fn)
 
@@ -234,6 +253,62 @@ class CartStack(Stack):
             authorizer=authorizer,
         )
         return http_api
+
+    def _build_internal_routes(
+        self,
+        http_api: apigwv2.HttpApi,
+        internal_get_cart_fn: lambda_.Function,
+        internal_remove_items_fn: lambda_.Function,
+        internal_caller_role_arns: tuple[str, ...],
+    ) -> None:
+        """MA-135 FR-5 — service-to-service only: IAM (SigV4), not the
+        Cognito JWT authorizer, since the `userId` path parameter is only
+        trustworthy when API Gateway has already verified the caller is
+        Order Service's own execution role. Same pattern as User's
+        internal address-state route (user_stack.py)."""
+        http_api.add_routes(
+            path="/cart/internal/users/{userId}",
+            methods=[apigwv2.HttpMethod.GET],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "InternalGetCartIntegration", internal_get_cart_fn
+            ),
+            authorizer=apigwv2_authorizers.HttpIamAuthorizer(),
+        )
+        http_api.add_routes(
+            path="/cart/internal/users/{userId}/remove-items",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "InternalRemoveItemsIntegration", internal_remove_items_fn
+            ),
+            authorizer=apigwv2_authorizers.HttpIamAuthorizer(),
+        )
+
+        route_arns = [
+            f"arn:{self.partition}:execute-api:{self.region}:{self.account}:"
+            f"{http_api.http_api_id}/*/GET/cart/internal/users/*",
+            f"arn:{self.partition}:execute-api:{self.region}:{self.account}:"
+            f"{http_api.http_api_id}/*/POST/cart/internal/users/*/remove-items",
+        ]
+        CfnOutput(
+            self,
+            "InternalRoutesArns",
+            value=",".join(route_arns),
+            description=(
+                "execute-api ARNs for MA-135's internal cart routes. Order "
+                "Service's execution role needs execute-api:Invoke on these — "
+                "list it in internal_caller_role_arns at deploy time, or grant "
+                "it from Order's own stack."
+            ),
+        )
+        for i, arn in enumerate(internal_caller_role_arns):
+            # mutable=True: the caller's role lives in its own stack; see
+            # user_stack.py's identical grant for why that's allowed.
+            caller_role = iam.Role.from_role_arn(
+                self, f"InternalCallerRole{i}", arn, mutable=True
+            )
+            caller_role.add_to_principal_policy(
+                iam.PolicyStatement(actions=["execute-api:Invoke"], resources=route_arns)
+            )
 
     def _build_outbox_scheduler(self, outbox_publisher_fn: lambda_.Function) -> None:
         rule = events.Rule(

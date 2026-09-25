@@ -27,7 +27,9 @@ def build_cart_service(settings: Settings) -> CartService:
     pricing_client = HttpPricingClient(
         settings.pricing_internal_base_url, settings.request_timeout_seconds
     )
-    wallet_client = HttpWalletClient()
+    wallet_client = HttpWalletClient(
+        settings.wallet_internal_base_url, settings.request_timeout_seconds
+    )
     return CartService(
         repository, catalog_client, user_client, pricing_client, wallet_client,
         settings.wallet_minimum_balance,

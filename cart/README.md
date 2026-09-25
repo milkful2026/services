@@ -14,6 +14,12 @@ subscription line items. Implements
 | POST | `/cart/items` | FR-2 | Cognito JWT |
 | PUT | `/cart` | FR-3 | Cognito JWT |
 | DELETE | `/cart/items/{id}` | FR-4 | Cognito JWT |
+| GET | `/cart/internal/users/{userId}` | MA-135 FR-3 | IAM (SigV4) — Order Service's checkout read |
+| POST | `/cart/internal/users/{userId}/remove-items` | MA-135 FR-4 | IAM (SigV4) — Order Service's post-checkout clear |
+
+`GET /cart` also returns `payNowQuote` (one-time lines only) and `perDeliveryQuote` (one delivery
+of every subscription line), each `null` when that partition is empty (MA-135 FR-2). Subscription
+lines carry a required `slotId`; one-time lines must not (MA-135 FR-1).
 
 ## Architecture decisions flagged for review
 
@@ -41,8 +47,10 @@ subscription line items. Implements
 - **Pricing & Offer Service (MA-101) doesn't exist yet** — `GET /cart` (which unconditionally needs
   a live quote per FR-1) fails closed with `PricingUnavailableError` until it does. This is the
   correct, spec'd failure mode, not a bug in this service.
-- **Wallet Service (MA-100) doesn't exist at all** — not even spec'd. FR-6's wallet gate fails
-  closed with `WalletCheckUnavailableError` for every subscription-frequency write until it exists.
+- **Wallet gate needs `CART_WALLET_INTERNAL_BASE_URL`.** The gate calls Wallet's
+  `GET /wallet/internal/balance` (MA-130 FR-3) and compares paise against
+  `wallet_minimum_balance` (whole rupees). Left unset, it fails closed with
+  `WalletCheckUnavailableError`, which is what every subscription write did before MA-135.
 
 ## Local development
 

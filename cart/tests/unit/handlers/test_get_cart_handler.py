@@ -51,7 +51,10 @@ def test_empty_cart_returns_200_with_null_quote():
 
     assert response["statusCode"] == 200
     data = json.loads(response["body"])["data"]
-    assert data == {"items": [], "cartVersion": 0, "quote": None}
+    assert data == {
+        "items": [], "cartVersion": 0, "quote": None,
+        "payNowQuote": None, "perDeliveryQuote": None,
+    }
 
 
 def test_cart_with_items_serializes_quote():

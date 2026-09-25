@@ -22,6 +22,7 @@ class CartRepositoryPort(Protocol):
         frequency: Frequency,
         start_date: str | None,
         idempotency_key: str,
+        slot_id: str | None = None,
     ) -> LineItem:
         """A repeated call with the same idempotency_key within the
         bounded window returns the original result rather than creating a
@@ -39,6 +40,20 @@ class CartRepositoryPort(Protocol):
     def delete_item(self, user_id: str, line_item_id: str) -> None:
         """Raises LineItemNotFoundError if line_item_id doesn't exist or
         doesn't belong to user_id (FR-4)."""
+        ...
+
+    def remove_items(
+        self,
+        user_id: str,
+        item_ids: list[str],
+        if_version: int,
+        reason: str,
+        checkout_id: str | None,
+    ) -> Cart:
+        """MA-135 FR-4. Raises CartVersionMismatchError if the cart moved
+        past if_version with some of the listed items still present; a
+        retried clear whose items are all already gone returns the current
+        cart instead."""
         ...
 
     def get_unpublished_outbox_events(self, limit: int) -> list[dict]:
@@ -90,8 +105,8 @@ class WalletClientPort(Protocol):
     def set_correlation_id(self, correlation_id: str) -> None: ...
 
     def get_balance(self, cognito_sub: str) -> int:
-        """Raises WalletCheckUnavailableError — always, today, since
-        Wallet Service (MA-100) doesn't exist (see README Known Gaps)."""
+        """Balance in paise. Raises WalletCheckUnavailableError on a
+        transport failure, or when no Wallet base URL is configured."""
         ...
 
 
