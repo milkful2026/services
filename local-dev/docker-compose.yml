@@ -106,8 +106,27 @@ services:
     build:
       context: ..
       dockerfile: user/Dockerfile
+    image: milkful-user:local
     ports:
       - "8002:8002"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ENV_LOCAL_PATH: /shared/user/.env.local
+    volumes:
+      - user-env:/shared/user
+
+  # Drains user's outbox (UserRegistered) to EventBridge — same image as
+  # `user`, different CMD. Without it, UserRegistered never left the
+  # outbox table, so Wallet never auto-provisioned a wallet for a newly
+  # registered user and /wallet/me sat at CREATING forever.
+  user-outbox:
+    build:
+      context: ..
+      dockerfile: user/Dockerfile
+    image: milkful-user:local
+    command: ["python", "run_local_outbox_publisher.py"]
     depends_on:
       bootstrap:
         condition: service_completed_successfully
