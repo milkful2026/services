@@ -601,10 +601,10 @@ def main() -> None:
             "PAYMENT_EVENT_BUS_NAME": "default",
             "PAYMENT_WALLET_INTERNAL_BASE_URL": WALLET_HTTP_URL,
             # Razorpay credentials are NOT provisioned by bootstrap.py —
-            # moto has no Razorpay equivalent. Copy payment/.env.local.example
-            # and fill in rzp_test_* values yourself for anything past the
-            # FakeGateway-backed unit/integration tests (real webhook
-            # signature verification, real orders.create).
+            # moto has no Razorpay equivalent. Under docker compose they come
+            # from the gitignored local-dev/.env (see .env.example) as real
+            # env vars; for a native run, copy payment/.env.local.example
+            # and fill in rzp_test_* values yourself.
             "PAYMENT_CORS_ALLOW_ALL": "true",
         },
     )

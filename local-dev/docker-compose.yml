@@ -326,6 +326,14 @@ services:
         condition: service_started
     environment:
       ENV_LOCAL_PATH: /shared/payment/.env.local
+      # rzp_test_* credentials from the gitignored local-dev/.env (compose
+      # reads it automatically for substitution; see .env.example). Real
+      # env vars win over the bootstrap-generated .env.local, so these
+      # reach Settings. Empty when unset — recharges then fail at
+      # orders.create, same as before.
+      PAYMENT_RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      PAYMENT_RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      PAYMENT_RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
     volumes:
       - payment-env:/shared/payment
 
