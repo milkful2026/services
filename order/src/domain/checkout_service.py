@@ -70,6 +70,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # created from the My Subscriptions screen, never through the cart.
 _SCHEDULE_FOR_FREQUENCY = {"DAILY": "DAILY", "ALTERNATE_DAYS": "ALTERNATE_DAYS"}
 
+# An IN_PROGRESS checkout untouched this long has no request still driving
+# it (every dependency call times out in seconds), so a new-key request
+# may resume it instead of being blocked by it forever.
+_ABANDONED_AFTER = timedelta(minutes=2)
+
 
 def new_checkout_id() -> str:
     return f"chk_{uuid.uuid4().hex}"
@@ -123,6 +128,10 @@ class CheckoutService:
             )
             return self._replay_or_resume(existing, correlation_id)
 
+        live = self._repo.get_live_checkout(user_id)
+        if live is not None:
+            self._settle_live_checkout(live, correlation_id)
+
         now = now or datetime.now(IST)
         checkout, order, balance_paise = self._validate_and_build(
             user_id=user_id,
@@ -160,6 +169,32 @@ class CheckoutService:
             )
         return self._run(checkout, correlation_id, known_balance_paise=None)
 
+    def _settle_live_checkout(self, live: Checkout, correlation_id: str) -> None:
+        """A different key found this user's IN_PROGRESS checkout. If
+        another request may still be driving it, reject (naming it so the
+        app can resume it). If it was abandoned — the app lost its key
+        after a CHECKOUT_INCOMPLETE — finish it here, so it can never lock
+        the user out; this request then validates against whatever cart
+        that leaves (usually CART_CHANGED, so the app re-reviews)."""
+        updated_at = live.updated_at
+        if updated_at is not None and updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=UTC)  # SQLite drops the offset
+        if updated_at is None or datetime.now(UTC) - updated_at < _ABANDONED_AFTER:
+            raise CheckoutInProgressError(
+                "Another checkout is already in progress for this account",
+                {"checkoutId": live.id},
+            )
+        logger.info(
+            "checkout.resume_abandoned",
+            extra={"checkoutId": live.id, "correlationId": correlation_id},
+        )
+        try:
+            self._run(live, correlation_id, known_balance_paise=None)
+        except (InsufficientBalanceError, WalletNotActiveError):
+            # The abandoned checkout is now PAYMENT_FAILED — terminal, so
+            # it no longer blocks. This request runs its own balance check.
+            pass
+
     # --- FR-3/FR-4: validation (no side effects) + the records to start ---
 
     def _validate_and_build(
@@ -171,11 +206,6 @@ class CheckoutService:
         expected_pay_now_paise: int | None,
         now: datetime,
     ) -> tuple[Checkout, Order | None, int]:
-        if self._repo.get_live_checkout(user_id) is not None:
-            raise CheckoutInProgressError(
-                "Another checkout is already in progress for this account"
-            )
-
         try:
             cart = self._cart.get_cart(user_id)
         except CartUnavailableError as exc:
@@ -260,7 +290,10 @@ class CheckoutService:
         delivery_date = self._delivery_date(now)
         checkout_id = new_checkout_id()
         order = None
-        if pay_now_paise > 0:
+        # Every one-time line gets an order, even one that prices to ₹0
+        # (a 100% offer): the order is what records the delivery, and the
+        # clear step removes these lines from the cart regardless.
+        if one_time:
             order = Order(
                 id=new_order_id(),
                 user_id=user_id,
@@ -332,6 +365,14 @@ class CheckoutService:
             # Crashed after recording the failure but before the checkout
             # was marked — finish failing it the same way.
             self._fail_checkout(checkout, order.failure_reason or "INSUFFICIENT_BALANCE", None)
+        if order.amount_paise == 0:
+            # Nothing to debit — confirm directly rather than asking
+            # Wallet for a zero-amount debit.
+            now = datetime.now(UTC)
+            payload = self._confirmed_payload(order, checkout, now, correlation_id)
+            self._repo.mark_confirmed(order.id, now, "OrderConfirmed", payload)
+            logger.info("checkout.paid", extra={"checkoutId": checkout.id, "orderId": order.id})
+            return balance_after
 
         try:
             debit = self._wallet.debit(
@@ -501,10 +542,28 @@ class CheckoutService:
                 )
             except CartVersionConflictError:
                 # The customer edited the cart from another device mid-
-                # checkout: re-read once and remove what's still there.
+                # checkout: re-read once and remove only the lines still
+                # exactly as checked out. A line edited since (say, quantity
+                # 1 -> 5) wasn't what we charged for or subscribed to, so it
+                # stays in the cart for the customer to check out again.
                 current = self._cart.get_cart(checkout.user_id)
-                present_ids = {item["id"] for item in current.items}
-                remaining = [item_id for item_id in item_ids if item_id in present_ids]
+                snapshot = {line.line_id: line for line in checkout.lines}
+                unchanged_ids = {
+                    item["id"]
+                    for item in current.items
+                    if _line_from_cart(item) == snapshot.get(item["id"])
+                }
+                remaining = [item_id for item_id in item_ids if item_id in unchanged_ids]
+                edited = [
+                    item["id"]
+                    for item in current.items
+                    if item["id"] in item_ids and item["id"] not in unchanged_ids
+                ]
+                if edited:
+                    logger.info(
+                        "checkout.clear_skipped_edited_lines",
+                        extra={"checkoutId": checkout.id, "lineIds": edited},
+                    )
                 if remaining:
                     self._cart.remove_items(
                         checkout.user_id, remaining, current.cart_version, checkout.id

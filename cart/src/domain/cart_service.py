@@ -158,8 +158,6 @@ class CartService:
             quantity = item["quantity"]
             frequency = item["frequency"]
             start_date = item.get("start_date")
-            slot_id = item.get("slot_id")
-            self._validate_item(quantity, frequency, start_date, slot_id)
 
             item_id = item.get("id")
             if item_id is not None:
@@ -175,12 +173,26 @@ class CartService:
                 # exists — an unrelated edit elsewhere in the cart must not
                 # reset every item's "added" timestamp to now.
                 item["added_at"] = existing.added_at
+                # An app build from before slotId existed echoes existing
+                # lines back without it — keep the stored slot rather than
+                # silently dropping it on an unrelated edit.
+                if item.get("slot_id") is None and frequency.is_subscription:
+                    item["slot_id"] = existing.slot_id
+            slot_id = item.get("slot_id")
+
             is_new_or_changed = (
                 existing is None
                 or existing.quantity != quantity
                 or existing.frequency != frequency
                 or existing.start_date != start_date
                 or existing.slot_id != slot_id
+            )
+            # slotId is only required of lines this request adds or
+            # changes: a subscription line stored before slotId existed
+            # must not block every other edit to the cart. Checkout
+            # rejects such a line on its own (LINE_INVALID / SLOT_MISSING).
+            self._validate_item(
+                quantity, frequency, start_date, slot_id, require_slot=is_new_or_changed
             )
             if frequency.is_subscription and is_new_or_changed:
                 needs_wallet_gate = True
@@ -208,6 +220,7 @@ class CartService:
         frequency: Frequency,
         start_date: str | None,
         slot_id: str | None = None,
+        require_slot: bool = True,
     ) -> None:
         if quantity < 1:
             raise ValidationError(f"quantity must be at least 1 (got {quantity})")
@@ -217,7 +230,11 @@ class CartService:
             raise ValidationError("startDate is required for a subscription item")
         # MA-135 FR-1 — Subscription Service's create requires a slot, and
         # checkout (MA-136) creates the subscription from this line.
-        if frequency.is_subscription and not (slot_id and slot_id.strip()):
+        if (
+            require_slot
+            and frequency.is_subscription
+            and not (slot_id and slot_id.strip())
+        ):
             raise ValidationError("slotId is required for a subscription item")
         if frequency == Frequency.ONE_TIME and slot_id is not None:
             raise ValidationError("slotId must not be set for a ONE_TIME item")

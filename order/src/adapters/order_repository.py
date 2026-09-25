@@ -435,8 +435,10 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                 same_key = self.get_checkout(checkout.user_id, checkout.idempotency_key)
                 if same_key is not None:
                     return same_key
+                live = self.get_live_checkout(checkout.user_id)
                 raise CheckoutInProgressError(
-                    "Another checkout is already in progress for this account"
+                    "Another checkout is already in progress for this account",
+                    {"checkoutId": live.id} if live is not None else None,
                 ) from None
 
     def update_checkout(
@@ -536,4 +538,5 @@ def _row_to_checkout(row) -> Checkout:
             SubscriptionLineResult.from_dict(d) for d in (row.subscription_results or [])
         ],
         result=row.result,
+        updated_at=row.updated_at,
     )

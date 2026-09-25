@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
+from adapters.order_repository import checkouts_table
 from domain.checkout_models import CheckoutStatus, CheckoutStep
 from domain.exceptions import (
     CartChangedError,
@@ -124,6 +125,25 @@ def test_subscription_only_cart_charges_nothing_now(
     assert wallet_client.calls == []
     assert [s["status"] for s in result["subscriptions"]] == ["CREATED"]
     assert result["walletBalanceAfterPaise"] == 100_000
+
+
+def test_free_one_time_lines_still_get_a_confirmed_order(
+    checkout_service, repo, cart_client, pricing_client, wallet_client
+):
+    # A 100% offer prices the one-time lines to ₹0 — the lines still leave
+    # the cart, so there must still be an order recording the delivery.
+    cart_client.items = [_one_time()]
+    pricing_client.net_payable = 0.0
+
+    result = _checkout(checkout_service, expected=0)
+
+    order = result["order"]
+    assert order["status"] == "CONFIRMED"
+    assert order["amountPaise"] == 0
+    assert order["items"] == [{"productId": "buffalo-milk", "quantity": 1}]
+    assert wallet_client.calls == []  # no zero-amount debit
+    assert cart_client.items == []
+    assert [e["event_type"] for e in repo.fetch_unpublished()] == ["OrderConfirmed"]
 
 
 def test_alternate_days_maps_to_its_schedule(checkout_service, cart_client, subscription_client):
@@ -282,15 +302,67 @@ def test_dependency_down_before_start_is_retryable_and_persists_nothing(
 
 
 def test_second_live_checkout_with_another_key_is_rejected(
-    checkout_service, cart_client, wallet_client
+    checkout_service, repo, cart_client, wallet_client
 ):
     cart_client.items = [_one_time()]
     wallet_client.raise_unavailable = True
     with pytest.raises(CheckoutIncompleteError):
         _checkout(checkout_service, key="key-00000001")
 
-    with pytest.raises(CheckoutInProgressError):
+    live = repo.get_live_checkout("user-1")
+    with pytest.raises(CheckoutInProgressError) as exc_info:
         _checkout(checkout_service, key="key-00000002")
+    # Names the live checkout, so the app can tell which one to resume.
+    assert exc_info.value.details == {"checkoutId": live.id}
+
+
+def _abandon(engine, checkout_id):
+    with engine.begin() as conn:
+        conn.execute(
+            checkouts_table.update()
+            .where(checkouts_table.c.id == checkout_id)
+            .values(updated_at=datetime.now(UTC) - timedelta(minutes=10))
+        )
+
+
+def test_abandoned_live_checkout_is_finished_by_a_new_key_instead_of_blocking_it(
+    checkout_service, repo, engine, cart_client, wallet_client
+):
+    # The app got CHECKOUT_INCOMPLETE and then lost its Idempotency-Key.
+    cart_client.items = [_one_time()]
+    wallet_client.raise_unavailable = True
+    with pytest.raises(CheckoutIncompleteError):
+        _checkout(checkout_service, key="key-00000001")
+    abandoned = repo.get_live_checkout("user-1")
+    _abandon(engine, abandoned.id)
+    wallet_client.raise_unavailable = False
+
+    # The new key finishes the abandoned checkout (one charge, cart
+    # cleared), then validates its own request against the cleared cart.
+    with pytest.raises((CartEmptyError, CartChangedError)):
+        _checkout(checkout_service, key="key-00000002")
+
+    assert repo.get_live_checkout("user-1") is None
+    assert repo.get_checkout("user-1", "key-00000001").status == CheckoutStatus.COMPLETED
+    assert [c[1] for c in wallet_client.calls] == [abandoned.order_id] * 2  # 1 failed, 1 ok
+    assert cart_client.items == []
+
+
+def test_abandoned_live_checkout_that_is_declined_no_longer_blocks(
+    checkout_service, repo, engine, cart_client, wallet_client
+):
+    cart_client.items = [_one_time()]
+    wallet_client.raise_unavailable = True
+    with pytest.raises(CheckoutIncompleteError):
+        _checkout(checkout_service, key="key-00000001")
+    _abandon(engine, repo.get_live_checkout("user-1").id)
+    wallet_client.raise_unavailable = False
+    wallet_client.result_status = "INSUFFICIENT_BALANCE"
+
+    with pytest.raises(InsufficientBalanceError):
+        _checkout(checkout_service, key="key-00000002")
+
+    assert repo.get_checkout("user-1", "key-00000001").status == CheckoutStatus.PAYMENT_FAILED
 
 
 # --- FR-5: charge outcomes --------------------------------------------------------
@@ -428,6 +500,26 @@ def test_cart_edited_elsewhere_mid_checkout_is_re_read_and_cleared(checkout_serv
 
     assert cart_client.items == []
     assert [call[1] for call in cart_client.remove_calls] == [3, 4]
+
+
+def test_line_edited_elsewhere_mid_checkout_stays_in_the_cart(checkout_service, cart_client):
+    cart_client.items = [_one_time(), _daily()]
+    cart_client.conflict_once = True
+    remove = cart_client.remove_items
+
+    def edit_then_remove(*args, **kwargs):
+        # Another device raises the one-time line's quantity 1 -> 5 while
+        # this checkout (which charged for 1) is clearing the cart.
+        cart_client.items[0]["quantity"] = 5
+        return remove(*args, **kwargs)
+
+    cart_client.remove_items = edit_then_remove
+
+    result = _checkout(checkout_service)
+
+    assert result["order"]["items"] == [{"productId": "buffalo-milk", "quantity": 1}]
+    assert cart_client.remove_calls[-1][0] == ["li-2"]
+    assert [(i["id"], i["quantity"]) for i in cart_client.items] == [("li-1", 5)]
 
 
 def test_cart_down_at_clear_pauses_then_resume_finishes_without_side_effects(

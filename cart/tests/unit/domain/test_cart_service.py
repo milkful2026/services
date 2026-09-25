@@ -491,6 +491,59 @@ def test_replace_cart_changed_slot_is_re_gated():
     assert fakes["wallet"].calls == ["user-1"]
 
 
+def _legacy_subscription_line():
+    # Stored before slotId existed — no slot on the row.
+    return LineItem(id="sub-1", product_id="cow-milk", quantity=1, frequency=Frequency.DAILY,
+                    start_date="2026-09-01", added_at="2026-08-28T00:00:00Z", slot_id=None)
+
+
+def test_replace_cart_untouched_legacy_line_without_slot_does_not_block_other_edits():
+    service, fakes = _service(cart=Cart(line_items=[_legacy_subscription_line()], cart_version=3))
+
+    service.replace_cart(
+        "user-1",
+        items=[
+            {"id": "sub-1", "product_id": "cow-milk", "quantity": 1,
+             "frequency": Frequency.DAILY, "start_date": "2026-09-01"},
+            {"product_id": "buffalo-milk", "quantity": 2, "frequency": Frequency.ONE_TIME},
+        ],
+        if_version=3,
+    )
+
+    assert len(fakes["repo"].replace_cart_calls) == 1
+
+
+def test_replace_cart_changed_legacy_line_still_needs_a_slot():
+    service, fakes = _service(cart=Cart(line_items=[_legacy_subscription_line()], cart_version=3))
+
+    with pytest.raises(ValidationError, match="slotId is required"):
+        service.replace_cart(
+            "user-1",
+            items=[{"id": "sub-1", "product_id": "cow-milk", "quantity": 3,
+                    "frequency": Frequency.DAILY, "start_date": "2026-09-01"}],
+            if_version=3,
+        )
+
+    assert fakes["repo"].replace_cart_calls == []
+
+
+def test_replace_cart_request_without_slot_keeps_the_stored_slot():
+    # An older app build that doesn't send slotId echoes the line back
+    # without it — the stored slot must survive, and nothing is re-gated.
+    existing = _item(id="sub-1", frequency=Frequency.DAILY, start_date="2026-09-01")
+    service, fakes = _service(cart=Cart(line_items=[existing], cart_version=3))
+
+    service.replace_cart(
+        "user-1",
+        items=[{"id": "sub-1", "product_id": "cow-milk", "quantity": 1,
+                "frequency": Frequency.DAILY, "start_date": "2026-09-01"}],
+        if_version=3,
+    )
+
+    assert fakes["repo"].replace_cart_calls[0]["items"][0]["slot_id"] == "slot-am"
+    assert fakes["wallet"].calls == []
+
+
 # -- wallet gate is paise vs. a whole-rupee minimum --------------------------
 
 

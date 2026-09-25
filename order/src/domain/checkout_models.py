@@ -7,7 +7,7 @@ run again, so a retried request with the same Idempotency-Key resumes at
 """
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 
 
@@ -112,6 +112,9 @@ class Checkout:
     # The stored response for replay: the FR-9 success body, or for
     # PAYMENT_FAILED {"error": {errorCode, message, httpStatus, details}}.
     result: dict | None = None
+    # Last write to the row — how a new-key request tells an abandoned
+    # IN_PROGRESS checkout from one another request is still running.
+    updated_at: datetime | None = None
 
     @property
     def one_time_lines(self) -> list[CheckoutLine]:

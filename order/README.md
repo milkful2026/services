@@ -27,16 +27,20 @@ lines, listed in `items`; `subscriptionId` is null).
 POST /orders/checkout {cartVersion, expectedPayNowPaise?} + Idempotency-Key
   -> (user, key) already has a checkout: COMPLETED/PAYMENT_FAILED -> replay,
      IN_PROGRESS -> resume at its step
-  -> validate, nothing persisted: one live checkout per user, Cart internal
+  -> another IN_PROGRESS checkout for the user: 409 CHECKOUT_IN_PROGRESS
+     naming it, or — untouched for 2 min (abandoned) — finish it first
+  -> validate, nothing persisted: Cart internal
      read + version, line shape (slot, start date), User address state,
      Pricing quote of the one-time lines, price match, Wallet balance
      (pay-now + ₹500 minimum if any subscription line)
   -> one txn: checkouts(IN_PROGRESS, STARTED) + CREATED order + order_items
+     (an order whenever there are one-time lines, even at ₹0)
   -> Wallet debit: DEBITED -> CONFIRMED (+OrderConfirmed); declined ->
      PAYMENT_FAILED, checkout ends, nothing else happens
   -> Subscription POST /internal/subscriptions per line
      (key checkout:{id}:{lineId}); a 4xx fails that line only
-  -> Cart internal remove-items (the checked-out lines)
+  -> Cart internal remove-items (the checked-out lines; on a version
+     conflict, only those still exactly as checked out)
   -> COMPLETED, result stored for same-key replay
 ```
 
@@ -119,8 +123,10 @@ every other service here); no real AWS/DB/network.
   visibility timeout — MA-132 §11 explicitly defers this; redelivery is
   the only recovery path in this pass.
 - A sweep that resumes checkouts left `IN_PROGRESS` by a client that
-  never retried (MA-136 §11). Until it exists, such a checkout blocks
-  that user's next checkout until the app resumes it with its persisted
-  key. **Needed before production.**
+  never retried (MA-136 §11). Until it exists, such a checkout is only
+  finished when the user next checks out (it no longer blocks them once
+  it's been untouched for 2 minutes), so a paid-but-unfinished checkout
+  can sit with its subscriptions not yet created. **Needed before
+  production.**
 - The checkout's IAM grant for Cart's internal routes (Cart stack's
   `internal_caller_role_arns`) — same manual cross-stack step as User's.
