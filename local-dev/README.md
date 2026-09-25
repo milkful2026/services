@@ -32,6 +32,21 @@ cd services/local-dev
 docker compose up -d
 ```
 
+Or use the wrapper script, which does the same `docker compose up -d` and then verifies every one
+of the ten app services actually responds (not just that its container shows "Up") before it exits
+successfully — the same check-every-port routine used to debug flaky local runs, now scripted:
+
+```bash
+./start-backend.sh              # Git Bash / WSL / macOS / Linux
+# or, from PowerShell / cmd:
+powershell -ExecutionPolicy Bypass -File start-backend.ps1
+```
+
+Safe to re-run any time — `docker compose up -d` reuses/recreates containers as needed and
+`bootstrap.py`'s seeds are upserts. Exits non-zero (and prints which service to check
+`docker compose logs` for) if anything fails to come up, instead of leaving you to discover it
+later on whichever screen happens to call that service first.
+
 One command brings up the whole stack: `moto_server` (:5000), Postgres (:5432), Redis (:6379),
 a one-shot `bootstrap` container that waits for those to be healthy and then runs
 `bootstrap.py` + `apply_migrations.py` + all three `seed_*.py` scripts, and every app service —
