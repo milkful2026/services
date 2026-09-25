@@ -20,10 +20,13 @@ class FakeCartService:
     def set_correlation_id(self, correlation_id: str) -> None:
         self.correlation_id = correlation_id
 
-    def add_item(self, user_id, product_id, quantity, frequency, start_date, idempotency_key):
+    def add_item(
+        self, user_id, product_id, quantity, frequency, start_date, idempotency_key, slot_id=None
+    ):
         self.calls.append({
             "user_id": user_id, "product_id": product_id, "quantity": quantity,
             "frequency": frequency, "start_date": start_date, "idempotency_key": idempotency_key,
+            "slot_id": slot_id,
         })
         if self.raises:
             raise self.raises
@@ -128,3 +131,22 @@ def test_domain_validation_error_propagates_as_400():
     )
 
     assert response["statusCode"] == 400
+
+
+def test_slot_id_is_forwarded_and_echoed():
+    service = _inject(
+        line_item=LineItem(
+            id="item-2", product_id="cow-milk", quantity=1, frequency=Frequency.DAILY,
+            start_date="2026-09-27", added_at="2026-08-28T00:00:00Z", slot_id="slot-am",
+        )
+    )
+
+    response = add_item_handler.handler(
+        _event({"productId": "cow-milk", "quantity": 1, "frequency": "DAILY",
+                "startDate": "2026-09-27", "slotId": "slot-am"}),
+        None,
+    )
+
+    assert response["statusCode"] == 201
+    assert service.calls[0]["slot_id"] == "slot-am"
+    assert json.loads(response["body"])["data"]["slotId"] == "slot-am"

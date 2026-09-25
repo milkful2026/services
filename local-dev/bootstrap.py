@@ -47,6 +47,10 @@ CATALOG_HTTP_URL = os.environ.get("LOCAL_DEV_CATALOG_HTTP_URL", "http://localhos
 USER_HTTP_URL = os.environ.get("LOCAL_DEV_USER_HTTP_URL", "http://localhost:8002")
 PRICING_HTTP_URL = os.environ.get("LOCAL_DEV_PRICING_HTTP_URL", "http://localhost:8005")
 WALLET_HTTP_URL = os.environ.get("LOCAL_DEV_WALLET_HTTP_URL", "http://localhost:8006")
+CART_HTTP_URL = os.environ.get("LOCAL_DEV_CART_HTTP_URL", "http://localhost:8004")
+SUBSCRIPTION_HTTP_URL = os.environ.get(
+    "LOCAL_DEV_SUBSCRIPTION_HTTP_URL", "http://localhost:8008"
+)
 
 _SERVICES_DIR = Path(__file__).resolve().parent.parent
 
@@ -565,10 +569,10 @@ def main() -> None:
             "CART_CATALOG_INTERNAL_BASE_URL": CATALOG_HTTP_URL,
             "CART_USER_INTERNAL_BASE_URL": USER_HTTP_URL,
             "CART_PRICING_INTERNAL_BASE_URL": PRICING_HTTP_URL,
-            # Left unset — matches config.env.Settings' own "" default:
-            # Cart Service's own wallet wiring is out of MA-24's scope
-            # (see the MA-24 implementation plan's explicit note); Wallet
-            # Service existing now doesn't change this file.
+            # MA-135 — the subscription wallet gate's balance read
+            # (Wallet's GET /wallet/internal/balance). Unset, every
+            # subscription line add would fail closed.
+            "CART_WALLET_INTERNAL_BASE_URL": WALLET_HTTP_URL,
         },
     )
     _write_env_file(
@@ -633,6 +637,10 @@ def main() -> None:
             "ORDER_USER_INTERNAL_BASE_URL": USER_HTTP_URL,
             "ORDER_PRICING_BASE_URL": PRICING_HTTP_URL,
             "ORDER_WALLET_INTERNAL_BASE_URL": WALLET_HTTP_URL,
+            # MA-136 cart checkout — Cart's internal read/clear and
+            # Subscription's internal create.
+            "ORDER_CART_INTERNAL_BASE_URL": CART_HTTP_URL,
+            "ORDER_SUBSCRIPTION_INTERNAL_BASE_URL": SUBSCRIPTION_HTTP_URL,
             # Local dev only — Flutter web's browser-origin CORS block,
             # same reasoning as inventory/catalog/wallet's identical entries.
             "ORDER_CORS_ALLOW_ALL": "true",

@@ -74,3 +74,6 @@ class UserProfile:
     default_address_state: str | None = None  # None when no default address is set
     # None when no default address, or it predates zone_id
     default_address_zone_id: str | None = None
+    # MA-135 FR-6 — the whole default address as saved from the onboarding
+    # Google Maps / Places screen; None when no default address is set.
+    default_address: Address | None = None

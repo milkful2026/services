@@ -29,7 +29,7 @@ def template() -> Template:
     return Template.from_stack(stack)
 
 
-def test_five_lambdas_exist_for_the_five_handlers(template):
+def test_seven_lambdas_exist_for_the_seven_handlers(template):
     functions = template.find_resources("AWS::Lambda::Function")
     handlers = {
         props["Properties"].get("Handler")
@@ -42,6 +42,8 @@ def test_five_lambdas_exist_for_the_five_handlers(template):
         "handlers.put_cart_handler.handler",
         "handlers.delete_item_handler.handler",
         "handlers.outbox_publisher_handler.handler",
+        "handlers.internal_get_cart_handler.handler",
+        "handlers.internal_remove_items_handler.handler",
     }
 
 
@@ -59,8 +61,12 @@ def test_cart_table_has_the_right_key_schema_and_ttl(template):
     )
 
 
-def test_all_four_routes_use_jwt_authorizer(template):
-    routes = template.find_resources("AWS::ApiGatewayV2::Route")
+def test_all_four_public_routes_use_jwt_authorizer(template):
+    routes = {
+        k: v
+        for k, v in template.find_resources("AWS::ApiGatewayV2::Route").items()
+        if "/internal/" not in v["Properties"]["RouteKey"]
+    }
     assert len(routes) == 4
     for props in routes.values():
         assert props["Properties"]["AuthorizationType"] == "JWT"
@@ -112,3 +118,27 @@ def test_no_vpc_is_provisioned(template):
     # cart_stack.py's own module docstring point 3 — no Redis/VPC-bound
     # dependency exists in this pass, unlike identity-auth/user/inventory.
     assert template.find_resources("AWS::EC2::VPC") == {}
+
+
+def test_internal_checkout_routes_use_iam_not_jwt(template):
+    routes = template.find_resources("AWS::ApiGatewayV2::Route")
+    internal = {
+        props["Properties"]["RouteKey"]: props["Properties"]
+        for props in routes.values()
+        if "/internal/" in props["Properties"]["RouteKey"]
+    }
+    assert set(internal) == {
+        "GET /cart/internal/users/{userId}",
+        "POST /cart/internal/users/{userId}/remove-items",
+    }
+    for props in internal.values():
+        assert props["AuthorizationType"] == "AWS_IAM"
+
+
+def test_wallet_internal_base_url_is_passed_to_the_lambdas(template):
+    functions = template.find_resources("AWS::Lambda::Function")
+    get_cart = next(
+        f for f in functions.values()
+        if f["Properties"].get("Handler") == "handlers.add_item_handler.handler"
+    )
+    assert "CART_WALLET_INTERNAL_BASE_URL" in get_cart["Properties"]["Environment"]["Variables"]

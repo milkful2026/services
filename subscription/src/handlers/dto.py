@@ -32,6 +32,14 @@ class CreateSubscriptionRequest(BaseModel):
     idempotencyKey: str  # noqa: N815
 
 
+class InternalCreateSubscriptionRequest(CreateSubscriptionRequest):
+    """MA-136 FR-11 — Order Service's checkout creates a subscription on
+    the customer's behalf, so the user comes from the body, not a JWT."""
+
+    userId: str = Field(min_length=1)  # noqa: N815
+    correlationId: str | None = None  # noqa: N815
+
+
 class PauseRequest(BaseModel):
     from_: date | None = Field(default=None, alias="from")
     until: date | None = None

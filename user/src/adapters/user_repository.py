@@ -187,6 +187,7 @@ class SqlAlchemyUserRepository:
             default_address_id=default_row.id if default_row else "",
             default_address_state=default_row.state if default_row else None,
             default_address_zone_id=default_row.zone_id if default_row else None,
+            default_address=_row_to_address(default_row) if default_row else None,
         )
 
     def register(
@@ -375,3 +376,21 @@ class SqlAlchemyUserRepository:
             )
         except SQLAlchemyError as exc:
             raise ExternalServiceUnavailableError("Failed to mark outbox event published") from exc
+
+
+def _row_to_address(row) -> Address:
+    """MA-135 FR-6 — the stored default address row, verbatim (no
+    re-geocoding): exactly what the onboarding Google Maps / Places screen
+    saved."""
+    return Address(
+        id=row.id,
+        lines=list(row.lines or []),
+        city=row.city,
+        state=row.state,
+        pincode=row.pincode,
+        lat=float(row.lat),
+        lng=float(row.lng),
+        landmark=row.landmark,
+        is_default=bool(row.is_default),
+        zone_id=row.zone_id,
+    )

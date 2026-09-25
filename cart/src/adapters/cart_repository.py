@@ -85,6 +85,7 @@ def _item_to_line_item(item: dict[str, Any]) -> LineItem:
         frequency=Frequency(item["frequency"]),
         start_date=item.get("startDate"),
         added_at=item["addedAt"],
+        slot_id=item.get("slotId"),
     )
 
 
@@ -99,6 +100,7 @@ def _line_item_to_response_dict(line_item: LineItem) -> dict[str, Any]:
         "frequency": str(line_item.frequency),
         "startDate": line_item.start_date,
         "addedAt": line_item.added_at,
+        "slotId": line_item.slot_id,
     }
 
 
@@ -110,6 +112,8 @@ def _response_dict_to_line_item(data: dict[str, Any]) -> LineItem:
         frequency=Frequency(data["frequency"]),
         start_date=data["startDate"],
         added_at=data["addedAt"],
+        # .get(): replay rows written before slotId existed lack the key.
+        slot_id=data.get("slotId"),
     )
 
 
@@ -186,6 +190,7 @@ class DynamoDbCartRepository:
         frequency: Frequency,
         start_date: str | None,
         idempotency_key: str | None,
+        slot_id: str | None = None,
     ) -> LineItem:
         if idempotency_key:
             replay = self._find_idempotency_replay(user_id, idempotency_key)
@@ -201,6 +206,7 @@ class DynamoDbCartRepository:
             frequency=frequency,
             start_date=start_date,
             added_at=added_at,
+            slot_id=slot_id,
         )
         expires_at = _cart_expires_at()
         event_id = str(uuid.uuid4())
@@ -216,6 +222,7 @@ class DynamoDbCartRepository:
                         "quantity": quantity,
                         "frequency": str(frequency),
                         "startDate": start_date,
+                        "slotId": slot_id,
                         "addedAt": added_at,
                         "expiresAt": expires_at,
                     }.items()},
@@ -339,6 +346,7 @@ class DynamoDbCartRepository:
                     frequency=frequency,
                     start_date=item.get("start_date"),
                     added_at=added_at,
+                    slot_id=item.get("slot_id"),
                 )
             )
             transact_items.append(
@@ -352,6 +360,7 @@ class DynamoDbCartRepository:
                             "quantity": item["quantity"],
                             "frequency": str(frequency),
                             "startDate": item.get("start_date"),
+                            "slotId": item.get("slot_id"),
                             "addedAt": added_at,
                             "expiresAt": expires_at,
                         }.items()},
@@ -438,6 +447,97 @@ class DynamoDbCartRepository:
                 extra={"correlationId": self._correlation_id, "error": str(exc)},
             )
             raise CartServiceError("Failed to delete cart item") from exc
+
+    def remove_items(
+        self,
+        user_id: str,
+        item_ids: list[str],
+        if_version: int,
+        reason: str,
+        checkout_id: str | None,
+    ) -> Cart:
+        """MA-135 FR-4 — Order Service's post-checkout clear. Deletes the
+        listed ITEM# rows, bumps cartVersion (checked against `if_version`)
+        and writes one CartUpdated outbox row, all in one transaction. IDs
+        no longer in the cart are skipped rather than failing the call. If
+        *none* of them are left and the cart has already moved past
+        `if_version`, this is a retried clear that already succeeded, so
+        the current cart is returned instead of a 409."""
+        current = self.get_cart(user_id)
+        wanted = set(item_ids)
+        present = [li.id for li in current.line_items if li.id in wanted]
+        if not present and current.cart_version >= if_version:
+            return current
+        if current.cart_version != if_version:
+            raise CartVersionMismatchError(
+                "Cart was modified by another device — refetch and retry",
+                details={"expectedVersion": if_version, "cartVersion": current.cart_version},
+            )
+
+        expires_at = _cart_expires_at()
+        event_id = str(uuid.uuid4())
+        new_version = if_version + 1
+        transact_items: list[dict[str, Any]] = [
+            {
+                "Delete": {
+                    "TableName": self._table_name,
+                    "Key": {
+                        "userId": _to_av(user_id),
+                        "SK": _to_av(f"{_ITEM_PREFIX}{line_item_id}"),
+                    },
+                }
+            }
+            for line_item_id in present
+        ]
+        meta_index = len(transact_items)
+        transact_items.append(
+            self._meta_upsert_transact_item(
+                user_id, expires_at, explicit_version=new_version, expected_version=if_version
+            )
+        )
+        transact_items.append(
+            self._outbox_put_transact_item(
+                user_id,
+                event_id,
+                "ITEMS_REMOVED",
+                cart_id=user_id,
+                extra_payload={"reason": reason, "checkoutId": checkout_id},
+            )
+        )
+
+        try:
+            self._client.transact_write_items(TransactItems=transact_items)
+        except self._client.exceptions.TransactionCanceledException as exc:
+            if self._condition_failed_for(exc, meta_index):
+                raise CartVersionMismatchError(
+                    "Cart was modified by another device — refetch and retry",
+                    details={"expectedVersion": if_version},
+                ) from exc
+            logger.error(
+                "cart_repository.remove_items failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise CartServiceError("Failed to remove cart items") from exc
+        except ClientError as exc:
+            logger.error(
+                "cart_repository.remove_items failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise CartServiceError("Failed to remove cart items") from exc
+
+        logger.info(
+            "cart.internal.remove_items",
+            extra={
+                "correlationId": self._correlation_id,
+                "userId": user_id,
+                "checkoutId": checkout_id,
+                "removedCount": len(present),
+                "cartVersion": new_version,
+            },
+        )
+        removed = set(present)
+        remaining = [li for li in current.line_items if li.id not in removed]
+        return Cart(line_items=remaining, cart_version=new_version)
 
     # -- outbox (outbox_publisher_handler only) --------------------------
 
@@ -612,7 +712,12 @@ class DynamoDbCartRepository:
         }
 
     def _outbox_put_transact_item(
-        self, user_id: str, event_id: str, change_type: str, cart_id: str
+        self,
+        user_id: str,
+        event_id: str,
+        change_type: str,
+        cart_id: str,
+        extra_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "eventId": event_id,
@@ -620,6 +725,7 @@ class DynamoDbCartRepository:
             "cartId": cart_id,
             "changeType": change_type,
             "occurredAt": datetime.now(UTC).isoformat(),
+            **(extra_payload or {}),
         }
         return {
             "Put": {

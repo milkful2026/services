@@ -67,16 +67,60 @@ class CartService:
                 "No default delivery address set for this account"
             )
 
+        # MA-135 FR-2 — the existing all-lines `quote` plus the review
+        # screen's split: one-time lines (paid at checkout) and subscription
+        # lines (one delivery each). An empty partition is never quoted
+        # (Pricing rejects an empty list), and a partition that *is* the
+        # whole cart reuses `quote` rather than asking Pricing the same
+        # question twice — so only a mixed cart costs three calls, run
+        # concurrently. Any failure fails the whole GET, like the single
+        # quote always has.
+        one_time = [li for li in cart.line_items if not li.frequency.is_subscription]
+        recurring = [li for li in cart.line_items if li.frequency.is_subscription]
+        if not recurring or not one_time:
+            quote = self._quote_lines(cart.line_items, delivery_state)
+            pay_now_quote = quote if one_time else None
+            per_delivery_quote = quote if recurring else None
+        else:
+            partitions = [cart.line_items, one_time, recurring]
+            with ThreadPoolExecutor(max_workers=len(partitions)) as executor:
+                futures = [
+                    executor.submit(self._quote_lines, lines, delivery_state)
+                    for lines in partitions
+                ]
+                quote, pay_now_quote, per_delivery_quote = (f.result() for f in futures)
+        return CartView(
+            cart=cart,
+            quote=quote,
+            pay_now_quote=pay_now_quote,
+            per_delivery_quote=per_delivery_quote,
+        )
+
+    def _quote_lines(self, lines: list[LineItem], delivery_state: str):
         items_payload = [
             {
                 "product_id": li.product_id,
                 "quantity": li.quantity,
                 "frequency": str(li.frequency),
             }
-            for li in cart.line_items
+            for li in lines
         ]
-        quote = self._pricing_client.quote(items_payload, delivery_state)
-        return CartView(cart=cart, quote=quote)
+        return self._pricing_client.quote(items_payload, delivery_state)
+
+    def get_cart_internal(self, user_id: str) -> Cart:
+        """MA-135 FR-3 — Order Service's checkout read. No quote: Order
+        prices the one-time lines itself at checkout time."""
+        return self._repository.get_cart(user_id)
+
+    def remove_items_internal(
+        self, user_id: str, item_ids: list[str], if_version: int, checkout_id: str | None
+    ) -> Cart:
+        """MA-135 FR-4 — Order Service's post-checkout clear."""
+        if not item_ids:
+            raise ValidationError("itemIds must not be empty")
+        return self._repository.remove_items(
+            user_id, item_ids, if_version, reason="CHECKOUT", checkout_id=checkout_id
+        )
 
     def add_item(
         self,
@@ -86,14 +130,15 @@ class CartService:
         frequency: Frequency,
         start_date: str | None,
         idempotency_key: str | None,
+        slot_id: str | None = None,
     ) -> LineItem:
-        self._validate_item(quantity, frequency, start_date)
+        self._validate_item(quantity, frequency, start_date, slot_id)
         self._check_stock(product_id, quantity)
         if frequency.is_subscription:
             self._check_wallet_gate(user_id)
 
         return self._repository.add_item(
-            user_id, product_id, quantity, frequency, start_date, idempotency_key
+            user_id, product_id, quantity, frequency, start_date, idempotency_key, slot_id
         )
 
     def replace_cart(self, user_id: str, items: list[dict], if_version: int) -> Cart:
@@ -113,7 +158,6 @@ class CartService:
             quantity = item["quantity"]
             frequency = item["frequency"]
             start_date = item.get("start_date")
-            self._validate_item(quantity, frequency, start_date)
 
             item_id = item.get("id")
             if item_id is not None:
@@ -129,11 +173,26 @@ class CartService:
                 # exists — an unrelated edit elsewhere in the cart must not
                 # reset every item's "added" timestamp to now.
                 item["added_at"] = existing.added_at
+                # An app build from before slotId existed echoes existing
+                # lines back without it — keep the stored slot rather than
+                # silently dropping it on an unrelated edit.
+                if item.get("slot_id") is None and frequency.is_subscription:
+                    item["slot_id"] = existing.slot_id
+            slot_id = item.get("slot_id")
+
             is_new_or_changed = (
                 existing is None
                 or existing.quantity != quantity
                 or existing.frequency != frequency
                 or existing.start_date != start_date
+                or existing.slot_id != slot_id
+            )
+            # slotId is only required of lines this request adds or
+            # changes: a subscription line stored before slotId existed
+            # must not block every other edit to the cart. Checkout
+            # rejects such a line on its own (LINE_INVALID / SLOT_MISSING).
+            self._validate_item(
+                quantity, frequency, start_date, slot_id, require_slot=is_new_or_changed
             )
             if frequency.is_subscription and is_new_or_changed:
                 needs_wallet_gate = True
@@ -156,7 +215,12 @@ class CartService:
         self._repository.delete_item(user_id, line_item_id)
 
     def _validate_item(
-        self, quantity: int, frequency: Frequency, start_date: str | None
+        self,
+        quantity: int,
+        frequency: Frequency,
+        start_date: str | None,
+        slot_id: str | None = None,
+        require_slot: bool = True,
     ) -> None:
         if quantity < 1:
             raise ValidationError(f"quantity must be at least 1 (got {quantity})")
@@ -164,6 +228,16 @@ class CartService:
             raise ValidationError("startDate must not be set for a ONE_TIME item")
         if frequency != Frequency.ONE_TIME and start_date is None:
             raise ValidationError("startDate is required for a subscription item")
+        # MA-135 FR-1 — Subscription Service's create requires a slot, and
+        # checkout (MA-136) creates the subscription from this line.
+        if (
+            require_slot
+            and frequency.is_subscription
+            and not (slot_id and slot_id.strip())
+        ):
+            raise ValidationError("slotId is required for a subscription item")
+        if frequency == Frequency.ONE_TIME and slot_id is not None:
+            raise ValidationError("slotId must not be set for a ONE_TIME item")
 
     def _check_stock_for_all(self, items: list[dict]) -> None:
         if not items:
@@ -195,8 +269,10 @@ class CartService:
             )
 
     def _check_wallet_gate(self, user_id: str) -> None:
-        balance = self._wallet_client.get_balance(user_id)
-        if balance < self._wallet_minimum_balance:
+        # get_balance is paise (Wallet's own unit); the configured minimum
+        # is whole rupees, matching the app's own "≥ ₹500" check.
+        balance_paise = self._wallet_client.get_balance(user_id)
+        if balance_paise < self._wallet_minimum_balance * 100:
             raise WalletBalanceTooLowError(
                 "Wallet balance is below the minimum required for a subscription item",
                 details={"minimumRequired": self._wallet_minimum_balance},

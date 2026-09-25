@@ -21,7 +21,7 @@ waits for a wallet to exist.
 |--------|------|------|------|
 | POST | `/users/register` | MA-93 FR-1 | Cognito JWT (API Gateway authorizer) |
 | GET | `/delivery/slots?zoneId=` | MA-93 FR-2 | Cognito JWT |
-| GET | `/users/me` | MA-107 FR-2 | Cognito JWT |
+| GET | `/users/me` | MA-107 FR-2 (+ MA-135 FR-6 `defaultAddress`) | Cognito JWT |
 
 `sub` and `mobile` are read from the API Gateway JWT authorizer's
 verified claims — never trusted from the request body.

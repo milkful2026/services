@@ -29,7 +29,9 @@ class Settings(BaseSettings):
     catalog_internal_base_url: str
     user_internal_base_url: str
     pricing_internal_base_url: str
-    wallet_internal_base_url: str = ""  # unset: MA-100 doesn't exist yet, see README Known Gaps
+    # Wallet's internal balance read (MA-130 FR-3). Unset fails the
+    # subscription wallet gate closed (WalletCheckUnavailableError).
+    wallet_internal_base_url: str = ""
     request_timeout_seconds: float = 3.0
 
     # Business rules

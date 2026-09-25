@@ -21,7 +21,7 @@ import requests
 from requests.exceptions import RequestException
 from shared.adapters.retry import call_with_retry
 
-from domain.exceptions import WalletUnavailableError
+from domain.exceptions import WalletBalanceUnavailableError, WalletUnavailableError
 from domain.models import DebitResult
 
 logger = logging.getLogger(__name__)
@@ -105,4 +105,41 @@ class HttpWalletClient:
         except _RetryableWalletError as exc:
             raise WalletUnavailableError(
                 "Wallet debit request failed after retries", details={"cause": str(exc)}
+            ) from exc
+
+    def get_balance(self, user_id: str) -> int:
+        """MA-136 FR-3.7 — `GET /wallet/internal/balance` (MA-130 FR-3), in
+        paise. Advisory only: checkout's pre-charge balance check. A
+        wallet that isn't provisioned yet reads as 0 (Wallet's own
+        CREATING-if-absent convention). Raises WalletBalanceUnavailableError
+        after retries."""
+        url = f"{self._base_url}/wallet/internal/balance"
+
+        def _attempt() -> int:
+            try:
+                response = requests.get(
+                    url,
+                    params={"userId": user_id},
+                    timeout=self._timeout_seconds,
+                    headers={"x-request-id": self._correlation_id},
+                )
+            except RequestException as exc:
+                raise _RetryableWalletError(str(exc)) from exc
+            if response.status_code != 200:
+                raise _RetryableWalletError(f"Wallet returned HTTP {response.status_code}")
+            try:
+                return int(response.json()["data"]["balancePaise"])
+            except (ValueError, KeyError, TypeError) as exc:
+                raise _RetryableWalletError(f"malformed 200 body from Wallet: {exc}") from exc
+
+        try:
+            return call_with_retry(
+                _attempt,
+                max_retries=self._max_retries,
+                backoff_base_seconds=self._backoff_base_seconds,
+                retryable_exceptions=(_RetryableWalletError,),
+            )
+        except _RetryableWalletError as exc:
+            raise WalletBalanceUnavailableError(
+                "Wallet balance read failed after retries", details={"cause": str(exc)}
             ) from exc

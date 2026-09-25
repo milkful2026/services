@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://milkful.internal/events/OrderPaymentFailed.schema.json",
   "title": "OrderPaymentFailed",
-  "description": "EventBridge `detail` for a subscription order that failed to materialize or be paid for. Producer: milkful.order (MA-132). Consumers: Notification Service (future); Reporting.",
+  "description": "EventBridge `detail` for an order that failed to materialize or be paid for. Producer: milkful.order — a subscription delivery (MA-132, source=SUBSCRIPTION) or a cart checkout (MA-136, source=CHECKOUT). Consumers: Notification Service (future); Reporting.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,7 +11,7 @@
     "correlationId",
     "orderId",
     "userId",
-    "subscriptionId",
+    "source",
     "amountPaise",
     "reason"
   ],
@@ -21,7 +21,9 @@
     "correlationId": { "type": "string", "minLength": 1 },
     "orderId": { "type": "string", "minLength": 1 },
     "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
-    "subscriptionId": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "enum": ["SUBSCRIPTION", "CHECKOUT"] },
+    "subscriptionId": { "type": ["string", "null"], "minLength": 1, "description": "Set for SUBSCRIPTION; null/absent for CHECKOUT." },
+    "checkoutId": { "type": ["string", "null"], "minLength": 1, "description": "Set for CHECKOUT (MA-136)." },
     "amountPaise": {
       "type": "integer",
       "minimum": 0,

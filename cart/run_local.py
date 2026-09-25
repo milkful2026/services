@@ -34,6 +34,8 @@ load_env_file(Path(os.environ.get("ENV_LOCAL_PATH", str(_SERVICE_DIR / ".env.loc
 import handlers.add_item_handler as add_item_handler  # noqa: E402
 import handlers.delete_item_handler as delete_item_handler  # noqa: E402
 import handlers.get_cart_handler as get_cart_handler  # noqa: E402
+import handlers.internal_get_cart_handler as internal_get_cart_handler  # noqa: E402
+import handlers.internal_remove_items_handler as internal_remove_items_handler  # noqa: E402
 import handlers.put_cart_handler as put_cart_handler  # noqa: E402
 
 ROUTES = {
@@ -45,6 +47,13 @@ ROUTES = {
     # fallback — see that module for why an exact-match dict alone isn't
     # enough here, unlike every other service's route table so far.
     ("DELETE", "/cart/items/{id}"): delete_item_handler.handler,
+    # MA-135 FR-3/FR-4 — Order Service's checkout read/clear. IAM (SigV4)
+    # in a deployed stack; this local shim doesn't verify SigV4 at all.
+    ("GET", "/cart/internal/users/{userId}"): internal_get_cart_handler.handler,
+    (
+        "POST",
+        "/cart/internal/users/{userId}/remove-items",
+    ): internal_remove_items_handler.handler,
 }
 
 if __name__ == "__main__":

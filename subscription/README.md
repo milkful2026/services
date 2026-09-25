@@ -20,6 +20,7 @@ service — no prior scaffold.
 | GET | `/subscriptions` | Cognito JWT | List mine, `nextDeliveryDate` computed (FR-9) |
 | GET | `/subscriptions/{id}` | Cognito JWT | One subscription's detail (FR-9) |
 | POST | `/internal/run-daily` | network-level (VPC-only, no JWT) | The Daily Run — EventBridge Scheduler target in prod, a local-dev script here |
+| POST | `/internal/subscriptions` | network-level (VPC-only, no JWT) | MA-136 FR-11: Order Service's cart checkout creates a subscription for `userId` (body); same create logic, idempotency and errors as the public route |
 
 ## Events
 

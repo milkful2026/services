@@ -259,3 +259,39 @@ def test_get_me_for_unregistered_sub_returns_404(wired_env):
 
     assert response["statusCode"] == 404
     assert json.loads(response["body"])["data"]["errorCode"] == "USER_NOT_FOUND"
+
+
+@responses_lib.activate
+def test_get_me_returns_the_full_saved_default_address(wired_env, cognito_user_pool):
+    # MA-135 FR-6 — the address exactly as the onboarding Google Maps /
+    # Places screen saved it, alongside the unchanged flat fields.
+    _mock_inventory_serviceable(True, zone_id="zone-blr-1")
+    sub, _ = _register_cognito_user(cognito_user_pool, mobile="+919876543297")
+    body = json.loads(json.dumps(_VALID_BODY))
+    body["addresses"][0]["lines"] = ["Flat 402, Sai Heights", "Baner Road"]
+    body["addresses"][0]["landmark"] = "Near Baner Gaon bus stop"
+
+    register_handler.handler(_event(body, sub=sub), None)
+    response = get_me_handler.handler(_get_me_event(sub), None)
+
+    data = json.loads(response["body"])["data"]
+    address = data["defaultAddress"]
+    assert address["id"] == data["defaultAddressId"]
+    assert address["lines"] == ["Flat 402, Sai Heights", "Baner Road"]
+    assert address["landmark"] == "Near Baner Gaon bus stop"
+    assert address["city"] == "Bangalore"
+    assert address["state"] == "Karnataka" == data["defaultAddressState"]
+    assert address["pincode"] == "560001"
+    assert address["lat"] == 12.9716
+    assert address["lng"] == 77.5946
+
+
+@responses_lib.activate
+def test_get_me_default_address_landmark_is_null_when_unset(wired_env, cognito_user_pool):
+    _mock_inventory_serviceable(True)
+    sub, _ = _register_cognito_user(cognito_user_pool, mobile="+919876543296")
+
+    register_handler.handler(_event(_VALID_BODY, sub=sub), None)
+    response = get_me_handler.handler(_get_me_event(sub), None)
+
+    assert json.loads(response["body"])["data"]["defaultAddress"]["landmark"] is None

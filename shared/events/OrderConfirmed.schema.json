@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://milkful.internal/events/OrderConfirmed.schema.json",
   "title": "OrderConfirmed",
-  "description": "EventBridge `detail` for a subscription order successfully paid via wallet debit. Producer: milkful.order (MA-132). Consumers: Notification Service (future); Reporting.",
+  "description": "EventBridge `detail` for an order successfully paid via wallet debit. Producer: milkful.order — a subscription delivery (MA-132, source=SUBSCRIPTION) or a cart checkout's one-time lines (MA-136, source=CHECKOUT). Consumers: Notification Service (future); Reporting.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,9 +11,7 @@
     "correlationId",
     "orderId",
     "userId",
-    "subscriptionId",
-    "productId",
-    "quantity",
+    "source",
     "amountPaise",
     "deliveryDate"
   ],
@@ -23,9 +21,24 @@
     "correlationId": { "type": "string", "minLength": 1 },
     "orderId": { "type": "string", "minLength": 1 },
     "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
-    "subscriptionId": { "type": "string", "minLength": 1 },
-    "productId": { "type": "string", "minLength": 1 },
-    "quantity": { "type": "integer", "exclusiveMinimum": 0 },
+    "source": { "type": "string", "enum": ["SUBSCRIPTION", "CHECKOUT"] },
+    "subscriptionId": { "type": ["string", "null"], "minLength": 1, "description": "Set for SUBSCRIPTION; null/absent for CHECKOUT." },
+    "checkoutId": { "type": ["string", "null"], "minLength": 1, "description": "Set for CHECKOUT (MA-136)." },
+    "productId": { "type": ["string", "null"], "minLength": 1, "description": "SUBSCRIPTION only; a CHECKOUT order lists its lines in `items`." },
+    "quantity": { "type": ["integer", "null"], "exclusiveMinimum": 0 },
+    "items": {
+      "type": "array",
+      "description": "CHECKOUT only — every one-time line in the order.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["productId", "quantity"],
+        "properties": {
+          "productId": { "type": "string", "minLength": 1 },
+          "quantity": { "type": "integer", "exclusiveMinimum": 0 }
+        }
+      }
+    },
     "amountPaise": { "type": "integer", "exclusiveMinimum": 0 },
     "deliveryDate": { "type": "string", "format": "date" }
   }

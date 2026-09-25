@@ -105,6 +105,19 @@ def serialize_delivery_slots(slots: list[DeliverySlot]) -> list[dict[str, Any]]:
     return [{"id": s.id, "label": s.label, "available": s.available} for s in slots]
 
 
+def serialize_address(address: Address) -> dict[str, Any]:
+    return {
+        "id": address.id,
+        "lines": address.lines,
+        "landmark": address.landmark,
+        "city": address.city,
+        "state": address.state,
+        "pincode": address.pincode,
+        "lat": address.lat,
+        "lng": address.lng,
+    }
+
+
 def serialize_user_profile(profile: UserProfile) -> dict[str, Any]:
     return {
         "userId": profile.user_id,
@@ -114,6 +127,13 @@ def serialize_user_profile(profile: UserProfile) -> dict[str, Any]:
         "defaultAddressId": profile.default_address_id,
         "defaultAddressState": profile.default_address_state,
         "defaultAddressZoneId": profile.default_address_zone_id,
+        # MA-135 FR-6 — additive; the three flat fields above stay for
+        # existing app builds.
+        "defaultAddress": (
+            serialize_address(profile.default_address)
+            if profile.default_address is not None
+            else None
+        ),
     }
 
 

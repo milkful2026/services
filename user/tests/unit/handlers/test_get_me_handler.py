@@ -65,6 +65,9 @@ def test_get_me_success_returns_profile():
         "defaultAddressId": "addr-1",
         "defaultAddressState": "Karnataka",
         "defaultAddressZoneId": "zone-blr-1",
+        # The fake profile carries no Address object — MA-135 FR-6's
+        # populated shape is covered by the registration-flow integration test.
+        "defaultAddress": None,
     }
     assert service.calls == ["sub-123"]
 

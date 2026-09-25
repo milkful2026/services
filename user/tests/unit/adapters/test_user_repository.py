@@ -234,6 +234,11 @@ def test_get_profile_by_sub_returns_profile_defaulting_to_b2c(repository):
     assert profile.default_address_id == registered.default_address_id
     assert profile.default_address_state == "Karnataka"
     assert profile.default_address_zone_id is None
+    assert profile.default_address is not None
+    assert profile.default_address.id == registered.default_address_id
+    assert profile.default_address.lines == ["12 MG Road"]
+    assert profile.default_address.pincode == "560001"
+    assert profile.default_address.landmark is None
 
 
 def test_register_persists_zone_id_on_address_row(repository, sqlite_engine):

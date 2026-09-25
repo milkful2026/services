@@ -24,6 +24,7 @@ class AddItemRequestDto(BaseModel):
     quantity: int
     frequency: str
     start_date: str | None = Field(alias="startDate", default=None)
+    slot_id: str | None = Field(alias="slotId", default=None)
 
     model_config = {"populate_by_name": True}
 
@@ -46,6 +47,7 @@ class ReplaceCartItemDto(BaseModel):
     quantity: int
     frequency: str
     start_date: str | None = Field(alias="startDate", default=None)
+    slot_id: str | None = Field(alias="slotId", default=None)
 
     model_config = {"populate_by_name": True}
 
@@ -65,12 +67,24 @@ class ReplaceCartItemDto(BaseModel):
             "quantity": self.quantity,
             "frequency": Frequency(self.frequency),
             "start_date": self.start_date,
+            "slot_id": self.slot_id,
         }
 
 
 class ReplaceCartRequestDto(BaseModel):
     items: list[ReplaceCartItemDto]
     if_version: int = Field(alias="ifVersion")
+
+    model_config = {"populate_by_name": True}
+
+
+class InternalRemoveItemsRequestDto(BaseModel):
+    """MA-135 FR-4 — `POST /cart/internal/users/{userId}/remove-items`."""
+
+    item_ids: list[str] = Field(alias="itemIds", min_length=1)
+    if_version: int = Field(alias="ifVersion")
+    reason: str = "CHECKOUT"
+    checkout_id: str | None = Field(alias="checkoutId", default=None)
 
     model_config = {"populate_by_name": True}
 
@@ -82,6 +96,7 @@ def serialize_line_item(line_item: LineItem) -> dict[str, Any]:
         "quantity": line_item.quantity,
         "frequency": str(line_item.frequency),
         "startDate": line_item.start_date,
+        "slotId": line_item.slot_id,
         "addedAt": line_item.added_at,
     }
 
@@ -104,6 +119,15 @@ def serialize_cart_view(view: CartView) -> dict[str, Any]:
         "items": [serialize_line_item(li) for li in view.cart.line_items],
         "cartVersion": view.cart.cart_version,
         "quote": serialize_quote(view.quote) if view.quote is not None else None,
+        # MA-135 FR-2 — additive; older app builds ignore both keys.
+        "payNowQuote": (
+            serialize_quote(view.pay_now_quote) if view.pay_now_quote is not None else None
+        ),
+        "perDeliveryQuote": (
+            serialize_quote(view.per_delivery_quote)
+            if view.per_delivery_quote is not None
+            else None
+        ),
     }
 
 
