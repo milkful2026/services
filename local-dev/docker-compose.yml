@@ -70,6 +70,10 @@ services:
       LOCAL_DEV_USER_HTTP_URL: http://user:8002
       LOCAL_DEV_PRICING_HTTP_URL: http://pricing-offer:8005
       LOCAL_DEV_WALLET_HTTP_URL: http://wallet:8006
+      # MA-34 checkout: Order Service calls Cart's and Subscription's
+      # internal routes.
+      LOCAL_DEV_CART_HTTP_URL: http://cart:8004
+      LOCAL_DEV_SUBSCRIPTION_HTTP_URL: http://subscription:8008
       LOCAL_DEV_ENV_OUTPUT_ROOT: /shared
     volumes:
       - identity-auth-env:/shared/identity-auth
@@ -195,6 +199,11 @@ services:
         condition: service_started
       pricing-offer:
         condition: service_started
+      # MA-34 checkout (MA-136): cart read/clear + subscription create.
+      cart:
+        condition: service_started
+      subscription:
+        condition: service_started
     environment:
       ENV_LOCAL_PATH: /shared/order/.env.local
     volumes:
@@ -242,6 +251,9 @@ services:
       user:
         condition: service_started
       pricing-offer:
+        condition: service_started
+      # MA-135: the subscription wallet gate reads Wallet's balance.
+      wallet:
         condition: service_started
     environment:
       ENV_LOCAL_PATH: /shared/cart/.env.local

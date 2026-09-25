@@ -180,6 +180,7 @@ class OrderService:
             "correlationId": correlation_id or "",
             "orderId": order.id,
             "userId": user_id,
+            "source": "SUBSCRIPTION",
             "subscriptionId": subscription_id,
             "amountPaise": 0,
             "reason": reason,
@@ -205,6 +206,7 @@ class OrderService:
                 "correlationId": correlation_id or "",
                 "orderId": order.id,
                 "userId": order.user_id,
+                "source": "SUBSCRIPTION",
                 "subscriptionId": order.subscription_id,
                 "productId": order.product_id,
                 "quantity": order.quantity,
@@ -225,6 +227,7 @@ class OrderService:
             "correlationId": correlation_id or "",
             "orderId": order.id,
             "userId": order.user_id,
+            "source": "SUBSCRIPTION",
             "subscriptionId": order.subscription_id,
             "amountPaise": order.amount_paise,
             "reason": reason,
@@ -262,6 +265,14 @@ class OrderService:
 def _serialize(order: Order) -> dict:
     return {
         "orderId": order.id,
+        # MA-136 FR-10 — SUBSCRIPTION | CHECKOUT; `items` lists every line
+        # for both kinds (a subscription order is its single product).
+        "source": order.source.value,
+        "checkoutId": order.checkout_id,
+        "items": [
+            {"productId": item.product_id, "quantity": item.quantity}
+            for item in order.item_list()
+        ],
         "subscriptionId": order.subscription_id,
         "productId": order.product_id,
         "quantity": order.quantity,

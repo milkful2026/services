@@ -2,7 +2,9 @@
 
 Turns a due subscription delivery into a real, paid Order: quotes the
 current price via Pricing Service, debits the customer's wallet, and
-records the outcome.
+records the outcome. Since MA-136 (MA-34) it also runs **cart checkout**:
+one idempotent call that charges a cart's one-time lines as a single
+order, starts its subscription lines, and clears them from the cart.
 
 Implements `specs/services/tasks/MA/MA-25/MA-132.md` (MA-99/MA-25). New
 service — no prior scaffold.
@@ -13,14 +15,44 @@ service — no prior scaffold.
 |--------|------|------|---------|
 | GET | `/orders/me` | Cognito JWT | Paged (keyset), newest-first, optionally filtered by `subscriptionId` (FR-3) |
 | GET | `/orders/{id}` | Cognito JWT | One order's full detail (FR-3) |
+| POST | `/orders/checkout` | Cognito JWT + `Idempotency-Key` | MA-136 cart checkout — see below |
 
-No public write endpoints — every order is consumer-created from
-`SubscriptionOrderDue`, never a direct client `POST`.
+Every order has a `source`: `SUBSCRIPTION` (materialized from
+`SubscriptionOrderDue`, one product) or `CHECKOUT` (a cart's one-time
+lines, listed in `items`; `subscriptionId` is null).
+
+## Cart checkout flow (MA-136)
+
+```
+POST /orders/checkout {cartVersion, expectedPayNowPaise?} + Idempotency-Key
+  -> (user, key) already has a checkout: COMPLETED/PAYMENT_FAILED -> replay,
+     IN_PROGRESS -> resume at its step
+  -> validate, nothing persisted: one live checkout per user, Cart internal
+     read + version, line shape (slot, start date), User address state,
+     Pricing quote of the one-time lines, price match, Wallet balance
+     (pay-now + ₹500 minimum if any subscription line)
+  -> one txn: checkouts(IN_PROGRESS, STARTED) + CREATED order + order_items
+  -> Wallet debit: DEBITED -> CONFIRMED (+OrderConfirmed); declined ->
+     PAYMENT_FAILED, checkout ends, nothing else happens
+  -> Subscription POST /internal/subscriptions per line
+     (key checkout:{id}:{lineId}); a 4xx fails that line only
+  -> Cart internal remove-items (the checked-out lines)
+  -> COMPLETED, result stored for same-key replay
+```
+
+A dependency failing after the checkout started returns `503
+CHECKOUT_INCOMPLETE`; retrying with the same key resumes, and never
+charges twice (checkout key unique, one order per checkout, Wallet's own
+order-id idempotency).
 
 ## Events
 
 - **Consumes** (`order-events-q`, owned by this service): `SubscriptionOrderDue`
   from Subscription Service (MA-131).
+- **Calls** (checkout only): Cart `GET /cart/internal/users/{id}` and
+  `POST .../remove-items` (SigV4), Subscription `POST /internal/subscriptions`,
+  Wallet `GET /wallet/internal/balance` — alongside the existing User /
+  Pricing / Wallet-debit calls.
 - **Publishes** (transactional outbox → EventBridge): `OrderConfirmed`,
   `OrderPaymentFailed`.
 
@@ -49,8 +81,12 @@ correctness guarantee, independent of the SQS-level message dedupe.
 
 `orders(id, user_id, subscription_id, product_id, quantity,
 amount_paise, delivery_date, status, failure_reason, created_at,
-confirmed_at)` with `UNIQUE(subscription_id, delivery_date)` and
-`CHECK(amount_paise > 0)`, plus `outbox(…)`.
+confirmed_at, source, checkout_id)` with `UNIQUE(subscription_id,
+delivery_date)`, `UNIQUE(checkout_id)`, `CHECK(amount_paise >= 0)` and
+the `orders_source_shape` CHECK; `order_items(order_id, line_no,
+product_id, quantity)`; `checkouts(…)` with `UNIQUE(user_id,
+idempotency_key)` and a partial unique index allowing one `IN_PROGRESS`
+checkout per user (`migrations/0002_checkout.sql`); plus `outbox(…)`.
 
 ## Local development
 
@@ -82,3 +118,9 @@ every other service here); no real AWS/DB/network.
 - A reconciliation sweep for an order stuck in `CREATED` past SQS's
   visibility timeout — MA-132 §11 explicitly defers this; redelivery is
   the only recovery path in this pass.
+- A sweep that resumes checkouts left `IN_PROGRESS` by a client that
+  never retried (MA-136 §11). Until it exists, such a checkout blocks
+  that user's next checkout until the app resumes it with its persisted
+  key. **Needed before production.**
+- The checkout's IAM grant for Cart's internal routes (Cart stack's
+  `internal_caller_role_arns`) — same manual cross-stack step as User's.

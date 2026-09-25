@@ -42,12 +42,21 @@ class HttpPricingClient:
         self._correlation_id = correlation_id
 
     def quote(self, product_id: str, quantity: int, delivery_state: str) -> Quote:
+        return self.quote_items([(product_id, quantity)], delivery_state)
+
+    def quote_items(self, items: list[tuple[str, int]], delivery_state: str) -> Quote:
+        """One aggregated ONE_TIME quote for (product_id, quantity) lines —
+        MA-132's single subscription delivery, or MA-136's checkout
+        one-time lines."""
         url = f"{self._base_url}/pricing/quote"
         # frequency: "ONE_TIME" — each delivery is priced and charged
         # individually, never as a monthly subscription aggregate
         # (MA-132 FR-1).
         body = {
-            "items": [{"productId": product_id, "quantity": quantity, "frequency": "ONE_TIME"}],
+            "items": [
+                {"productId": product_id, "quantity": quantity, "frequency": "ONE_TIME"}
+                for product_id, quantity in items
+            ],
             "deliveryState": delivery_state,
         }
 
@@ -93,13 +102,17 @@ class HttpPricingClient:
                 error_data = error_body.get("data") if isinstance(error_body, dict) else None
                 error_code = error_data.get("errorCode") if isinstance(error_data, dict) else None
                 if error_code == "PRODUCT_PRICING_UNKNOWN":
+                    unknown_product = error_data.get("productId") or (
+                        items[0][0] if len(items) == 1 else None
+                    )
                     # Not retryable and not a transport failure — a
                     # definite fact this attempt reports up as a typed
                     # exception, distinct from _RetryablePricingError, so
                     # materialize() can map it to a terminal PAYMENT_FAILED
                     # instead of leaving the message unacked.
                     raise ProductPricingUnknownError(
-                        f"Catalog has no product {product_id!r}"
+                        f"Catalog has no product {unknown_product!r}",
+                        details={"productId": unknown_product},
                     )
                 raise _RetryablePricingError(f"Pricing returned an unrecognized 404: {error_code}")
             raise _RetryablePricingError(f"Pricing returned HTTP {response.status_code}")

@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     pricing_base_url: str = "http://localhost:8005"
     wallet_internal_base_url: str = "http://localhost:8006"
 
+    # --- MA-136: cart checkout ---
+    cart_internal_base_url: str = "http://localhost:8004"
+    subscription_internal_base_url: str = "http://localhost:8008"
+    # Must equal Subscription Service's own cutoff_hour_ist (8 PM IST,
+    # confirmed by Product 2026-09-25 for one-time deliveries too).
+    checkout_cutoff_hour_ist: int = 20
+    # Must equal Cart's wallet_minimum_balance (₹500), in paise.
+    subscription_min_balance_paise: int = 50_000
+
 
 def get_settings() -> Settings:
     """Instantiated lazily so tests can inject env vars before first access."""

@@ -81,3 +81,128 @@ class WalletUnavailableError(OrderError):
 
     error_code = "WALLET_UNAVAILABLE"
     http_status = 503
+
+
+# --- MA-136: cart checkout ---------------------------------------------------
+# Each maps 1:1 to an outcome the app handles (MA-137 FR-7). Pre-start
+# rejections (400/402/409/422) persist nothing, so retrying with the same
+# Idempotency-Key simply re-evaluates.
+
+
+class ValidationError(OrderError):
+    error_code = "VALIDATION_ERROR"
+    http_status = 400
+
+
+class CartEmptyError(OrderError):
+    error_code = "CART_EMPTY"
+    http_status = 409
+
+
+class CartChangedError(OrderError):
+    """The cart's version moved since the customer reviewed it."""
+
+    error_code = "CART_CHANGED"
+    http_status = 409
+
+
+class CheckoutInProgressError(OrderError):
+    """Another checkout for this user is still IN_PROGRESS (a different
+    Idempotency-Key) — at most one live checkout per user."""
+
+    error_code = "CHECKOUT_IN_PROGRESS"
+    http_status = 409
+
+
+class PriceChangedError(OrderError):
+    error_code = "PRICE_CHANGED"
+    http_status = 409
+
+
+class LineInvalidError(OrderError):
+    """`details.lines`: [{lineId, reason}] with reason SLOT_MISSING |
+    START_DATE_PAST | PRODUCT_UNAVAILABLE."""
+
+    error_code = "LINE_INVALID"
+    http_status = 422
+
+
+class DeliveryAddressUnknownError(OrderError):
+    error_code = "DELIVERY_ADDRESS_UNKNOWN"
+    http_status = 422
+
+
+class InsufficientBalanceError(OrderError):
+    """`details`: balancePaise, requiredPaise, shortfallPaise."""
+
+    error_code = "INSUFFICIENT_BALANCE"
+    http_status = 402
+
+
+class WalletNotActiveError(OrderError):
+    error_code = "WALLET_NOT_ACTIVE"
+    http_status = 403
+
+
+class DependencyUnavailableError(OrderError):
+    """A dependency was unreachable *before* anything was persisted — safe
+    to retry with the same key."""
+
+    error_code = "DEPENDENCY_UNAVAILABLE"
+    http_status = 503
+
+
+class CheckoutIncompleteError(OrderError):
+    """A dependency failed *after* the checkout started (possibly after the
+    charge). The checkout stays IN_PROGRESS; retrying with the same key
+    resumes it — never a second charge."""
+
+    error_code = "CHECKOUT_INCOMPLETE"
+    http_status = 503
+
+
+class StoredCheckoutFailureError(OrderError):
+    """Replay of a checkout that already ended PAYMENT_FAILED: re-raises
+    the exact stored outcome, code and status included."""
+
+    def __init__(
+        self, error_code: str, http_status: int, message: str, details: dict | None = None
+    ) -> None:
+        super().__init__(message, details)
+        self.error_code = error_code
+        self.http_status = http_status
+
+
+# Adapter-level failures the checkout maps onto the outcomes above.
+
+
+class CartUnavailableError(OrderError):
+    error_code = "CART_UNAVAILABLE"
+    http_status = 503
+
+
+class CartVersionConflictError(OrderError):
+    error_code = "CART_VERSION_CONFLICT"
+    http_status = 409
+
+
+class SubscriptionUnavailableError(OrderError):
+    error_code = "SUBSCRIPTION_UNAVAILABLE"
+    http_status = 503
+
+
+class SubscriptionRejectedError(OrderError):
+    """Subscription Service gave a definite 4xx for one line (e.g.
+    PRODUCT_NOT_ELIGIBLE, INVALID_SCHEDULE) — `reason` is its errorCode."""
+
+    error_code = "SUBSCRIPTION_REJECTED"
+    http_status = 422
+
+    def __init__(self, reason: str, message: str = "") -> None:
+        super().__init__(message or reason)
+        self.reason = reason
+
+
+class WalletBalanceUnavailableError(OrderError):
+    error_code = "WALLET_UNAVAILABLE"
+    http_status = 503
