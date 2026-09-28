@@ -68,7 +68,7 @@ def test_run_once_confirms_stuck_order_with_one_debit_and_one_event(
     # Ticket AC 4.
     _stuck(repo, engine)
     counts = sweep_handler.run_once(service=_sweep(repo, service))
-    assert counts["confirmed"] == 1
+    assert counts["subscription_order.confirmed"] == 1
     assert repo.get("ord_stuck").status == OrderStatus.CONFIRMED
     assert len(wallet_client.calls) == 1
     events = [e for e in repo.fetch_unpublished() if e["event_type"] == "OrderConfirmed"]

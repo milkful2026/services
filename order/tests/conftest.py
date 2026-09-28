@@ -3,6 +3,8 @@
 AWS, DB, or network.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
@@ -22,7 +24,7 @@ from domain.exceptions import (
     WalletBalanceUnavailableError,
     WalletUnavailableError,
 )
-from domain.models import DebitResult, Quote
+from domain.models import DebitLookup, DebitResult, Quote
 from domain.order_service import OrderService
 
 
@@ -113,16 +115,31 @@ class FakeWalletClient:
         # MA-136 — balance read (paise) for checkout's pre-check.
         self.balance_paise = 100_000
         self.raise_balance_unavailable = False
+        # MA-142 — debits Wallet would report for get_debit (order_id -> lookup).
+        self.debited: dict[str, DebitLookup] = {}
+        self.raise_lookup_unavailable = False
+        self.lookup_calls: list[str] = []
 
     def debit(self, user_id: str, order_id: str, amount_paise: int, correlation_id: str):
         self.calls.append((user_id, order_id, amount_paise))
         if self.raise_unavailable:
             raise WalletUnavailableError("fake unavailable")
         if self.result_status == "DEBITED":
+            self.debited[order_id] = DebitLookup(
+                amount_paise=amount_paise,
+                balance_after_paise=self.balance_paise - amount_paise,
+                debited_at=datetime.now(UTC),
+            )
             return DebitResult(
                 status="DEBITED", balance_after_paise=self.balance_paise - amount_paise
             )
         return DebitResult(status=self.result_status, balance_after_paise=self.balance_paise)
+
+    def get_debit(self, order_id: str) -> DebitLookup | None:
+        self.lookup_calls.append(order_id)
+        if self.raise_lookup_unavailable:
+            raise WalletUnavailableError("fake unavailable")
+        return self.debited.get(order_id)
 
     def get_balance(self, user_id: str) -> int:
         if self.raise_balance_unavailable:

@@ -105,11 +105,29 @@ or safely closes records left half-done by a crash or an outage:
 | `ORDER_SWEEP_ENABLED` | `true` |
 | `ORDER_SWEEP_INTERVAL_SECONDS` | `300` |
 | `ORDER_SUBSCRIPTION_ORDER_STALE_SECONDS` | `900` |
+| `ORDER_CHECKOUT_STALE_SECONDS` | `600` |
 | `ORDER_SWEEP_MAX_ATTEMPTS` | `6` |
 | `ORDER_SWEEP_LEASE_SECONDS` | `120` (minimum 60) |
 | `ORDER_SWEEP_BATCH_SIZE` | `50` |
 
-Metrics (log-based, `"metric"` field): `sweep.subscription_order.{found,resumed,confirmed,payment_failed,escalated,failed_attempt}`
+- **Abandoned checkouts** (`IN_PROGRESS`, untouched for
+  `ORDER_CHECKOUT_STALE_SECONDS`, MA-144): resumed through the same steps
+  a customer retry runs. Exceptions:
+  - never charged and past the delivery cut-off → Wallet is asked
+    (`GET /wallet/internal/debits/{orderId}`); no debit → checkout and
+    order `CANCELLED` with no charge and the cart untouched (a debit
+    found → completed as normal). An unreachable Wallet never cancels.
+  - budget spent after payment, subscriptions still failing → completed,
+    the unstarted lines left in the cart (`SUBSCRIPTION_UNAVAILABLE`).
+  - budget spent before we know about the charge, or at the cart clear
+    → `NEEDS_ATTENTION` (the one-live-checkout lock is released).
+  The customer path takes the same lease: a checkout the sweep holds
+  returns `409 CHECKOUT_IN_PROGRESS` with `retryAfterSeconds`; a replay of
+  a cancelled or escalated checkout returns `409 CHECKOUT_CANCELLED` /
+  `409 CHECKOUT_NEEDS_ATTENTION`.
+
+Metrics (log-based, `"metric"` field): `sweep.subscription_order.{found,resumed,confirmed,payment_failed,escalated,failed_attempt}`,
+`sweep.checkout.{found,resumed,completed,completed_partial,payment_failed,cancelled,charged_after_cutoff,escalated,failed_attempt}`
 (`escalated` carries `reason`), `sweep.run_duration_ms`, `sweep.run_failed`.
 `/healthz` returns 503 if the sweep thread dies.
 
@@ -155,11 +173,5 @@ every other service here); no real AWS/DB/network.
   `sweep.run_failed` ≥ 3 in 15 min → ops notification.
 - `services/local-dev` wiring (`docker-compose.yml` entry, database
   bootstrap, queue/rule bootstrap) — same step.
-- A sweep that resumes checkouts left `IN_PROGRESS` by a client that
-  never retried (MA-136 §11). Until it exists, such a checkout is only
-  finished when the user next checks out (it no longer blocks them once
-  it's been untouched for 2 minutes), so a paid-but-unfinished checkout
-  can sit with its subscriptions not yet created. **Needed before
-  production.**
 - The checkout's IAM grant for Cart's internal routes (Cart stack's
   `internal_caller_role_arns`) — same manual cross-stack step as User's.

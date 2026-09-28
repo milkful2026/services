@@ -14,6 +14,9 @@ class OrderStatus(StrEnum):
     # MA-143: the sweep gave up (retry budget spent, or past the delivery
     # cut-off before it could be charged). Terminal; operators act on it.
     NEEDS_ATTENTION = "NEEDS_ATTENTION"
+    # MA-144 PD-1: a checkout's order that was never charged and can no
+    # longer be delivered. No event: it was never confirmed.
+    CANCELLED = "CANCELLED"
 
 
 # MA-143 failure reasons set by the sweep (orders.failure_reason).

@@ -1,7 +1,7 @@
 """MA-136 — the checkout tables' DB-level guarantees (SQLite, same
 constraints as 0002_checkout.sql)."""
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -141,3 +141,52 @@ def test_one_order_per_checkout_is_enforced_by_the_db(engine):
 
     with pytest.raises(IntegrityError), engine.begin() as conn:
         conn.execute(orders_table.insert().values(id="ord_2", **row))
+
+
+# --- MA-144: lease + recovery guarantees ---
+
+
+def test_cancel_is_atomic_when_the_order_was_already_paid(repo):
+    from domain.exceptions import LeaseLostError
+
+    repo.start_checkout(_checkout(order_id="ord_1"), _order())
+    assert repo.claim_checkout("chk_1", "sweep:x", 120)
+    paid_at = datetime(2026, 9, 25, tzinfo=UTC)
+    repo.mark_confirmed("ord_1", paid_at, "OrderConfirmed", {"orderId": "ord_1"})
+
+    with pytest.raises(LeaseLostError):
+        repo.cancel_checkout_and_order("chk_1", "ord_1", "sweep:x", {"error": {}})
+
+    # Neither half applied.
+    assert repo.get_checkout_by_id("chk_1").status == CheckoutStatus.IN_PROGRESS
+    assert repo.get("ord_1").status == OrderStatus.CONFIRMED
+
+
+def test_cancel_and_escalate_free_the_one_live_checkout_lock(repo):
+    repo.start_checkout(_checkout(order_id="ord_1"), _order())
+    repo.claim_checkout("chk_1", "sweep:x", 120)
+    repo.cancel_checkout_and_order("chk_1", "ord_1", "sweep:x", {"error": {}})
+    repo.start_checkout(_checkout("chk_2", key="key-2"), None)  # no CheckoutInProgressError
+
+    repo.claim_checkout("chk_2", "sweep:x", 120)
+    repo.escalate_checkout("chk_2", "sweep:x", "CART_CLEAR_FAILED", None)
+    repo.start_checkout(_checkout("chk_3", key="key-3"), None)
+    assert repo.get_checkout_by_id("chk_2").status == CheckoutStatus.NEEDS_ATTENTION
+    assert repo.get_checkout_by_id("chk_3").status == CheckoutStatus.IN_PROGRESS
+
+
+def test_claiming_a_checkout_does_not_make_it_look_fresh(repo):
+    repo.start_checkout(_checkout(), None)
+    before = repo.get_checkout_by_id("chk_1").updated_at
+    repo.claim_checkout("chk_1", "sweep:x", 120)
+    repo.renew_checkout("chk_1", "sweep:x", 120)
+    repo.release_checkout("chk_1", "sweep:x")
+    assert repo.get_checkout_by_id("chk_1").updated_at == before
+
+
+def test_terminal_status_clears_the_lease(repo):
+    repo.start_checkout(_checkout(), None, claim_owner="request:1", lease_seconds=120)
+    assert repo.get_checkout_by_id("chk_1").claim_owner == "request:1"
+    repo.update_checkout("chk_1", status=CheckoutStatus.COMPLETED, result={})
+    checkout = repo.get_checkout_by_id("chk_1")
+    assert checkout.claim_owner is None and checkout.claimed_until is None

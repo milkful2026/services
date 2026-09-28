@@ -22,6 +22,7 @@ transaction.
 """
 
 import logging
+import math
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -34,18 +35,21 @@ from domain.checkout_models import (
     CheckoutStep,
     SubscriptionLineResult,
 )
-from domain.cutoff import IST
+from domain.cutoff import IST, delivery_cutoff_passed
 from domain.exceptions import (
     AddressLookupUnavailableError,
     CartChangedError,
     CartEmptyError,
     CartUnavailableError,
     CartVersionConflictError,
+    CheckoutCancelledError,
     CheckoutIncompleteError,
     CheckoutInProgressError,
+    CheckoutNeedsAttentionError,
     DeliveryAddressUnknownError,
     DependencyUnavailableError,
     InsufficientBalanceError,
+    LeaseLostError,
     LineInvalidError,
     OrderError,
     PriceChangedError,
@@ -96,6 +100,7 @@ class CheckoutService:
         *,
         cutoff_hour_ist: int,
         subscription_min_balance_paise: int,
+        lease_seconds: float = 120,
     ) -> None:
         self._repo = repository
         self._cart = cart_client
@@ -105,6 +110,7 @@ class CheckoutService:
         self._subscriptions = subscription_client
         self._cutoff_hour_ist = cutoff_hour_ist
         self._subscription_min_balance_paise = subscription_min_balance_paise
+        self._lease_seconds = lease_seconds
 
     # --- FR-1/FR-2 entry point ---
 
@@ -124,11 +130,11 @@ class CheckoutService:
                 "checkout.replay",
                 extra={"checkoutId": existing.id, "status": existing.status.value},
             )
-            return self._replay_or_resume(existing, correlation_id)
+            return self._replay_or_resume(existing, correlation_id, now)
 
         live = self._repo.get_live_checkout(user_id)
         if live is not None:
-            self._settle_live_checkout(live, correlation_id)
+            self._settle_live_checkout(live, correlation_id, now)
 
         now = now or datetime.now(IST)
         checkout, order, balance_paise = self._validate_and_build(
@@ -138,7 +144,11 @@ class CheckoutService:
             expected_pay_now_paise=expected_pay_now_paise,
             now=now,
         )
-        started = self._repo.start_checkout(checkout, order)
+        owner = _request_owner()
+        checkout.claim_owner = owner
+        started = self._repo.start_checkout(
+            checkout, order, claim_owner=owner, lease_seconds=self._lease_seconds
+        )
         if started.id != checkout.id:
             # Lost a race to an identical request with the same key — that
             # one owns the checkout; resume it rather than starting another.
@@ -152,9 +162,11 @@ class CheckoutService:
                 "correlationId": correlation_id,
             },
         )
-        return self._run(started, correlation_id, known_balance_paise=balance_paise)
+        return self._drive(started, correlation_id, known_balance_paise=balance_paise)
 
-    def _replay_or_resume(self, checkout: Checkout, correlation_id: str) -> dict:
+    def _replay_or_resume(
+        self, checkout: Checkout, correlation_id: str, now: datetime | None = None
+    ) -> dict:
         if checkout.status == CheckoutStatus.COMPLETED:
             return checkout.result
         if checkout.status == CheckoutStatus.PAYMENT_FAILED:
@@ -165,9 +177,23 @@ class CheckoutService:
                 error.get("message", "Payment failed"),
                 error.get("details"),
             )
-        return self._run(checkout, correlation_id, known_balance_paise=None)
+        if checkout.status == CheckoutStatus.CANCELLED:
+            raise _stored_error(checkout)
+        if checkout.status == CheckoutStatus.NEEDS_ATTENTION:
+            raise CheckoutNeedsAttentionError(_NEEDS_ATTENTION_MESSAGE, {"checkoutId": checkout.id})
+        # MA-144 FR-6.2: same key, still IN_PROGRESS — only the lease holder runs it.
+        self._claim_for_request(checkout)
+        try:
+            if self._cancel_or_wallet_unavailable(checkout, now) == "cancelled":
+                raise _stored_error(self._repo.get_checkout_by_id(checkout.id))
+        except CheckoutIncompleteError:
+            self._repo.release_checkout(checkout.id, checkout.claim_owner)
+            raise
+        return self._drive(checkout, correlation_id, known_balance_paise=None)
 
-    def _settle_live_checkout(self, live: Checkout, correlation_id: str) -> None:
+    def _settle_live_checkout(
+        self, live: Checkout, correlation_id: str, now: datetime | None = None
+    ) -> None:
         """A different key found this user's IN_PROGRESS checkout. If
         another request may still be driving it, reject (naming it so the
         app can resume it). If it was abandoned — the app lost its key
@@ -182,16 +208,136 @@ class CheckoutService:
                 "Another checkout is already in progress for this account",
                 {"checkoutId": live.id},
             )
+        # MA-144 FR-6.3: and only if nobody (the sweep) holds its lease.
+        self._claim_for_request(live)
         logger.info(
             "checkout.resume_abandoned",
             extra={"checkoutId": live.id, "correlationId": correlation_id},
         )
         try:
-            self._run(live, correlation_id, known_balance_paise=None)
+            if self._cancel_or_wallet_unavailable(live, now) == "cancelled":
+                return  # PD-1: cancelled, no longer blocks; this request starts fresh
+        except CheckoutIncompleteError:
+            self._repo.release_checkout(live.id, live.claim_owner)
+            raise
+        try:
+            self._drive(live, correlation_id, known_balance_paise=None)
         except (InsufficientBalanceError, WalletNotActiveError):
             # The abandoned checkout is now PAYMENT_FAILED — terminal, so
             # it no longer blocks. This request runs its own balance check.
             pass
+
+    # --- MA-144: lease, PD-1 cancellation, PD-2 partial finish ---
+
+    def _claim_for_request(self, checkout: Checkout) -> None:
+        owner = _request_owner()
+        if not self._repo.claim_checkout(checkout.id, owner, self._lease_seconds):
+            remaining = self._repo.lease_remaining_seconds(checkout.id) or 1
+            raise CheckoutInProgressError(
+                "Another checkout is already in progress for this account",
+                {"checkoutId": checkout.id, "retryAfterSeconds": max(1, math.ceil(remaining))},
+            )
+        checkout.claim_owner = owner
+
+    def _drive(self, checkout: Checkout, correlation_id: str, known_balance_paise: int | None):
+        """_run for a customer request that holds the lease: hand the lease
+        back if the checkout is left incomplete, so the next retry (or the
+        sweep, once stale) can pick it up straight away."""
+        try:
+            return self._run(checkout, correlation_id, known_balance_paise)
+        except CheckoutIncompleteError:
+            self._repo.release_checkout(checkout.id, checkout.claim_owner)
+            raise
+        except LeaseLostError as exc:
+            raise CheckoutInProgressError(
+                "Another checkout is already in progress for this account",
+                {"checkoutId": checkout.id, "retryAfterSeconds": 1},
+            ) from exc
+
+    def _renew_lease(self, checkout: Checkout) -> None:
+        """Before every dependency call: extend our lease, or stop at once if
+        it expired and someone else took the checkout over."""
+        if checkout.claim_owner is None:
+            return
+        if not self._repo.renew_checkout(checkout.id, checkout.claim_owner, self._lease_seconds):
+            raise LeaseLostError("Lease lost mid-checkout", {"checkoutId": checkout.id})
+
+    def cancel_if_cutoff_passed(
+        self, checkout: Checkout, now: datetime | None = None
+    ) -> str | None:
+        """MA-144 FR-2 (PD-1). For a checkout whose charge never started and
+        whose delivery date has passed its cut-off, ask Wallet whether a
+        lost-response debit landed anyway:
+        - no debit  -> cancel checkout + order, no charge  -> "cancelled"
+        - debit     -> leave it for the caller to resume   -> "charged"
+        - not eligible                                     -> None
+        Raises WalletUnavailableError if Wallet can't be asked — never
+        cancels on an unknown answer. The caller holds the lease."""
+        if checkout.step != CheckoutStep.STARTED or checkout.order_id is None:
+            return None
+        order = self._repo.get(checkout.order_id)
+        if order is None or order.status != OrderStatus.CREATED or order.amount_paise <= 0:
+            return None
+        if not delivery_cutoff_passed(
+            checkout.delivery_date, now or datetime.now(UTC), self._cutoff_hour_ist
+        ):
+            return None
+        self._renew_lease(checkout)
+        if self._wallet.get_debit(order.id) is not None:
+            logger.warning(
+                "checkout.charged_after_cutoff",
+                extra={"checkoutId": checkout.id, "orderId": order.id},
+            )
+            return "charged"
+        exc = CheckoutCancelledError(_CANCELLED_MESSAGE, {"checkoutId": checkout.id})
+        self._repo.cancel_checkout_and_order(
+            checkout.id, order.id, checkout.claim_owner, {"error": _error_body(exc)}
+        )
+        logger.info(
+            "checkout.cancelled_cutoff_passed",
+            extra={"checkoutId": checkout.id, "orderId": order.id},
+        )
+        return "cancelled"
+
+    def _cancel_or_wallet_unavailable(self, checkout: Checkout, now: datetime | None) -> str | None:
+        """PD-1 on the customer path: an unreachable Wallet is a retryable
+        CHECKOUT_INCOMPLETE for the app, not an unknown error."""
+        try:
+            return self.cancel_if_cutoff_passed(checkout, now)
+        except WalletUnavailableError as exc:
+            raise CheckoutIncompleteError(
+                "Couldn't finish placing the order — retry to continue",
+                {"checkoutId": checkout.id},
+            ) from exc
+
+    def resume(self, checkout: Checkout, correlation_id: str) -> dict:
+        """The sweep's entry point: same steps as a customer resume. The
+        caller holds the lease (checkout.claim_owner)."""
+        return self._run(checkout, correlation_id, known_balance_paise=None)
+
+    def finish_partial(self, checkout: Checkout, correlation_id: str) -> dict:
+        """MA-144 FR-4 (PD-2): the checkout is paid but its subscriptions kept
+        failing for the whole retry budget. Record every unstarted line as
+        FAILED (so it stays in the cart for the customer), clear the rest and
+        complete. Raises CheckoutIncompleteError if the cart clear fails."""
+        done = {r.line_id for r in checkout.subscription_results}
+        for line in checkout.subscription_lines:
+            if line.line_id not in done:
+                checkout.subscription_results.append(
+                    SubscriptionLineResult(
+                        line_id=line.line_id,
+                        product_id=line.product_id,
+                        status="FAILED",
+                        reason="SUBSCRIPTION_UNAVAILABLE",
+                    )
+                )
+        self._repo.update_checkout(
+            checkout.id,
+            step=CheckoutStep.SUBSCRIPTIONS_DONE,
+            subscription_results=checkout.subscription_results,
+        )
+        checkout.step = CheckoutStep.SUBSCRIPTIONS_DONE
+        return self._run(checkout, correlation_id, known_balance_paise=None)
 
     # --- FR-3/FR-4: validation (no side effects) + the records to start ---
 
@@ -372,6 +518,7 @@ class CheckoutService:
             logger.info("checkout.paid", extra={"checkoutId": checkout.id, "orderId": order.id})
             return balance_after
 
+        self._renew_lease(checkout)
         try:
             debit = self._wallet.debit(
                 checkout.user_id, order.id, order.amount_paise, correlation_id
@@ -470,6 +617,7 @@ class CheckoutService:
         for line in checkout.subscription_lines:
             if line.line_id in done:
                 continue
+            self._renew_lease(checkout)
             try:
                 created = self._subscriptions.create(
                     user_id=checkout.user_id,
@@ -533,6 +681,7 @@ class CheckoutService:
         ]
         if not item_ids:
             return
+        self._renew_lease(checkout)
         try:
             try:
                 self._cart.remove_items(
@@ -605,6 +754,39 @@ class CheckoutService:
             "subscriptions": [r.to_dict() for r in checkout.subscription_results],
             "walletBalanceAfterPaise": balance_after_paise,
         }
+
+
+_CANCELLED_MESSAGE = (
+    "This order was cancelled because it couldn't be completed in time. "
+    "You weren't charged. Review your cart and confirm again."
+)
+_NEEDS_ATTENTION_MESSAGE = (
+    "We couldn't finish this order automatically. Our team has been alerted, "
+    "and you won't be charged twice."
+)
+
+
+def _request_owner() -> str:
+    return f"request:{uuid.uuid4().hex}"
+
+
+def _error_body(exc: OrderError) -> dict:
+    return {
+        "errorCode": exc.error_code,
+        "httpStatus": exc.http_status,
+        "message": exc.message,
+        "details": exc.details,
+    }
+
+
+def _stored_error(checkout: Checkout) -> StoredCheckoutFailureError:
+    error = (checkout.result or {}).get("error", {})
+    return StoredCheckoutFailureError(
+        error.get("errorCode", CheckoutCancelledError.error_code),
+        int(error.get("httpStatus", CheckoutCancelledError.http_status)),
+        error.get("message", _CANCELLED_MESSAGE),
+        error.get("details"),
+    )
 
 
 def _line_from_cart(item: dict) -> CheckoutLine:

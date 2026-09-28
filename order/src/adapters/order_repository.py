@@ -11,7 +11,7 @@ compatible with migrations/0001_orders.sql + 0002_checkout.sql +
 import base64
 import json
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from shared.adapters.db_operation import SqlAlchemyOperationMixin
 from shared.adapters.json_column import JSONColumn
@@ -38,14 +38,16 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from domain.checkout_models import (
+    TERMINAL_CHECKOUT_STATUSES,
     Checkout,
     CheckoutLine,
     CheckoutStatus,
     CheckoutStep,
     SubscriptionLineResult,
 )
-from domain.exceptions import CheckoutInProgressError, ServiceUnavailableError
+from domain.exceptions import CheckoutInProgressError, LeaseLostError, ServiceUnavailableError
 from domain.models import (
+    FAILURE_CUTOFF_PASSED,
     FAILURE_SWEEP_EXHAUSTED,
     Order,
     OrderItem,
@@ -405,7 +407,22 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                 ).fetchone()
         return None if row is None else _row_to_checkout(row)
 
-    def start_checkout(self, checkout: Checkout, order: Order | None) -> Checkout:
+    def get_checkout_by_id(self, checkout_id: str) -> Checkout | None:
+        with self._db_operation("get_checkout_by_id", "Failed to load checkout"):
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(checkouts_table).where(checkouts_table.c.id == checkout_id)
+                ).fetchone()
+        return None if row is None else _row_to_checkout(row)
+
+    def start_checkout(
+        self,
+        checkout: Checkout,
+        order: Order | None,
+        *,
+        claim_owner: str | None = None,
+        lease_seconds: float = 0,
+    ) -> Checkout:
         """One transaction: the IN_PROGRESS checkout row, plus — when there
         are one-time lines — its CREATED order and order_items. A race on
         the same (user, key) returns the winner's row (the caller resumes
@@ -428,6 +445,11 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                             order_id=checkout.order_id,
                             subscription_results=[],
                             result=None,
+                            # MA-144: the starting request holds the lease.
+                            claim_owner=claim_owner,
+                            claimed_until=(
+                                self._db_now_plus(lease_seconds) if claim_owner else None
+                            ),
                         )
                     )
                     if order is not None:
@@ -482,6 +504,8 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
             values["step"] = step.value
         if status is not None:
             values["status"] = status.value
+            if status in TERMINAL_CHECKOUT_STATUSES:
+                values.update(_LEASE_CLEARED)  # MA-144: a finished checkout holds nothing
         if subscription_results is not None:
             values["subscription_results"] = [r.to_dict() for r in subscription_results]
         if result is not None:
@@ -625,6 +649,152 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                     )
                 )
         return result.rowcount == 1
+
+    # --- MA-144: checkout lease + recovery ---
+
+    def claim_checkout(self, checkout_id: str, owner: str, lease_seconds: float) -> bool:
+        """Leases an IN_PROGRESS checkout to `owner`; False if anyone else holds it."""
+        return self._claim(
+            checkouts_table,
+            checkout_id,
+            owner,
+            lease_seconds,
+            checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+        )
+
+    def renew_checkout(self, checkout_id: str, owner: str, lease_seconds: float) -> bool:
+        return self._renew(checkouts_table, checkout_id, owner, lease_seconds)
+
+    def release_checkout(self, checkout_id: str, owner: str) -> None:
+        self._release(checkouts_table, checkout_id, owner)
+
+    def lease_remaining_seconds(self, checkout_id: str) -> float | None:
+        """For `retryAfterSeconds` only — a hint, so the app clock is fine here."""
+        with self._db_operation("lease_remaining_seconds", "Failed to load checkout"):
+            with self._engine.connect() as conn:
+                claimed_until = conn.execute(
+                    select(checkouts_table.c.claimed_until).where(
+                        checkouts_table.c.id == checkout_id
+                    )
+                ).scalar_one_or_none()
+        if claimed_until is None:
+            return None
+        if claimed_until.tzinfo is None:
+            claimed_until = claimed_until.replace(tzinfo=UTC)  # SQLite drops the offset
+        return (claimed_until - datetime.now(UTC)).total_seconds()
+
+    def list_stale_checkouts(self, older_than_seconds: float, limit: int) -> list[str]:
+        with self._db_operation("list_stale_checkouts", "Failed to list checkouts"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(checkouts_table.c.id)
+                    .where(
+                        checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+                        checkouts_table.c.updated_at < self._db_now_plus(-older_than_seconds),
+                        self._lease_free(checkouts_table),
+                    )
+                    .order_by(checkouts_table.c.updated_at)
+                    .limit(limit)
+                ).fetchall()
+        return [r.id for r in rows]
+
+    def record_checkout_sweep_failure(self, checkout_id: str, owner: str, error_code: str) -> int:
+        """+1 sweep attempt and the reason; returns the new count. Keeps the
+        lease — the sweep decides next (release, escalate or finish), which
+        depends on how far the checkout got."""
+        with self._db_operation("record_checkout_sweep_failure", "Failed to record attempt"):
+            with self._engine.begin() as conn:
+                conn.execute(
+                    checkouts_table.update()
+                    .where(
+                        checkouts_table.c.id == checkout_id,
+                        checkouts_table.c.claim_owner == owner,
+                    )
+                    .values(
+                        sweep_attempts=checkouts_table.c.sweep_attempts + 1,
+                        last_sweep_error=error_code,
+                    )
+                )
+                return int(
+                    conn.execute(
+                        select(checkouts_table.c.sweep_attempts).where(
+                            checkouts_table.c.id == checkout_id
+                        )
+                    ).scalar_one()
+                )
+
+    def cancel_checkout_and_order(
+        self, checkout_id: str, order_id: str, owner: str, result: dict
+    ) -> None:
+        """PD-1, one transaction: the never-charged order -> CANCELLED and the
+        checkout -> CANCELLED (lease and one-live lock released). Either both
+        change or neither: a guard that matches nothing raises LeaseLostError
+        and rolls back."""
+        with self._db_operation("cancel_checkout_and_order", "Failed to cancel checkout"):
+            with self._engine.begin() as conn:
+                order_rows = conn.execute(
+                    orders_table.update()
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.status == OrderStatus.CREATED.value,
+                    )
+                    .values(
+                        status=OrderStatus.CANCELLED.value, failure_reason=FAILURE_CUTOFF_PASSED
+                    )
+                ).rowcount
+                checkout_rows = conn.execute(
+                    checkouts_table.update()
+                    .where(
+                        checkouts_table.c.id == checkout_id,
+                        checkouts_table.c.claim_owner == owner,
+                        checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+                    )
+                    .values(
+                        status=CheckoutStatus.CANCELLED.value,
+                        result=result,
+                        updated_at=func.now(),
+                        **_LEASE_CLEARED,
+                    )
+                ).rowcount
+                if order_rows != 1 or checkout_rows != 1:
+                    raise LeaseLostError(
+                        "Checkout or order changed underneath the cancel",
+                        {"checkoutId": checkout_id},
+                    )
+
+    def escalate_checkout(
+        self, checkout_id: str, owner: str, error_code: str, order_id: str | None
+    ) -> None:
+        """Checkout -> NEEDS_ATTENTION (lease and one-live lock released) and,
+        if given and still unpaid, its order -> NEEDS_ATTENTION(SWEEP_EXHAUSTED)."""
+        with self._db_operation("escalate_checkout", "Failed to escalate checkout"):
+            with self._engine.begin() as conn:
+                conn.execute(
+                    checkouts_table.update()
+                    .where(
+                        checkouts_table.c.id == checkout_id,
+                        checkouts_table.c.claim_owner == owner,
+                        checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+                    )
+                    .values(
+                        status=CheckoutStatus.NEEDS_ATTENTION.value,
+                        last_sweep_error=error_code,
+                        updated_at=func.now(),
+                        **_LEASE_CLEARED,
+                    )
+                )
+                if order_id is not None:
+                    conn.execute(
+                        orders_table.update()
+                        .where(
+                            orders_table.c.id == order_id,
+                            orders_table.c.status == OrderStatus.CREATED.value,
+                        )
+                        .values(
+                            status=OrderStatus.NEEDS_ATTENTION.value,
+                            failure_reason=FAILURE_SWEEP_EXHAUSTED,
+                        )
+                    )
 
     # --- outbox (used by the publisher handler) ---
 

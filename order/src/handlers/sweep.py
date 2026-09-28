@@ -22,7 +22,12 @@ def run_once(service=None, now: datetime | None = None) -> Counter:
     correlation_id = str(uuid.uuid4())
     now = now or datetime.now(UTC)
     started = time.monotonic()
-    counts = service.sweep_subscription_orders(correlation_id, now)
+    counts = Counter()
+    for flow, run_pass in (
+        ("subscription_order", service.sweep_subscription_orders),
+        ("checkout", service.sweep_checkouts),
+    ):
+        counts.update({f"{flow}.{k}": v for k, v in run_pass(correlation_id, now).items()})
     duration_ms = int((time.monotonic() - started) * 1000)
     _metrics.emit("sweep.run_duration_ms", value=duration_ms)
     if counts:

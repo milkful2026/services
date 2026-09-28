@@ -15,6 +15,20 @@ class CheckoutStatus(StrEnum):
     IN_PROGRESS = "IN_PROGRESS"
     COMPLETED = "COMPLETED"
     PAYMENT_FAILED = "PAYMENT_FAILED"
+    # MA-144: abandoned before any charge and too late to deliver (PD-1).
+    CANCELLED = "CANCELLED"
+    # MA-144: the sweep gave up; an operator must look (lock released).
+    NEEDS_ATTENTION = "NEEDS_ATTENTION"
+
+
+TERMINAL_CHECKOUT_STATUSES = frozenset(
+    {
+        CheckoutStatus.COMPLETED,
+        CheckoutStatus.PAYMENT_FAILED,
+        CheckoutStatus.CANCELLED,
+        CheckoutStatus.NEEDS_ATTENTION,
+    }
+)
 
 
 class CheckoutStep(StrEnum):

@@ -56,6 +56,7 @@ def get_checkout_service() -> CheckoutService:
         HttpSubscriptionClient(settings.subscription_internal_base_url),
         cutoff_hour_ist=settings.checkout_cutoff_hour_ist,
         subscription_min_balance_paise=settings.subscription_min_balance_paise,
+        lease_seconds=settings.sweep_lease_seconds,
     )
 
 
@@ -73,4 +74,6 @@ def get_sweep_service() -> SweepService:
         max_attempts=settings.sweep_max_attempts,
         lease_seconds=settings.sweep_lease_seconds,
         batch_size=settings.sweep_batch_size,
+        checkout_service=get_checkout_service(),
+        checkout_stale_seconds=settings.checkout_stale_seconds,
     )
