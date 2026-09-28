@@ -18,6 +18,7 @@ Service scaffold and carries both.
 | GET | `/wallet/me/transactions` | Cognito JWT | Paged (keyset), newest-first ledger — the contract MA-27 renders |
 | POST | `/wallet/me/retry` | Cognito JWT | MA-1 replay of auto-provision |
 | GET | `/wallet/internal/limits` | SigV4 (VPC-only) | Recharge min/max for Payment Service (MA-126) |
+| GET | `/wallet/internal/debits/{orderId}` | SigV4 (VPC-only) | Read-only: was this order debited? 200 with amount/balance, or 404 `DEBIT_NOT_FOUND`. Order Service's sweep asks before cancelling an abandoned checkout (MA-142) |
 
 ## Events
 

@@ -154,3 +154,44 @@ def test_internal_balance_no_wallet_is_creating_zero(client):
     r = client.get("/wallet/internal/balance", params={"userId": "ghost"})
     assert r.status_code == 200
     assert r.json()["data"] == {"balancePaise": 0, "status": "CREATING"}
+
+
+# --- MA-142: GET /wallet/internal/debits/{orderId} ---
+
+
+def test_internal_debit_lookup_after_debit_is_200(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    client.post(
+        "/wallet/internal/debit",
+        json={"userId": "user-1", "orderId": "ord_x", "amountPaise": 30000},
+    )
+    r = client.get("/wallet/internal/debits/ord_x")
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["status"] == "DEBITED"
+    assert data["amountPaise"] == 30000
+    assert data["balanceAfterPaise"] == 70000
+    # Ledger rows are immutable: a repeated call returns the same data
+    # (only the envelope's per-request requestId differs).
+    assert client.get("/wallet/internal/debits/ord_x").json()["data"] == data
+
+
+def test_internal_debit_lookup_unknown_is_404(client, engine):
+    seed_wallet(engine)
+    r = client.get("/wallet/internal/debits/ord_unknown")
+    assert r.status_code == 404
+    assert r.json()["data"]["errorCode"] == "DEBIT_NOT_FOUND"
+
+
+@pytest.mark.parametrize("bad", ["bad%20id", "a" * 65, "ord.x"])
+def test_internal_debit_lookup_invalid_id_is_400(client, bad):
+    r = client.get(f"/wallet/internal/debits/{bad}")
+    assert r.status_code == 400
+    assert r.json()["data"]["errorCode"] == "VALIDATION_ERROR"
+
+
+def test_internal_debit_lookup_is_only_an_internal_route():
+    # openapi() flattens included routers (app.routes nests them).
+    lookups = [p for p in app.openapi()["paths"] if "/debits/" in p]
+    assert lookups == ["/wallet/internal/debits/{orderId}"]
+

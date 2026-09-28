@@ -84,3 +84,13 @@ class DebitResult:
 
     status: str  # "DEBITED" | "INSUFFICIENT_BALANCE" | "WALLET_NOT_ACTIVE"
     balance_after_paise: int | None = None
+
+
+@dataclass(frozen=True)
+class DebitLookup:
+    """MA-142 — Wallet's `GET /wallet/internal/debits/{orderId}`: proof
+    that an order was charged. `None` from the client means "not debited"."""
+
+    amount_paise: int
+    balance_after_paise: int
+    debited_at: datetime

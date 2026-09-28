@@ -4,7 +4,7 @@ never imports SQLAlchemy, `requests`, or boto3 directly."""
 from datetime import datetime
 from typing import Protocol
 
-from domain.models import DebitResult, Order, OrdersPage, Quote
+from domain.models import DebitLookup, DebitResult, Order, OrdersPage, Quote
 
 
 class OrderRepositoryPort(Protocol):
@@ -90,4 +90,10 @@ class WalletClientPort(Protocol):
         failure or a persistent 503 WALLET_PROVISIONING_PENDING. Returns a
         typed DebitResult (never raises) for DEBITED/INSUFFICIENT_BALANCE/
         WALLET_NOT_ACTIVE — all three are normal 200 responses."""
+        ...
+
+    def get_debit(self, order_id: str) -> DebitLookup | None:
+        """MA-142. The debit for `order_id`, or None if it was never
+        debited. Raises WalletUnavailableError when Wallet can't be asked —
+        callers must never read that as "not debited"."""
         ...

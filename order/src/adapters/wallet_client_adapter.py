@@ -16,19 +16,24 @@ subscription's first order right after registration retries via SQS
 redelivery instead of permanently failing."""
 
 import logging
+from datetime import datetime
 
 import requests
 from requests.exceptions import RequestException
 from shared.adapters.retry import call_with_retry
 
 from domain.exceptions import WalletBalanceUnavailableError, WalletUnavailableError
-from domain.models import DebitResult
+from domain.models import DebitLookup, DebitResult
 
 logger = logging.getLogger(__name__)
 
 
 class _RetryableWalletError(Exception):
     pass
+
+
+class _UnexpectedWalletResponse(Exception):
+    """A 4xx the contract doesn't allow — not retried, never read as an answer."""
 
 
 class HttpWalletClient:
@@ -105,6 +110,69 @@ class HttpWalletClient:
         except _RetryableWalletError as exc:
             raise WalletUnavailableError(
                 "Wallet debit request failed after retries", details={"cause": str(exc)}
+            ) from exc
+
+    def get_debit(self, order_id: str) -> DebitLookup | None:
+        """MA-142 — `GET /wallet/internal/debits/{orderId}`. Read-only, so
+        safe to retry. 404 DEBIT_NOT_FOUND → None (never debited). Anything
+        that isn't a definite answer raises WalletUnavailableError: the
+        sweep (MA-144) cancels a checkout on None, so "couldn't ask" must
+        never look like "not debited"."""
+        url = f"{self._base_url}/wallet/internal/debits/{order_id}"
+
+        def _attempt() -> DebitLookup | None:
+            try:
+                response = requests.get(
+                    url,
+                    timeout=self._timeout_seconds,
+                    headers={"x-request-id": self._correlation_id},
+                )
+            except RequestException as exc:
+                raise _RetryableWalletError(str(exc)) from exc
+            if response.status_code >= 500:
+                raise _RetryableWalletError(f"Wallet returned HTTP {response.status_code}")
+            try:
+                data = response.json()["data"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise _UnexpectedWalletResponse(
+                    f"malformed HTTP {response.status_code} body from Wallet: {exc}"
+                ) from exc
+            if response.status_code == 404 and data.get("errorCode") == "DEBIT_NOT_FOUND":
+                return None
+            if response.status_code != 200:
+                raise _UnexpectedWalletResponse(
+                    f"Wallet returned HTTP {response.status_code} ({data.get('errorCode')})"
+                )
+            try:
+                return DebitLookup(
+                    amount_paise=int(data["amountPaise"]),
+                    balance_after_paise=int(data["balanceAfterPaise"]),
+                    debited_at=datetime.fromisoformat(data["debitedAt"]),
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise _UnexpectedWalletResponse(
+                    f"malformed 200 body from Wallet: {exc}"
+                ) from exc
+
+        try:
+            return call_with_retry(
+                _attempt,
+                max_retries=self._max_retries,
+                backoff_base_seconds=self._backoff_base_seconds,
+                retryable_exceptions=(_RetryableWalletError,),
+            )
+        except _RetryableWalletError as exc:
+            raise WalletUnavailableError(
+                "Wallet debit lookup failed after retries", details={"cause": str(exc)}
+            ) from exc
+        except _UnexpectedWalletResponse as exc:
+            logger.error(
+                "wallet_client.get_debit unexpected response",
+                extra={"orderId": order_id, "error": str(exc)},
+            )
+            raise WalletUnavailableError(
+                "Wallet debit lookup returned an unexpected response",
+                details={"cause": str(exc)},
             ) from exc
 
     def get_balance(self, user_id: str) -> int:

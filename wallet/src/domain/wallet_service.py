@@ -18,6 +18,7 @@ from adapters.wallet_repository import (
 )
 from config.env import Settings
 from domain.exceptions import (
+    DebitNotFoundError,
     InvalidAmountError,
     InvalidCursorError,
     WalletError,
@@ -124,6 +125,29 @@ class WalletService:
         if wallet is None:
             return {"balancePaise": 0, "status": WalletStatus.CREATING.value}
         return {"balancePaise": wallet.balance_paise, "status": wallet.status.value}
+
+    def get_debit_for_order(self, order_id: str) -> dict:
+        """MA-142 — has `order_id` been debited? Read-only: Order Service's
+        sweep asks this before cancelling an abandoned checkout, so it must
+        never be answered by calling `debit` (which would charge)."""
+        entry = self._repo.get_ledger_entry_by_ref(f"order:{order_id}")
+        if entry is not None and entry.type != LedgerType.ORDER_DEBIT:
+            # Refs are namespaced, so this should be impossible.
+            logger.error(
+                "get_debit_for_order: ref held by a non-debit ledger entry",
+                extra={"orderId": order_id, "type": entry.type.value},
+            )
+            entry = None
+        if entry is None:
+            raise DebitNotFoundError(f"No debit found for order {order_id}")
+        return {
+            "orderId": order_id,
+            "status": DebitResult.DEBITED.value,
+            "amountPaise": abs(entry.amount_paise),
+            "balanceAfterPaise": entry.balance_after_paise,
+            "debitedAt": entry.created_at.isoformat(),
+            "walletId": entry.wallet_id,
+        }
 
     def list_transactions(
         self, user_id: str, limit: int | None, cursor: str | None

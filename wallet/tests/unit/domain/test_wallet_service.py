@@ -2,6 +2,7 @@ import pytest
 
 from adapters.wallet_repository import ledger_entries_table, wallets_table
 from domain.exceptions import (
+    DebitNotFoundError,
     InvalidAmountError,
     InvalidCursorError,
     OrderUserMismatchError,
@@ -439,3 +440,50 @@ class TestDebitForOrder:
 
         monkeypatch.undo()
         assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+
+
+class TestGetDebitForOrder:
+    """MA-142 — read-only debit lookup by order id."""
+
+    def test_debited_order_returns_positive_amount(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+        )
+        debit = service.get_debit_for_order("order-1")
+        assert debit["orderId"] == "order-1"
+        assert debit["status"] == "DEBITED"
+        assert debit["amountPaise"] == 30000
+        assert debit["balanceAfterPaise"] == 70000
+        assert debit["walletId"] == "wal_1"
+        assert debit["debitedAt"]
+
+    def test_unknown_order_raises_not_found(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        with pytest.raises(DebitNotFoundError):
+            service.get_debit_for_order("order-never")
+
+    def test_lookup_does_not_change_balance(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+        )
+        service.get_debit_for_order("order-1")
+        service.get_debit_for_order("order-1")
+        assert repo.get_wallet_by_user("user-1").balance_paise == 70000
+
+    def test_non_debit_entry_on_ref_is_not_found_and_logged(self, service, engine, caplog):
+        seed_wallet(engine, balance_paise=100000)
+        with engine.begin() as conn:
+            conn.execute(
+                ledger_entries_table.insert().values(
+                    wallet_id="wal_1",
+                    type="ADJUSTMENT",
+                    amount_paise=100,
+                    balance_after_paise=100100,
+                    ref="order:odd",
+                )
+            )
+        with caplog.at_level("ERROR"), pytest.raises(DebitNotFoundError):
+            service.get_debit_for_order("odd")
+        assert "non-debit ledger entry" in caplog.text

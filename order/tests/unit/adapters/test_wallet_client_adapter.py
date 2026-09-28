@@ -1,6 +1,8 @@
+import pytest
 import responses
 
 from adapters.wallet_client_adapter import HttpWalletClient
+from domain.exceptions import WalletUnavailableError
 
 
 def _client(max_retries: int = 1) -> HttpWalletClient:
@@ -62,3 +64,74 @@ def test_wallet_not_active_has_no_balance():
     result = _client().debit("user-1", "ord-1", 1000, "corr-1")
     assert result.status == "WALLET_NOT_ACTIVE"
     assert result.balance_after_paise is None
+
+
+# --- MA-142: get_debit ---
+
+_LOOKUP_URL = "http://wallet.test/wallet/internal/debits/ord-1"
+_FOUND = {
+    "data": {
+        "orderId": "ord-1",
+        "status": "DEBITED",
+        "amountPaise": 10820,
+        "balanceAfterPaise": 34180,
+        "debitedAt": "2026-09-28T14:03:11.412000+00:00",
+        "walletId": "wal_1",
+    }
+}
+
+
+@responses.activate
+def test_get_debit_found_returns_lookup():
+    responses.add(responses.GET, _LOOKUP_URL, json=_FOUND, status=200)
+    lookup = _client().get_debit("ord-1")
+    assert lookup.amount_paise == 10820
+    assert lookup.balance_after_paise == 34180
+    assert lookup.debited_at.year == 2026
+
+
+@responses.activate
+def test_get_debit_not_found_returns_none():
+    responses.add(
+        responses.GET,
+        _LOOKUP_URL,
+        json={"data": {"errorCode": "DEBIT_NOT_FOUND", "message": "x"}},
+        status=404,
+    )
+    assert _client().get_debit("ord-1") is None
+
+
+@responses.activate
+def test_get_debit_retries_5xx_then_succeeds():
+    responses.add(responses.GET, _LOOKUP_URL, status=503)
+    responses.add(responses.GET, _LOOKUP_URL, json=_FOUND, status=200)
+    assert _client(max_retries=2).get_debit("ord-1").amount_paise == 10820
+
+
+@responses.activate
+def test_get_debit_5xx_every_attempt_is_unavailable_not_none():
+    responses.add(responses.GET, _LOOKUP_URL, status=503)
+    with pytest.raises(WalletUnavailableError):
+        _client(max_retries=1).get_debit("ord-1")
+
+
+@responses.activate
+def test_get_debit_unexpected_4xx_is_unavailable_and_not_retried():
+    responses.add(
+        responses.GET,
+        _LOOKUP_URL,
+        json={"data": {"errorCode": "VALIDATION_ERROR", "message": "x"}},
+        status=400,
+    )
+    with pytest.raises(WalletUnavailableError):
+        _client(max_retries=2).get_debit("ord-1")
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_get_debit_404_without_debit_not_found_code_is_unavailable():
+    # e.g. an old Wallet without the route: FastAPI's own 404 must never
+    # be read as "not debited".
+    responses.add(responses.GET, _LOOKUP_URL, json={"detail": "Not Found"}, status=404)
+    with pytest.raises(WalletUnavailableError):
+        _client().get_debit("ord-1")

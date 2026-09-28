@@ -113,6 +113,16 @@ class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
                 ).fetchone()
         return None if row is None else _row_to_wallet(row)
 
+    def get_ledger_entry_by_ref(self, ref: str) -> LedgerEntry | None:
+        # MA-142: read-only — deliberately no FOR UPDATE, so a lookup never
+        # contends with a debit on the same wallet.
+        with self._db_operation("get_ledger_entry_by_ref", "Failed to load ledger entry"):
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(ledger_entries_table).where(ledger_entries_table.c.ref == ref)
+                ).fetchone()
+        return None if row is None else _row_to_entry(row)
+
     def insert_wallet_if_absent(self, wallet_id: str, user_id: str) -> bool:
         with self._db_operation("insert_wallet_if_absent", "Failed to create wallet"):
             with self._engine.begin() as conn:

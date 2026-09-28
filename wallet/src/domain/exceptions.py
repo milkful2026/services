@@ -54,6 +54,19 @@ class OrderUserMismatchError(WalletError):
     http_status = 400
 
 
+class DebitNotFoundError(WalletError):
+    """MA-142 — no ORDER_DEBIT ledger entry for the order. An expected
+    answer (the order was never charged), not an alarm condition."""
+
+    error_code = "DEBIT_NOT_FOUND"
+    http_status = 404
+
+
+class InvalidOrderIdError(WalletError):
+    error_code = "VALIDATION_ERROR"
+    http_status = 400
+
+
 class InvalidAmountError(WalletError):
     error_code = "INVALID_AMOUNT"
     http_status = 400
