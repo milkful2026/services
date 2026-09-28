@@ -8,3 +8,5 @@ thread's liveness for the ALB health check, same pattern wallet's own
 from shared.handlers.health import ConsumerHealth
 
 consumer_health = ConsumerHealth()
+# MA-143: the reconciliation sweep thread's liveness, reported the same way.
+sweep_health = ConsumerHealth()

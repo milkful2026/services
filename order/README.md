@@ -81,6 +81,38 @@ receive SubscriptionOrderDue
 `(subscription_id, delivery_date)` is UNIQUE at the DB level — the core
 correctness guarantee, independent of the SQS-level message dedupe.
 
+## Reconciliation sweep (MA-138 / MA-143)
+
+A daemon thread (`handlers/sweep.py`, started by `main.py`) that finishes
+or safely closes records left half-done by a crash or an outage:
+
+- **Subscription orders stuck `CREATED`** (older than
+  `ORDER_SUBSCRIPTION_ORDER_STALE_SECONDS`, e.g. the SQS message went to
+  the DLQ): charged once through the same debit step `materialize`'s
+  crash-resume uses (Wallet dedupes on the order id), or — once the
+  delivery can no longer be scheduled (20:00 IST the day before) —
+  moved to `NEEDS_ATTENTION(CUTOFF_PASSED)` **without charging**.
+- **Lease:** a record is worked only by the holder of
+  `claimed_until`/`claim_owner` (DB clock). The SQS resume path takes the
+  same lease; if the sweep holds it, the message is left unacked
+  (`ORDER_BUSY`) and the redelivery finds the order terminal.
+- **Budget:** each failed sweep attempt increments `sweep_attempts`; at
+  `ORDER_SWEEP_MAX_ATTEMPTS` the order becomes
+  `NEEDS_ATTENTION(SWEEP_EXHAUSTED)` and is never retried.
+
+| Env var | Default |
+|---------|---------|
+| `ORDER_SWEEP_ENABLED` | `true` |
+| `ORDER_SWEEP_INTERVAL_SECONDS` | `300` |
+| `ORDER_SUBSCRIPTION_ORDER_STALE_SECONDS` | `900` |
+| `ORDER_SWEEP_MAX_ATTEMPTS` | `6` |
+| `ORDER_SWEEP_LEASE_SECONDS` | `120` (minimum 60) |
+| `ORDER_SWEEP_BATCH_SIZE` | `50` |
+
+Metrics (log-based, `"metric"` field): `sweep.subscription_order.{found,resumed,confirmed,payment_failed,escalated,failed_attempt}`
+(`escalated` carries `reason`), `sweep.run_duration_ms`, `sweep.run_failed`.
+`/healthz` returns 503 if the sweep thread dies.
+
 ## Data (Aurora `order`)
 
 `orders(id, user_id, subscription_id, product_id, quantity,
@@ -117,11 +149,12 @@ every other service here); no real AWS/DB/network.
 - `infra/` CDK stack (Fargate + Aurora + this service's own
   `order-events-q` + DLQ + the `execute-api:Invoke` grant for the
   SigV4-signed User Service call) — MA-25 implementation plan Step 5.
+  It must also create the sweep alarms (MA-143 §6), from log metric
+  filters on `$.metric`: any `sweep.subscription_order.escalated` or
+  `sweep.checkout.escalated` in 5 min → ops notification;
+  `sweep.run_failed` ≥ 3 in 15 min → ops notification.
 - `services/local-dev` wiring (`docker-compose.yml` entry, database
   bootstrap, queue/rule bootstrap) — same step.
-- A reconciliation sweep for an order stuck in `CREATED` past SQS's
-  visibility timeout — MA-132 §11 explicitly defers this; redelivery is
-  the only recovery path in this pass.
 - A sweep that resumes checkouts left `IN_PROGRESS` by a client that
   never retried (MA-136 §11). Until it exists, such a checkout is only
   finished when the user next checks out (it no longer blocks them once

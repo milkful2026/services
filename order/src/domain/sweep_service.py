@@ -1,0 +1,143 @@
+"""MA-143 reconciliation sweep: finishes or safely closes records a crash or
+a dependency outage left half-done.
+
+Subscription orders stuck CREATED (MA-143 FR-4): charged once through the
+same debit step `materialize`'s crash-resume uses, or — once the delivery
+can no longer be scheduled — escalated to NEEDS_ATTENTION without
+charging.
+
+Every record is worked under a lease (see the repository), so the sweep,
+SQS redelivery and several Order tasks never run the same record at once.
+Failed attempts are counted; at the budget the record is escalated
+rather than retried for ever.
+"""
+
+import logging
+from collections import Counter
+from datetime import datetime
+
+from domain.cutoff import delivery_cutoff_passed
+from domain.exceptions import OrderError, WalletUnavailableError
+from domain.models import FAILURE_CUTOFF_PASSED, FAILURE_SWEEP_EXHAUSTED, OrderStatus
+
+logger = logging.getLogger(__name__)
+
+_ORDER_FLOW = "sweep.subscription_order"
+
+
+class SweepService:
+    def __init__(
+        self,
+        repository,
+        order_service,
+        metrics,
+        *,
+        owner: str,
+        cutoff_hour_ist: int,
+        subscription_order_stale_seconds: float,
+        max_attempts: int,
+        lease_seconds: float,
+        batch_size: int,
+    ) -> None:
+        self._repo = repository
+        self._order_service = order_service
+        self._metrics = metrics
+        self._owner = owner
+        self._cutoff_hour_ist = cutoff_hour_ist
+        self._order_stale_seconds = subscription_order_stale_seconds
+        self._max_attempts = max_attempts
+        self._lease_seconds = lease_seconds
+        self._batch_size = batch_size
+
+    # --- FR-4: stuck subscription orders ---
+
+    def sweep_subscription_orders(self, correlation_id: str, now: datetime) -> Counter:
+        counts: Counter = Counter()
+        order_ids = self._repo.list_stale_subscription_orders(
+            self._order_stale_seconds, self._batch_size
+        )
+        for order_id in order_ids:
+            counts["found"] += 1
+            self._metrics.emit(f"{_ORDER_FLOW}.found")
+            try:
+                outcome = self._sweep_order(order_id, correlation_id, now)
+            except Exception as exc:  # noqa: BLE001 — one record never stops the run
+                logger.exception(
+                    "sweep.subscription_order: unexpected error",
+                    extra={"orderId": order_id, "correlationId": correlation_id},
+                )
+                outcome = self._record_order_failure(
+                    order_id, f"UNEXPECTED:{type(exc).__name__}", correlation_id
+                )
+            if outcome:
+                counts[outcome] += 1
+        return counts
+
+    def _sweep_order(self, order_id: str, correlation_id: str, now: datetime) -> str | None:
+        if not self._repo.claim_order(order_id, self._owner, self._lease_seconds):
+            return None  # another worker has it
+        order = self._repo.get(order_id)
+        if order is None or order.status != OrderStatus.CREATED:
+            self._repo.release_order(order_id, self._owner)
+            return None
+        attempt = order.sweep_attempts + 1
+
+        if delivery_cutoff_passed(order.delivery_date, now, self._cutoff_hour_ist):
+            # D-5: too late to deliver — never charge it.
+            self._repo.escalate_order(order.id, self._owner, FAILURE_CUTOFF_PASSED)
+            self._log(order.id, attempt, "escalated", correlation_id, FAILURE_CUTOFF_PASSED)
+            self._metrics.emit(f"{_ORDER_FLOW}.escalated", reason=FAILURE_CUTOFF_PASSED)
+            return "escalated"
+
+        self._metrics.emit(f"{_ORDER_FLOW}.resumed")
+        try:
+            # Charges once, or replays a debit the crashed attempt already made.
+            self._order_service.resume_debit(order, correlation_id)
+        except WalletUnavailableError as exc:
+            return self._record_order_failure(order.id, exc.error_code, correlation_id)
+
+        after = self._repo.get(order.id)
+        outcome = "confirmed" if after.status == OrderStatus.CONFIRMED else "payment_failed"
+        self._log(order.id, attempt, outcome, correlation_id)
+        self._metrics.emit(f"{_ORDER_FLOW}.{outcome}")
+        return outcome
+
+    def _record_order_failure(self, order_id: str, error_code: str, correlation_id: str) -> str:
+        self._metrics.emit(f"{_ORDER_FLOW}.failed_attempt", error=error_code)
+        try:
+            escalated = self._repo.record_order_sweep_failure(
+                order_id, self._owner, error_code, self._max_attempts
+            )
+        except OrderError:
+            # DB trouble too — the lease simply expires and a later run retries.
+            logger.exception(
+                "sweep.subscription_order: could not record the failed attempt",
+                extra={"orderId": order_id, "correlationId": correlation_id},
+            )
+            return "failed_attempt"
+        if escalated:
+            self._log(order_id, None, "escalated", correlation_id, FAILURE_SWEEP_EXHAUSTED)
+            self._metrics.emit(f"{_ORDER_FLOW}.escalated", reason=FAILURE_SWEEP_EXHAUSTED)
+            return "escalated"
+        self._log(order_id, None, "failed_attempt", correlation_id, error_code)
+        return "failed_attempt"
+
+    def _log(
+        self,
+        order_id: str,
+        attempt: int | None,
+        outcome: str,
+        correlation_id: str,
+        reason: str | None = None,
+    ) -> None:
+        logger.info(
+            "sweep.subscription_order",
+            extra={
+                "orderId": order_id,
+                "attempt": attempt,
+                "outcome": outcome,
+                "reason": reason,
+                "correlationId": correlation_id,
+                "claimOwner": self._owner,
+            },
+        )

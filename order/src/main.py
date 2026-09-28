@@ -31,9 +31,10 @@ import uvicorn  # noqa: E402
 
 from adapters.order_events_consumer import OrderEventsConsumer  # noqa: E402
 from config.env import get_settings  # noqa: E402
+from handlers import sweep  # noqa: E402
 from handlers.app import app  # noqa: E402
 from handlers.dependencies import get_order_service  # noqa: E402
-from handlers.health import consumer_health  # noqa: E402
+from handlers.health import consumer_health, sweep_health  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,23 @@ def _run_consumer() -> None:
         raise
 
 
+def _run_sweep() -> None:
+    # MA-143 FR-1. run_forever survives per-run errors; reaching here means
+    # the thread itself died, so /healthz must say so.
+    try:
+        sweep.run_forever()
+    except Exception:
+        logger.critical("order sweep thread died — stuck orders will not be recovered")
+        sweep_health.alive = False
+        raise
+
+
 def main() -> None:
     threading.Thread(target=_run_consumer, daemon=True, name="order-events-consumer").start()
+    if get_settings().sweep_enabled:
+        threading.Thread(target=_run_sweep, daemon=True, name="order-sweep").start()
+    else:
+        logger.warning("ORDER_SWEEP_ENABLED=false — sweep thread not started")
     uvicorn.run(app, host="0.0.0.0", port=8009)  # noqa: S104 — Fargate task, not exposed directly
 
 

@@ -206,3 +206,13 @@ class SubscriptionRejectedError(OrderError):
 class WalletBalanceUnavailableError(OrderError):
     error_code = "WALLET_UNAVAILABLE"
     http_status = 503
+
+
+class OrderBusyError(OrderError):
+    """MA-143 FR-5 — another worker (the sweep) holds this order's lease.
+    Raised on the SQS resume path only; the consumer leaves the message
+    unacked, and the redelivery finds the order terminal and no-ops."""
+
+    error_code = "ORDER_BUSY"
+    http_status = 409
+

@@ -11,6 +11,14 @@ class OrderStatus(StrEnum):
     CONFIRMED = "CONFIRMED"
     PAYMENT_FAILED = "PAYMENT_FAILED"
     FAILED = "FAILED"
+    # MA-143: the sweep gave up (retry budget spent, or past the delivery
+    # cut-off before it could be charged). Terminal; operators act on it.
+    NEEDS_ATTENTION = "NEEDS_ATTENTION"
+
+
+# MA-143 failure reasons set by the sweep (orders.failure_reason).
+FAILURE_CUTOFF_PASSED = "CUTOFF_PASSED"
+FAILURE_SWEEP_EXHAUSTED = "SWEEP_EXHAUSTED"
 
 
 class OrderSource(StrEnum):
@@ -45,6 +53,11 @@ class Order:
     source: OrderSource = OrderSource.SUBSCRIPTION
     checkout_id: str | None = None
     items: list[OrderItem] = field(default_factory=list)
+    # MA-143 sweep lease / attempt bookkeeping.
+    sweep_attempts: int = 0
+    claimed_until: datetime | None = None
+    claim_owner: str | None = None
+    last_sweep_error: str | None = None
 
     def item_list(self) -> list[OrderItem]:
         """Every order as a list of lines — a SUBSCRIPTION order's single

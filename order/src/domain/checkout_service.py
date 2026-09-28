@@ -23,7 +23,7 @@ transaction.
 
 import logging
 import uuid
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from adapters.order_repository import new_order_id
@@ -34,6 +34,7 @@ from domain.checkout_models import (
     CheckoutStep,
     SubscriptionLineResult,
 )
+from domain.cutoff import IST
 from domain.exceptions import (
     AddressLookupUnavailableError,
     CartChangedError,
@@ -61,9 +62,6 @@ from domain.models import Order, OrderItem, OrderSource, OrderStatus
 
 logger = logging.getLogger(__name__)
 
-# Fixed offset, same as Subscription Service's own IST (India has no DST),
-# so no dependency on the host's tz database.
-IST = timezone(timedelta(hours=5, minutes=30))
 
 # Cart frequency -> Subscription Service schedule type. Cart's Frequency
 # stays deliberately narrow (MA-131 §6); WEEKLY/CUSTOM_DAYS are only

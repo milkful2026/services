@@ -1,12 +1,15 @@
 """FastAPI dependency wiring — the composition root. `lru_cache` gives a
 per-process singleton; tests override via `app.dependency_overrides`."""
 
+import os
+import socket
 from functools import lru_cache
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from adapters.cart_client_adapter import HttpCartClient
+from adapters.logging_metrics import LoggingMetricsRecorder
 from adapters.order_repository import SqlAlchemyOrderRepository
 from adapters.pricing_client_adapter import HttpPricingClient
 from adapters.subscription_client_adapter import HttpSubscriptionClient
@@ -15,6 +18,7 @@ from adapters.wallet_client_adapter import HttpWalletClient
 from config.env import get_settings
 from domain.checkout_service import CheckoutService
 from domain.order_service import OrderService
+from domain.sweep_service import SweepService
 
 
 @lru_cache
@@ -31,7 +35,13 @@ def get_order_service() -> OrderService:
     user_client = HttpUserClient(settings.user_internal_base_url, settings.aws_region)
     pricing_client = HttpPricingClient(settings.pricing_base_url)
     wallet_client = HttpWalletClient(settings.wallet_internal_base_url)
-    return OrderService(repository, user_client, pricing_client, wallet_client)
+    return OrderService(
+        repository,
+        user_client,
+        pricing_client,
+        wallet_client,
+        lease_seconds=settings.sweep_lease_seconds,
+    )
 
 
 @lru_cache
@@ -46,4 +56,21 @@ def get_checkout_service() -> CheckoutService:
         HttpSubscriptionClient(settings.subscription_internal_base_url),
         cutoff_hour_ist=settings.checkout_cutoff_hour_ist,
         subscription_min_balance_paise=settings.subscription_min_balance_paise,
+    )
+
+
+@lru_cache
+def get_sweep_service() -> SweepService:
+    settings = get_settings()
+    return SweepService(
+        SqlAlchemyOrderRepository(_engine()),
+        get_order_service(),
+        LoggingMetricsRecorder(),
+        # Unique per task, so a lease names the process that holds it.
+        owner=f"sweep:{socket.gethostname()}:{os.getpid()}",
+        cutoff_hour_ist=settings.checkout_cutoff_hour_ist,
+        subscription_order_stale_seconds=settings.subscription_order_stale_seconds,
+        max_attempts=settings.sweep_max_attempts,
+        lease_seconds=settings.sweep_lease_seconds,
+        batch_size=settings.sweep_batch_size,
     )

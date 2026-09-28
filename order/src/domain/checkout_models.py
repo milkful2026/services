@@ -115,6 +115,11 @@ class Checkout:
     # Last write to the row — how a new-key request tells an abandoned
     # IN_PROGRESS checkout from one another request is still running.
     updated_at: datetime | None = None
+    # MA-143 sweep lease / attempt bookkeeping (used by MA-144).
+    sweep_attempts: int = 0
+    claimed_until: datetime | None = None
+    claim_owner: str | None = None
+    last_sweep_error: str | None = None
 
     @property
     def one_time_lines(self) -> list[CheckoutLine]:

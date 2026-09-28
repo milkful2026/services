@@ -46,7 +46,13 @@ from adapters.interfaces import (
     WalletClientPort,
 )
 from adapters.order_repository import decode_cursor, new_order_id
-from domain.exceptions import InvalidCursorError, OrderNotFoundError, ProductPricingUnknownError
+from domain.exceptions import (
+    InvalidCursorError,
+    OrderBusyError,
+    OrderNotFoundError,
+    ProductPricingUnknownError,
+    WalletUnavailableError,
+)
 from domain.models import Order, OrdersPage, OrderStatus
 
 logger = logging.getLogger(__name__)
@@ -62,11 +68,14 @@ class OrderService:
         user_client: UserClientPort,
         pricing_client: PricingClientPort,
         wallet_client: WalletClientPort,
+        *,
+        lease_seconds: float = 120,
     ) -> None:
         self._repo = repository
         self._user_client = user_client
         self._pricing_client = pricing_client
         self._wallet_client = wallet_client
+        self._lease_seconds = lease_seconds
 
     def materialize(
         self,
@@ -77,6 +86,7 @@ class OrderService:
         quantity: int,
         delivery_date,
         correlation_id: str | None,
+        claim_owner: str | None = None,
     ) -> None:
         existing = self._repo.get_by_subscription_and_date(subscription_id, delivery_date)
         if existing is not None:
@@ -84,7 +94,7 @@ class OrderService:
                 # A prior attempt crashed between insert and the debit
                 # call — resume there rather than re-inserting or
                 # silently dropping the redelivery.
-                self._debit_and_finalize(existing, correlation_id)
+                self._resume_claimed(existing, correlation_id, claim_owner)
                 return
             logger.info(
                 "order.materialize: already resolved, no-op",
@@ -187,6 +197,31 @@ class OrderService:
         }
         order = self._repo.insert_payment_failed(order, "OrderPaymentFailed", payload)
         logger.info("order.payment_failed", extra={"orderId": order.id, "reason": reason})
+
+    def _resume_claimed(
+        self, order: Order, correlation_id: str | None, claim_owner: str | None
+    ) -> None:
+        """MA-143 FR-5 — the SQS resume path takes the order's lease first,
+        so it never debits alongside the sweep. Lost -> OrderBusyError (the
+        consumer leaves the message unacked; the redelivery then finds the
+        order terminal). A terminal transition releases the lease itself."""
+        if claim_owner is None:
+            self._debit_and_finalize(order, correlation_id)
+            return
+        if not self._repo.claim_order(order.id, claim_owner, self._lease_seconds):
+            raise OrderBusyError(
+                "Order is being resumed by another worker", {"orderId": order.id}
+            )
+        try:
+            self._debit_and_finalize(order, correlation_id)
+        except WalletUnavailableError:
+            self._repo.release_order(order.id, claim_owner)
+            raise
+
+    def resume_debit(self, order: Order, correlation_id: str | None) -> None:
+        """MA-143 — the sweep's entry point: the same debit step the SQS
+        crash-resume path runs. The caller already holds the lease."""
+        self._debit_and_finalize(order, correlation_id)
 
     def _debit_and_finalize(self, order: Order, correlation_id: str | None) -> None:
         # Deliberately outside any DB transaction — an external HTTP call

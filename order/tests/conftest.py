@@ -34,6 +34,8 @@ def _env(monkeypatch):
     monkeypatch.setenv("ORDER_USER_INTERNAL_BASE_URL", "http://user.test")
     monkeypatch.setenv("ORDER_PRICING_BASE_URL", "http://pricing.test")
     monkeypatch.setenv("ORDER_WALLET_INTERNAL_BASE_URL", "http://wallet.test")
+    # Tests drive the sweep with run_once(); never start its thread.
+    monkeypatch.setenv("ORDER_SWEEP_ENABLED", "false")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-south-1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")

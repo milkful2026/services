@@ -7,6 +7,7 @@ services/local-dev/order/.env.local into os.environ at the process
 entrypoint (see src/main.py).
 """
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +39,24 @@ class Settings(BaseSettings):
     checkout_cutoff_hour_ist: int = 20
     # Must equal Cart's wallet_minimum_balance (₹500), in paise.
     subscription_min_balance_paise: int = 50_000
+
+    # --- MA-143: reconciliation sweep (FR-7) ---
+    sweep_enabled: bool = True
+    sweep_interval_seconds: float = 300
+    subscription_order_stale_seconds: float = 900
+    checkout_stale_seconds: float = 600  # MA-144
+    sweep_max_attempts: int = 6
+    # Must outlast one dependency call (≈12 s with retries); the holder
+    # renews before each call, so this doesn't bound a whole record run.
+    sweep_lease_seconds: float = 120
+    sweep_batch_size: int = 50
+
+    @field_validator("sweep_lease_seconds")
+    @classmethod
+    def _lease_at_least_a_minute(cls, value: float) -> float:
+        if value < 60:
+            raise ValueError("ORDER_SWEEP_LEASE_SECONDS must be at least 60")
+        return value
 
 
 def get_settings() -> Settings:

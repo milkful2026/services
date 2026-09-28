@@ -194,3 +194,58 @@ class TestRedelivery:
         order = repo.get_by_subscription_and_date("sub-1", DELIVERY_DATE)
         assert order.id == "ord_precreated"
         assert order.status == OrderStatus.CONFIRMED
+
+
+class TestSqsResumeLease:
+    """MA-143 FR-5 — the SQS crash-resume path honours the sweep's lease."""
+
+    def _precreate(self, repo):
+        from domain.models import Order
+
+        repo.insert_created(
+            Order(
+                id="ord_precreated",
+                user_id="user-1",
+                subscription_id="sub-1",
+                product_id="prod-1",
+                quantity=2,
+                amount_paise=5500,
+                delivery_date=DELIVERY_DATE,
+                status=OrderStatus.CREATED,
+            )
+        )
+
+    def test_leased_by_sweep_raises_busy_without_debiting(self, service, repo, wallet_client):
+        from domain.exceptions import OrderBusyError
+
+        self._precreate(repo)
+        assert repo.claim_order("ord_precreated", "sweep:x", 120)
+        with pytest.raises(OrderBusyError):
+            _materialize(service, claim_owner="sqs:m1")
+        assert wallet_client.calls == []
+
+    def test_unleased_resumes_and_releases(self, service, repo, wallet_client):
+        self._precreate(repo)
+        _materialize(service, claim_owner="sqs:m1")
+        order = repo.get("ord_precreated")
+        assert order.status == OrderStatus.CONFIRMED
+        assert order.claim_owner is None
+        assert len(wallet_client.calls) == 1
+
+    def test_wallet_down_releases_the_lease_and_reraises(self, service, repo, wallet_client):
+        wallet_client.raise_unavailable = True
+        self._precreate(repo)
+        with pytest.raises(WalletUnavailableError):
+            _materialize(service, claim_owner="sqs:m1")
+        order = repo.get("ord_precreated")
+        assert order.status == OrderStatus.CREATED
+        assert order.claim_owner is None
+        assert order.sweep_attempts == 0  # SQS retries never spend the sweep budget
+
+    def test_redelivery_for_escalated_order_is_a_no_op(self, service, repo, wallet_client):
+        self._precreate(repo)
+        repo.claim_order("ord_precreated", "sweep:x", 120)
+        repo.escalate_order("ord_precreated", "sweep:x", "CUTOFF_PASSED")
+        _materialize(service, claim_owner="sqs:m1")
+        assert wallet_client.calls == []
+        assert repo.get("ord_precreated").status == OrderStatus.NEEDS_ATTENTION
