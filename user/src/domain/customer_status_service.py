@@ -95,18 +95,35 @@ class CustomerStatusService:
         now = now or datetime.now(UTC)
         today = now.date()
         account = self._get_or_404(customer_id)
-        _validate_reason(reason)
-        _validate_until(until, today)
 
         if account.status == CustomerStatus.DEACTIVATED.value:
             raise InvalidStatusTransitionError(
-                "Cannot suspend a deactivated account — reactivate it first"
+                "Cannot suspend a deactivated account -- reactivate it first"
             )
-        if account.status == CustomerStatus.SUSPENDED.value:
-            # Idempotent — spec §9's "already in that exact status" row:
-            # no duplicate history row, no duplicate event, no repeat
-            # Cognito call (the account is already disabled).
+
+        if account.status == CustomerStatus.SUSPENDED.value and account.suspended_until == until:
+            # Idempotent -- spec section 9's "already in that exact
+            # status" row: for Suspend this explicitly means the same
+            # `until` too (FR-3), not just the same coarse status. No
+            # duplicate history row, no duplicate event -- but this check
+            # runs BEFORE validation, and AdminDisableUser is still
+            # called on this path (FR-3/FR-4, section 11 Risk 1's
+            # "load-bearing detail"): a repeat call with a blank/invalid
+            # reason, or a by-now-past `until` that still matches the
+            # currently-stored value, must still return 200 unchanged
+            # rather than raising ValidationError, and must still
+            # re-attempt the Cognito call so a retry after a prior
+            # Cognito failure actually re-syncs Cognito instead of the
+            # idempotency check silently swallowing every retry.
+            self._sync_cognito_disable(account.cognito_sub)
             return account
+
+        # A real transition (fresh suspend, or a re-suspend with a
+        # different `until` -- FR-3's "extending or shortening the
+        # suspension" case) only ever reaches here, so validation only
+        # runs on the path that will actually perform one.
+        _validate_reason(reason)
+        _validate_until(until, today)
 
         updated = self._write_status_change(
             account,
@@ -132,17 +149,27 @@ class CustomerStatusService:
         now = now or datetime.now(UTC)
         today = now.date()
         account = self._get_or_404(customer_id)
-        _validate_reason(reason)
 
         if account.status == CustomerStatus.DEACTIVATED.value:
-            # Idempotent — spec §4 FR-4: "returns 200 with the existing
-            # state unchanged (not an error)", which FR-6's bulk action
-            # relies on.
+            # Idempotent -- spec section 4 FR-4: "returns 200 with the
+            # existing state unchanged (not an error)", which FR-6's
+            # bulk action relies on. This check runs BEFORE validation,
+            # so a repeat call with a blank/invalid reason still returns
+            # 200 unchanged instead of raising ValidationError. The
+            # idempotent path still calls AdminDisableUser (section
+            # 6/11 Risk 1's load-bearing detail) -- this is what makes a
+            # retry after a prior Cognito-call failure actually
+            # re-attempt Cognito, rather than this idempotency check
+            # silently swallowing every subsequent retry with no Cognito
+            # call at all.
+            self._sync_cognito_disable(account.cognito_sub)
             return account
 
-        # Deactivating an already-Suspended account is allowed —
+        _validate_reason(reason)
+
+        # Deactivating an already-Suspended account is allowed --
         # Deactivated supersedes Suspended; suspended_until is cleared
-        # (spec §9).
+        # (spec section 9).
         updated = self._write_status_change(
             account,
             new_status=CustomerStatus.DEACTIVATED.value,
@@ -164,17 +191,23 @@ class CustomerStatusService:
         actor_admin_id: str,
         now: datetime | None = None,
     ) -> CustomerAccount:
-        """Does not touch any of the customer's subscriptions (D2) — this
+        """Does not touch any of the customer's subscriptions (D2) -- this
         method only ever changes `users.status` and Cognito state (spec
-        §9's own edge case)."""
+        section 9's own edge case)."""
         now = now or datetime.now(UTC)
         today = now.date()
         account = self._get_or_404(customer_id)
 
         if account.status == CustomerStatus.ACTIVE.value:
-            # Same idempotency posture as suspend/deactivate above —
-            # spec §9 generalizes "already in that exact status" to every
-            # transition, not just FR-4's explicitly-worded case.
+            # Same idempotency posture as suspend/deactivate above --
+            # spec section 9 generalizes "already in that exact status"
+            # to every transition, not just FR-4's explicitly-worded
+            # case, including still re-attempting the Cognito call
+            # (AdminEnableUser) on this path for the same retry-safety
+            # reason as FR-3/FR-4. `reason` is optional for reactivate
+            # to begin with, so there's no validation to reorder here --
+            # only the missing Cognito call on this path needed fixing.
+            self._sync_cognito_enable(account.cognito_sub)
             return account
 
         updated = self._write_status_change(
@@ -182,10 +215,10 @@ class CustomerStatusService:
             new_status=CustomerStatus.ACTIVE.value,
             reason=reason,
             status_effective_from=today,
-            # Spec §7: effective_from is null in the HISTORY row for a
-            # reactivation, even though the `users` column itself is
-            # still stamped with today (see update_customer_status's own
-            # docstring for why these two are separate parameters).
+            # Spec section 7: effective_from is null in the HISTORY row
+            # for a reactivation, even though the `users` column itself
+            # is still stamped with today (see update_customer_status's
+            # own docstring for why these two are separate parameters).
             history_effective_from=None,
             suspended_until=None,
             actor_admin_id=actor_admin_id,

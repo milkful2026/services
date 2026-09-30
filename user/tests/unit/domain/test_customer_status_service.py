@@ -194,7 +194,41 @@ def test_suspend_already_suspended_is_idempotent_noop():
 
     assert result.status == CustomerStatus.SUSPENDED.value
     assert repo.update_calls == []  # no duplicate history row/event
-    assert cognito.disable_calls == []  # already disabled, no repeat call
+    # Still re-attempts Cognito on the idempotent path (spec section 11
+    # Risk 1's "load-bearing detail") -- this is what makes a retry
+    # after a prior Cognito failure actually re-sync Cognito.
+    assert cognito.disable_calls == [account.cognito_sub]
+
+
+def test_suspend_already_suspended_with_blank_reason_is_still_idempotent_200():
+    # Regression test: the idempotency check must run BEFORE validation.
+    # A repeat call with a blank reason and an `until` that, relative to
+    # `now`, is no longer in the future -- but matches the currently
+    # stored suspended_until exactly -- must still return 200 unchanged,
+    # not raise ValidationError.
+    account = _account(status=CustomerStatus.SUSPENDED.value, suspended_until=_YESTERDAY)
+    service, repo, cognito = _service([account])
+
+    result = service.suspend("cust-1", "", _YESTERDAY, "admin-1", now=_NOW)
+
+    assert result.status == CustomerStatus.SUSPENDED.value
+    assert repo.update_calls == []
+    assert cognito.disable_calls == [account.cognito_sub]
+
+
+def test_suspend_already_suspended_with_different_until_updates_and_writes_history():
+    # FR-3: re-suspending with a DIFFERENT `until` is not a full no-op --
+    # suspended_until is updated and a new history row is written.
+    account = _account(status=CustomerStatus.SUSPENDED.value, suspended_until=_TOMORROW)
+    service, repo, cognito = _service([account])
+    new_until = _TOMORROW + timedelta(days=10)
+
+    result = service.suspend("cust-1", "extended", new_until, "admin-1", now=_NOW)
+
+    assert result.status == CustomerStatus.SUSPENDED.value
+    assert len(repo.update_calls) == 1
+    assert repo.update_calls[0]["suspended_until"] == new_until
+    assert cognito.disable_calls == [account.cognito_sub]
 
 
 def test_suspend_unknown_customer_raises_404():
@@ -214,7 +248,7 @@ def test_suspend_cognito_failure_after_commit_raises_502_but_db_already_updated(
     with pytest.raises(CognitoSyncFailedError):
         service.suspend("cust-1", "reason", _TOMORROW, "admin-1", now=_NOW)
 
-    # DB transaction already committed (spec section 6/11) — retry-safe.
+    # DB transaction already committed (spec section 6/11) -- retry-safe.
     assert len(repo.update_calls) == 1
     assert repo.accounts["cust-1"].status == CustomerStatus.SUSPENDED.value
 
@@ -240,9 +274,27 @@ def test_deactivate_already_deactivated_is_idempotent_200_not_an_error():
     result = service.deactivate("cust-1", "new reason", "admin-1", now=_NOW)
 
     assert result.status == CustomerStatus.DEACTIVATED.value
-    assert result.status_reason == "old reason"  # unchanged — no-op
+    assert result.status_reason == "old reason"  # unchanged -- no-op
     assert repo.update_calls == []
-    assert cognito.disable_calls == []
+    # Still re-attempts Cognito on the idempotent path (FR-4, spec
+    # section 11 Risk 1's "load-bearing detail").
+    assert cognito.disable_calls == [account.cognito_sub]
+
+
+def test_deactivate_already_deactivated_with_blank_reason_is_still_idempotent_200():
+    # Regression test: the idempotency check must run BEFORE
+    # _validate_reason -- a repeat call with a blank reason against an
+    # already-deactivated account must still return 200 unchanged, not
+    # raise ValidationError.
+    account = _account(status=CustomerStatus.DEACTIVATED.value, status_reason="old reason")
+    service, repo, cognito = _service([account])
+
+    result = service.deactivate("cust-1", "", "admin-1", now=_NOW)
+
+    assert result.status == CustomerStatus.DEACTIVATED.value
+    assert result.status_reason == "old reason"
+    assert repo.update_calls == []
+    assert cognito.disable_calls == [account.cognito_sub]
 
 
 def test_deactivate_from_suspended_clears_suspended_until():
@@ -296,7 +348,9 @@ def test_reactivate_already_active_is_noop():
 
     assert result.status == CustomerStatus.ACTIVE.value
     assert repo.update_calls == []
-    assert cognito.enable_calls == []
+    # Still re-attempts Cognito on the idempotent path, same posture as
+    # suspend/deactivate above.
+    assert cognito.enable_calls == [account.cognito_sub]
 
 
 def test_reactivate_does_not_touch_subscriptions():
