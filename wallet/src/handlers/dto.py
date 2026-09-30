@@ -18,6 +18,12 @@ class DebitRequest(BaseModel):
     correlationId: str | None = None  # noqa: N815
 
 
+class VoidRequest(BaseModel):
+    """MA-142 FR-2 — the order's owner, whose wallet row the void locks."""
+
+    userId: str = Field(min_length=1, max_length=64)  # noqa: N815
+
+
 def _iso(value) -> str | None:
     return value.isoformat() if value is not None else None
 

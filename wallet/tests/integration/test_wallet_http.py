@@ -190,8 +190,78 @@ def test_internal_debit_lookup_invalid_id_is_400(client, bad):
     assert r.json()["data"]["errorCode"] == "VALIDATION_ERROR"
 
 
-def test_internal_debit_lookup_is_only_an_internal_route():
+def test_internal_debit_routes_are_only_internal():
     # openapi() flattens included routers (app.routes nests them).
-    lookups = [p for p in app.openapi()["paths"] if "/debits/" in p]
-    assert lookups == ["/wallet/internal/debits/{orderId}"]
+    routes = sorted(p for p in app.openapi()["paths"] if "/debits/" in p)
+    assert routes == [
+        "/wallet/internal/debits/{orderId}",
+        "/wallet/internal/debits/{orderId}/void",
+    ]
+
+
+# --- MA-142: POST /wallet/internal/debits/{orderId}/void ---
+
+
+def test_void_after_debit_is_409_already_debited_with_the_debit(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    client.post(
+        "/wallet/internal/debit",
+        json={"userId": "user-1", "orderId": "ord_x", "amountPaise": 30000},
+    )
+    r = client.post("/wallet/internal/debits/ord_x/void", json={"userId": "user-1"})
+    assert r.status_code == 409
+    body = r.json()["data"]
+    # The shared error envelope flattens `details` into `data`.
+    assert body["errorCode"] == "ALREADY_DEBITED"
+    assert body["status"] == "DEBITED"
+    assert body["amountPaise"] == 30000
+    assert body["balanceAfterPaise"] == 70000
+    assert body["debitedAt"]
+
+
+def test_void_then_debit_is_409_debit_voided(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    r = client.post("/wallet/internal/debits/ord_x/void", json={"userId": "user-1"})
+    assert r.status_code == 200
+    voided = r.json()["data"]
+    assert voided["orderId"] == "ord_x"
+    assert voided["status"] == "VOIDED"
+    assert voided["voidedAt"]
+
+    r = client.post(
+        "/wallet/internal/debit",
+        json={"userId": "user-1", "orderId": "ord_x", "amountPaise": 30000},
+    )
+    assert r.status_code == 409
+    body = r.json()["data"]
+    assert body["errorCode"] == "DEBIT_VOIDED"
+    assert body["orderId"] == "ord_x"
+    assert body["voidedAt"] == voided["voidedAt"]
+    balance = client.get("/wallet/internal/balance", params={"userId": "user-1"})
+    assert balance.json()["data"]["balancePaise"] == 100000
+
+
+def test_void_repeated_returns_the_same_200(client, engine):
+    seed_wallet(engine)
+    first = client.post("/wallet/internal/debits/ord_x/void", json={"userId": "user-1"})
+    second = client.post("/wallet/internal/debits/ord_x/void", json={"userId": "user-1"})
+    assert second.status_code == 200
+    assert second.json()["data"] == first.json()["data"]
+
+
+def test_lookup_of_voided_order_is_200_voided(client, engine):
+    seed_wallet(engine)
+    voided = client.post(
+        "/wallet/internal/debits/ord_x/void", json={"userId": "user-1"}
+    ).json()["data"]
+    r = client.get("/wallet/internal/debits/ord_x")
+    assert r.status_code == 200
+    assert r.json()["data"] == voided
+
+
+@pytest.mark.parametrize("bad", ["bad%20id", "a" * 65, "ord.x"])
+def test_void_invalid_id_is_400(client, bad):
+    r = client.post(f"/wallet/internal/debits/{bad}/void", json={"userId": "user-1"})
+    assert r.status_code == 400
+    assert r.json()["data"]["errorCode"] == "VALIDATION_ERROR"
 

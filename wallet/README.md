@@ -18,7 +18,8 @@ Service scaffold and carries both.
 | GET | `/wallet/me/transactions` | Cognito JWT | Paged (keyset), newest-first ledger — the contract MA-27 renders |
 | POST | `/wallet/me/retry` | Cognito JWT | MA-1 replay of auto-provision |
 | GET | `/wallet/internal/limits` | SigV4 (VPC-only) | Recharge min/max for Payment Service (MA-126) |
-| GET | `/wallet/internal/debits/{orderId}` | SigV4 (VPC-only) | Read-only: was this order debited? 200 with amount/balance, or 404 `DEBIT_NOT_FOUND`. Order Service's sweep asks before cancelling an abandoned checkout (MA-142) |
+| POST | `/wallet/internal/debits/{orderId}/void` | SigV4 (VPC-only) | Body `{userId}`. Fences the order under the wallet row lock: 200 `VOIDED` (no debit for it can ever commit; the debit then returns 409 `DEBIT_VOIDED`), or 409 `ALREADY_DEBITED` with the debit if it landed first. Idempotent; never moves money. Order Service calls it before closing an order without charge (MA-142) |
+| GET | `/wallet/internal/debits/{orderId}` | SigV4 (VPC-only) | Read-only diagnostics: 200 `DEBITED` (amount/balance) or `VOIDED`, else 404 `DEBIT_NOT_FOUND`. A 404 only means "not yet" — never grounds to close an order (MA-142) |
 
 ## Events
 
@@ -33,9 +34,11 @@ Service scaffold and carries both.
 `wallets(id, user_id UNIQUE, balance_paise BIGINT, currency, status, …)`,
 `ledger_entries(id, wallet_id, type, amount_paise (signed),
 balance_after_paise, ref TEXT UNIQUE, correlation_id, created_at)`,
+`debit_voids(ref PK, user_id, voided_at)` (MA-142, `0002_debit_voids.sql`),
 `outbox(…)`. Money is integer paise everywhere. The `ref` UNIQUE +
 `SELECT … FOR UPDATE` on the wallet row make recharge crediting
-exactly-once.
+exactly-once. The void and the order debit take that same lock, so for
+any order at most one of {ledger debit, void} ever exists.
 
 ## Local development
 

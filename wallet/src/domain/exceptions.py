@@ -62,6 +62,24 @@ class DebitNotFoundError(WalletError):
     http_status = 404
 
 
+class DebitVoidedError(WalletError):
+    """MA-142 FR-3 — `POST /wallet/internal/debit` for an order that Order
+    Service already voided (closed without charge). Nothing is written.
+    Should be rare: it means a late debit raced the close."""
+
+    error_code = "DEBIT_VOIDED"
+    http_status = 409
+
+
+class AlreadyDebitedError(WalletError):
+    """MA-142 FR-2 — a void for an order that was already debited. The
+    debit is returned under `details` so the caller resumes instead of
+    closing. Nothing is written."""
+
+    error_code = "ALREADY_DEBITED"
+    http_status = 409
+
+
 class InvalidOrderIdError(WalletError):
     error_code = "VALIDATION_ERROR"
     http_status = 400

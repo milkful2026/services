@@ -18,7 +18,9 @@ from adapters.wallet_repository import (
 )
 from config.env import Settings
 from domain.exceptions import (
+    AlreadyDebitedError,
     DebitNotFoundError,
+    DebitVoidedError,
     InvalidAmountError,
     InvalidCursorError,
     WalletError,
@@ -27,6 +29,7 @@ from domain.exceptions import (
 from domain.models import (
     DebitOutcome,
     DebitResult,
+    DebitVoid,
     LedgerEntry,
     LedgerType,
     TransactionsPage,
@@ -127,27 +130,44 @@ class WalletService:
         return {"balancePaise": wallet.balance_paise, "status": wallet.status.value}
 
     def get_debit_for_order(self, order_id: str) -> dict:
-        """MA-142 — has `order_id` been debited? Read-only: Order Service's
-        sweep asks this before cancelling an abandoned checkout, so it must
-        never be answered by calling `debit` (which would charge)."""
-        entry = self._repo.get_ledger_entry_by_ref(f"order:{order_id}")
+        """MA-142 FR-5 — diagnostics only: the debit for `order_id`, or its
+        void. Read-only. A 404 means "not debited *yet*"; only the void
+        decides that an order is uncharged, so no caller closes on this."""
+        ref = f"order:{order_id}"
+        entry = self._order_debit_entry(order_id, self._repo.get_ledger_entry_by_ref(ref))
+        if entry is not None:
+            return _debit_body(order_id, entry)
+        void = self._repo.get_void(ref)
+        if void is not None:
+            return _void_body(order_id, void)
+        raise DebitNotFoundError(f"No debit found for order {order_id}")
+
+    def void_debit_for_order(self, user_id: str, order_id: str) -> dict:
+        """MA-142 FR-2 — fence the order: after this returns, no debit for
+        it can ever commit. Raises AlreadyDebitedError (with the debit under
+        `details`) if it was debited first. Idempotent. Never touches money."""
+        outcome = self._repo.void_debit_for_order(user_id, f"order:{order_id}")
+        if isinstance(outcome, DebitVoid):
+            return _void_body(order_id, outcome)
+        entry = self._order_debit_entry(order_id, outcome)
+        if entry is None:
+            # A non-debit entry on an order ref: treated as not debited, but
+            # it can't be fenced either (the ref is taken) — refuse loudly.
+            raise WalletError(f"order {order_id!r} ref is held by a non-debit ledger entry")
+        raise AlreadyDebitedError(
+            f"order {order_id!r} was already debited", _debit_body(order_id, entry)
+        )
+
+    @staticmethod
+    def _order_debit_entry(order_id: str, entry: LedgerEntry | None) -> LedgerEntry | None:
         if entry is not None and entry.type != LedgerType.ORDER_DEBIT:
             # Refs are namespaced, so this should be impossible.
             logger.error(
                 "get_debit_for_order: ref held by a non-debit ledger entry",
                 extra={"orderId": order_id, "type": entry.type.value},
             )
-            entry = None
-        if entry is None:
-            raise DebitNotFoundError(f"No debit found for order {order_id}")
-        return {
-            "orderId": order_id,
-            "status": DebitResult.DEBITED.value,
-            "amountPaise": abs(entry.amount_paise),
-            "balanceAfterPaise": entry.balance_after_paise,
-            "debitedAt": entry.created_at.isoformat(),
-            "walletId": entry.wallet_id,
-        }
+            return None
+        return entry
 
     def list_transactions(
         self, user_id: str, limit: int | None, cursor: str | None
@@ -264,14 +284,27 @@ class WalletService:
                 "balanceAfterPaise": balance_after_paise,
             }
 
-        outcome = self._repo.debit_for_order(
-            user_id=user_id,
-            order_id=order_id,
-            amount_paise=amount_paise,
-            ref=ref,
-            correlation_id=correlation_id,
-            outbox_payload_builder=_build_debited_outbox,
-        )
+        try:
+            outcome = self._repo.debit_for_order(
+                user_id=user_id,
+                order_id=order_id,
+                amount_paise=amount_paise,
+                ref=ref,
+                correlation_id=correlation_id,
+                outbox_payload_builder=_build_debited_outbox,
+            )
+        except DebitVoidedError:
+            # MA-142 §5: alarm if > 0 over 1 h — a debit raced a close.
+            logger.warning(
+                "wallet.debit_refused_voided",
+                extra={
+                    "metric": "wallet.debit_refused_voided",
+                    "orderId": order_id,
+                    "outcome": DebitVoidedError.error_code,
+                    "correlationId": correlation_id,
+                },
+            )
+            raise
 
         # Skip on replay: the ledger/balance write already happened (and
         # was already evaluated for low-balance) on the original call —
@@ -351,6 +384,21 @@ class WalletService:
                 },
             )
         return offending_ids
+
+
+def _debit_body(order_id: str, entry: LedgerEntry) -> dict:
+    return {
+        "orderId": order_id,
+        "status": DebitResult.DEBITED.value,
+        "amountPaise": abs(entry.amount_paise),
+        "balanceAfterPaise": entry.balance_after_paise,
+        "debitedAt": entry.created_at.isoformat(),
+        "walletId": entry.wallet_id,
+    }
+
+
+def _void_body(order_id: str, void: DebitVoid) -> dict:
+    return {"orderId": order_id, "status": "VOIDED", "voidedAt": void.voided_at.isoformat()}
 
 
 def render_description(entry: LedgerEntry) -> str:

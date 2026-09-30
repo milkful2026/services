@@ -5,18 +5,21 @@ exposed via the public API Gateway):
 - POST /wallet/internal/debit, GET /wallet/internal/balance — Order
   Service (MA-132/MA-25) debits a subscription order and reads a
   balance from here.
-- GET /wallet/internal/debits/{orderId} — Order Service's sweep (MA-142)
-  asks whether an order was charged before cancelling it."""
+- POST /wallet/internal/debits/{orderId}/void — Order Service (MA-142)
+  fences an order before closing it without charge: afterwards no debit
+  for it can commit, or, if it was already debited, the debit comes back.
+- GET /wallet/internal/debits/{orderId} — read-only debit/void lookup
+  (MA-142), for diagnostics; never the basis for closing an order."""
 
 import logging
 import re
 
 from fastapi import APIRouter, Depends, Request
 
-from domain.exceptions import InvalidOrderIdError
+from domain.exceptions import InvalidOrderIdError, WalletError
 from domain.wallet_service import WalletService
 from handlers.dependencies import get_wallet_service
-from handlers.dto import DebitRequest, serialize_debit_outcome, success_envelope
+from handlers.dto import DebitRequest, VoidRequest, serialize_debit_outcome, success_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,11 @@ def get_internal_limits(
     service: WalletService = Depends(get_wallet_service),
 ):
     return success_envelope(service.get_internal_limits())
+
+
+def _validate_order_id(order_id: str) -> None:
+    if not _ORDER_ID.match(order_id):
+        raise InvalidOrderIdError("orderId must be 1-64 characters of [A-Za-z0-9_-]")
 
 
 @router.post("/wallet/internal/debit")
@@ -56,25 +64,43 @@ def get_internal_balance(
     return success_envelope(service.get_internal_balance(userId))
 
 
+@router.post("/wallet/internal/debits/{orderId}/void")
+def void_debit_for_order(
+    orderId: str,
+    body: VoidRequest,
+    request: Request,
+    service: WalletService = Depends(get_wallet_service),
+):
+    _validate_order_id(orderId)
+    correlation_id = request.headers.get("X-Correlation-Id", "")
+    try:
+        voided = service.void_debit_for_order(body.userId, orderId)
+    except WalletError as exc:
+        _log_debit_call("debit_void", orderId, exc.error_code, correlation_id)
+        raise
+    _log_debit_call("debit_void", orderId, "VOIDED", correlation_id)
+    return success_envelope(voided)
+
+
 @router.get("/wallet/internal/debits/{orderId}")
 def get_debit_for_order(
     orderId: str,
     request: Request,
     service: WalletService = Depends(get_wallet_service),
 ):
-    if not _ORDER_ID.match(orderId):
-        raise InvalidOrderIdError("orderId must be 1-64 characters of [A-Za-z0-9_-]")
+    _validate_order_id(orderId)
     correlation_id = request.headers.get("X-Correlation-Id", "")
     try:
         debit = service.get_debit_for_order(orderId)
-    except Exception:
-        logger.info(
-            "debit_lookup",
-            extra={"orderId": orderId, "found": False, "correlationId": correlation_id},
-        )
+    except WalletError as exc:
+        _log_debit_call("debit_lookup", orderId, exc.error_code, correlation_id)
         raise
-    logger.info(
-        "debit_lookup",
-        extra={"orderId": orderId, "found": True, "correlationId": correlation_id},
-    )
+    _log_debit_call("debit_lookup", orderId, debit["status"], correlation_id)
     return success_envelope(debit)
+
+
+def _log_debit_call(event: str, order_id: str, outcome: str, correlation_id: str) -> None:
+    logger.info(
+        event,
+        extra={"orderId": order_id, "outcome": outcome, "correlationId": correlation_id},
+    )

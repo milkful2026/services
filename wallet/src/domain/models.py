@@ -45,6 +45,15 @@ class LedgerEntry:
 
 
 @dataclass
+class DebitVoid:
+    """MA-142 — `debit_voids` row: no debit for `ref` can ever commit."""
+
+    ref: str
+    user_id: str
+    voided_at: datetime
+
+
+@dataclass
 class TransactionsPage:
     items: list[LedgerEntry]
     next_cursor: str | None
