@@ -47,6 +47,7 @@ from adapters.interfaces import (
 )
 from adapters.order_repository import decode_cursor, new_order_id
 from domain.exceptions import (
+    DebitVoidedError,
     InvalidCursorError,
     OrderBusyError,
     OrderNotFoundError,
@@ -154,7 +155,10 @@ class OrderService:
                 status=OrderStatus.CREATED,
             )
         )
-        self._debit_and_finalize(order, correlation_id)
+        try:
+            self._debit_and_finalize(order, correlation_id)
+        except DebitVoidedError:
+            self._debit_refused_voided(order)
 
     def _insert_payment_failed_before_pricing(
         self,
@@ -204,23 +208,35 @@ class OrderService:
         """MA-143 FR-5 — the SQS resume path takes the order's lease first,
         so it never debits alongside the sweep. Lost -> OrderBusyError (the
         consumer leaves the message unacked; the redelivery then finds the
-        order terminal). A terminal transition releases the lease itself."""
-        if claim_owner is None:
-            self._debit_and_finalize(order, correlation_id)
-            return
-        if not self._repo.claim_order(order.id, claim_owner, self._lease_seconds):
+        order terminal). A terminal transition releases the lease itself.
+
+        `DebitVoidedError`: the sweep closed (or is closing) this order past
+        its charge deadline — release, log and ack; the sweep finishes it."""
+        if claim_owner is not None and not self._repo.claim_order(
+            order.id, claim_owner, self._lease_seconds
+        ):
             raise OrderBusyError(
                 "Order is being resumed by another worker", {"orderId": order.id}
             )
         try:
             self._debit_and_finalize(order, correlation_id)
         except WalletUnavailableError:
-            self._repo.release_order(order.id, claim_owner)
+            if claim_owner is not None:
+                self._repo.release_order(order.id, claim_owner)
             raise
+        except DebitVoidedError:
+            if claim_owner is not None:
+                self._repo.release_order(order.id, claim_owner)
+            self._debit_refused_voided(order)
+
+    @staticmethod
+    def _debit_refused_voided(order: Order) -> None:
+        logger.warning("order.debit_refused_voided", extra={"orderId": order.id})
 
     def resume_debit(self, order: Order, correlation_id: str | None) -> None:
         """MA-143 — the sweep's entry point: the same debit step the SQS
-        crash-resume path runs. The caller already holds the lease."""
+        crash-resume path runs. The caller already holds the lease and
+        handles WalletUnavailableError / DebitVoidedError itself."""
         self._debit_and_finalize(order, correlation_id)
 
     def _debit_and_finalize(self, order: Order, correlation_id: str | None) -> None:

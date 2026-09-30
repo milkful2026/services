@@ -89,22 +89,33 @@ or safely closes records left half-done by a crash or an outage:
 - **Subscription orders stuck `CREATED`** (older than
   `ORDER_SUBSCRIPTION_ORDER_STALE_SECONDS`, e.g. the SQS message went to
   the DLQ): charged once through the same debit step `materialize`'s
-  crash-resume uses (Wallet dedupes on the order id), or — once the
-  delivery can no longer be scheduled (20:00 IST the day before) —
-  moved to `NEEDS_ATTENTION(CUTOFF_PASSED)` **without charging**.
+  crash-resume uses (Wallet dedupes on the order id) while before the
+  **charge deadline** (`ORDER_SUBSCRIPTION_CHARGE_DEADLINE_HOUR_IST`, 23:00
+  IST the day before delivery — not the 20:00 cut-off, which has already
+  passed when the Daily Run creates every subscription order). Past it the
+  order is **closed without charge**: Wallet voids it first
+  (`POST /wallet/internal/debits/{orderId}/void`, MA-142) → `NEEDS_ATTENTION(CUTOFF_PASSED)`,
+  `charge_state = NOT_CHARGED`; if a lost debit already landed, the void
+  says so and the order is confirmed instead (`charged_after_cutoff`
+  alarm). An unreachable Wallet never closes an order.
 - **Lease:** a record is worked only by the holder of
   `claimed_until`/`claim_owner` (DB clock). The SQS resume path takes the
   same lease; if the sweep holds it, the message is left unacked
   (`ORDER_BUSY`) and the redelivery finds the order terminal.
 - **Budget:** each failed sweep attempt increments `sweep_attempts`; at
   `ORDER_SWEEP_MAX_ATTEMPTS` the order becomes
-  `NEEDS_ATTENTION(SWEEP_EXHAUSTED)` and is never retried.
+  `NEEDS_ATTENTION(SWEEP_EXHAUSTED)` with `charge_state = UNKNOWN` and is
+  never retried for a charge.
+- **Settle pass:** each run voids `NEEDS_ATTENTION` orders whose charge is
+  `UNKNOWN` → `NOT_CHARGED`, or `CHARGED` + `sweep.settle.escalated_charged`
+  (alarm: paid but not confirmed). `status` never changes here.
 
 | Env var | Default |
 |---------|---------|
 | `ORDER_SWEEP_ENABLED` | `true` |
 | `ORDER_SWEEP_INTERVAL_SECONDS` | `300` |
 | `ORDER_SUBSCRIPTION_ORDER_STALE_SECONDS` | `900` |
+| `ORDER_SUBSCRIPTION_CHARGE_DEADLINE_HOUR_IST` | `23` (must be after the 20:00 cut-off) |
 | `ORDER_CHECKOUT_STALE_SECONDS` | `600` |
 | `ORDER_SWEEP_MAX_ATTEMPTS` | `6` |
 | `ORDER_SWEEP_LEASE_SECONDS` | `120` (minimum 60) |
@@ -113,12 +124,16 @@ or safely closes records left half-done by a crash or an outage:
 - **Abandoned checkouts** (`IN_PROGRESS`, untouched for
   `ORDER_CHECKOUT_STALE_SECONDS`, MA-144): resumed through the same steps
   a customer retry runs. Exceptions:
-  - never charged and past the delivery cut-off → Wallet is asked
-    (`GET /wallet/internal/debits/{orderId}`); no debit → checkout and
-    order `CANCELLED` with no charge and the cart untouched (a debit
-    found → completed as normal). An unreachable Wallet never cancels.
+  - never charged and past the delivery cut-off → Wallet voids the order;
+    voided (or a ₹0 order, no Wallet call) → checkout and order
+    `CANCELLED` with no charge and the cart untouched; already debited →
+    completed as normal. An unreachable Wallet never cancels. A debit
+    refused `DEBIT_VOIDED` (another worker closed it) ends `CANCELLED`.
   - budget spent after payment, subscriptions still failing → completed,
-    the unstarted lines left in the cart (`SUBSCRIPTION_UNAVAILABLE`).
+    the unstarted lines left in the cart (`SUBSCRIPTION_UNAVAILABLE`) and
+    their subscription keys carried (`carried_subscription_keys`), so the
+    next checkout of that line replays a create that did land instead of
+    creating a second subscription.
   - budget spent before we know about the charge, or at the cart clear
     → `NEEDS_ATTENTION` (the one-live-checkout lock is released).
   The customer path takes the same lease: a checkout the sweep holds
@@ -126,7 +141,8 @@ or safely closes records left half-done by a crash or an outage:
   a cancelled or escalated checkout returns `409 CHECKOUT_CANCELLED` /
   `409 CHECKOUT_NEEDS_ATTENTION`.
 
-Metrics (log-based, `"metric"` field): `sweep.subscription_order.{found,resumed,confirmed,payment_failed,escalated,failed_attempt}`,
+Metrics (log-based, `"metric"` field): `sweep.subscription_order.{found,resumed,confirmed,payment_failed,charged_after_cutoff,escalated,failed_attempt}`,
+`sweep.settle.{settled_not_charged,escalated_charged}`,
 `sweep.checkout.{found,resumed,completed,completed_partial,payment_failed,cancelled,charged_after_cutoff,escalated,failed_attempt}`
 (`escalated` carries `reason`), `sweep.run_duration_ms`, `sweep.run_failed`.
 `/healthz` returns 503 if the sweep thread dies.
@@ -140,7 +156,9 @@ delivery_date)`, `UNIQUE(checkout_id)`, `CHECK(amount_paise >= 0)` and
 the `orders_source_shape` CHECK; `order_items(order_id, line_no,
 product_id, quantity)`; `checkouts(…)` with `UNIQUE(user_id,
 idempotency_key)` and a partial unique index allowing one `IN_PROGRESS`
-checkout per user (`migrations/0002_checkout.sql`); plus `outbox(…)`.
+checkout per user (`migrations/0002_checkout.sql`); sweep lease/attempt
+columns, `orders.charge_state` and `carried_subscription_keys`
+(`migrations/0003_sweep.sql`); plus `outbox(…)`.
 
 ## Local development
 
@@ -169,7 +187,9 @@ every other service here); no real AWS/DB/network.
   SigV4-signed User Service call) — MA-25 implementation plan Step 5.
   It must also create the sweep alarms (MA-143 §6), from log metric
   filters on `$.metric`: any `sweep.subscription_order.escalated` or
-  `sweep.checkout.escalated` in 5 min → ops notification;
+  `sweep.checkout.escalated` in 5 min → ops notification; any
+  `sweep.*.charged_after_cutoff` or `sweep.settle.escalated_charged` →
+  ops notification (money taken, delivery at risk);
   `sweep.run_failed` ≥ 3 in 15 min → ops notification.
 - `services/local-dev` wiring (`docker-compose.yml` entry, database
   bootstrap, queue/rule bootstrap) — same step.

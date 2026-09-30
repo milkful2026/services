@@ -6,8 +6,9 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from adapters.order_repository import orders_table
+from config.env import Settings
 from domain.cutoff import IST
-from domain.models import Order, OrderStatus
+from domain.models import ChargeState, DebitLookup, Order, OrderStatus
 from domain.sweep_service import SweepService
 
 OWNER = "sweep:test"
@@ -31,13 +32,14 @@ def metrics():
 
 
 @pytest.fixture
-def sweep(repo, service, metrics):
+def sweep(repo, service, metrics, wallet_client):
     return SweepService(
         repo,
         service,
         metrics,
         owner=OWNER,
-        cutoff_hour_ist=20,
+        wallet_client=wallet_client,
+        charge_deadline_hour_ist=23,
         subscription_order_stale_seconds=900,
         max_attempts=MAX_ATTEMPTS,
         lease_seconds=120,
@@ -131,31 +133,173 @@ class TestResume:
         assert repo.get("ord_stuck").status == OrderStatus.NEEDS_ATTENTION
 
 
-class TestCutoff:
-    DELIVERY = date(2026, 2, 1)
+class TestChargeDeadline:
+    """D-5 (amended): subscription orders may be charged until 23:00 IST the
+    day before delivery; past it they are closed only through the void."""
 
-    def test_one_second_before_cutoff_is_charged(self, sweep, repo, engine, wallet_client):
+    DELIVERY = date(2026, 2, 1)
+    DEADLINE = datetime(2026, 1, 31, 23, 0, 0, tzinfo=IST)
+
+    def test_order_created_by_the_daily_run_at_the_cutoff_is_charged(
+        self, sweep, repo, engine, wallet_client
+    ):
+        # Regression for the PR #30 finding: the Daily Run creates every
+        # subscription order at 20:00, when the checkout cut-off has passed.
         _stuck_order(repo, engine, delivery_date=self.DELIVERY)
-        now = datetime(2026, 1, 31, 19, 59, 59, tzinfo=IST)
-        sweep.sweep_subscription_orders("corr", now)
+        now = datetime(2026, 1, 31, 20, 15, 0, tzinfo=IST)  # stale after 15 min
+        counts = sweep.sweep_subscription_orders("corr", now)
+        assert wallet_client.void_calls == []
+        assert len(wallet_client.calls) == 1
+        assert repo.get("ord_stuck").status == OrderStatus.CONFIRMED
+        assert counts["confirmed"] == 1
+
+    def test_one_second_before_deadline_is_charged(self, sweep, repo, engine, wallet_client):
+        _stuck_order(repo, engine, delivery_date=self.DELIVERY)
+        sweep.sweep_subscription_orders("corr", self.DEADLINE - timedelta(seconds=1))
         assert len(wallet_client.calls) == 1
         assert repo.get("ord_stuck").status == OrderStatus.CONFIRMED
 
-    def test_at_cutoff_escalates_without_any_wallet_call(
+    def test_at_deadline_voids_then_closes_without_any_debit(
         self, sweep, repo, engine, wallet_client, metrics
     ):
         _stuck_order(repo, engine, delivery_date=self.DELIVERY)
-        now = datetime(2026, 1, 31, 20, 0, 0, tzinfo=IST)
-        counts = sweep.sweep_subscription_orders("corr", now)
+        counts = sweep.sweep_subscription_orders("corr", self.DEADLINE)
         order = repo.get("ord_stuck")
         assert order.status == OrderStatus.NEEDS_ATTENTION
         assert order.failure_reason == "CUTOFF_PASSED"
+        assert order.charge_state == ChargeState.NOT_CHARGED
+        assert order.claim_owner is None
+        assert wallet_client.void_calls == ["ord_stuck"]
         assert wallet_client.calls == []
         assert repo.fetch_unpublished() == []
         assert counts["escalated"] == 1
         assert ("sweep.subscription_order.escalated", {"reason": "CUTOFF_PASSED"}) in (
             metrics.emitted
         )
+
+    def test_past_deadline_already_debited_is_confirmed_not_closed(
+        self, sweep, repo, engine, wallet_client, metrics
+    ):
+        # Crash after the debit, before mark_confirmed, found after the deadline.
+        _stuck_order(repo, engine, delivery_date=self.DELIVERY)
+        wallet_client.debited["ord_stuck"] = DebitLookup(5500, 94500, datetime.now(UTC))
+        counts = sweep.sweep_subscription_orders("corr", self.DEADLINE)
+        order = repo.get("ord_stuck")
+        assert order.status == OrderStatus.CONFIRMED
+        assert order.charge_state is None
+        assert len(wallet_client.calls) == 1  # the replay, not a second charge
+        assert len(_events(repo, "OrderConfirmed")) == 1
+        assert counts["confirmed"] == 1
+        assert ("sweep.subscription_order.charged_after_cutoff", {}) in metrics.emitted
+
+    def test_past_deadline_void_unavailable_never_closes(
+        self, sweep, repo, engine, wallet_client
+    ):
+        _stuck_order(repo, engine, delivery_date=self.DELIVERY)
+        wallet_client.raise_void_unavailable = True
+        counts = sweep.sweep_subscription_orders("corr", self.DEADLINE)
+        order = repo.get("ord_stuck")
+        assert order.status == OrderStatus.CREATED
+        assert order.sweep_attempts == 1
+        assert order.claim_owner is None
+        assert wallet_client.calls == []
+        assert counts["failed_attempt"] == 1
+
+    def test_crash_after_void_is_closed_by_the_next_run(self, sweep, repo, engine, wallet_client):
+        _stuck_order(repo, engine, delivery_date=self.DELIVERY)
+        wallet_client.voided["ord_stuck"] = datetime.now(UTC)  # voided, status never written
+        sweep.sweep_subscription_orders("corr", self.DEADLINE)
+        assert repo.get("ord_stuck").charge_state == ChargeState.NOT_CHARGED
+
+    def test_debit_refused_voided_is_skipped_without_writing(
+        self, sweep, repo, engine, wallet_client
+    ):
+        # Before the deadline, but another worker already voided it.
+        _stuck_order(repo, engine, delivery_date=self.DELIVERY)
+        wallet_client.voided["ord_stuck"] = datetime.now(UTC)
+        counts = sweep.sweep_subscription_orders("corr", self.DEADLINE - timedelta(hours=1))
+        order = repo.get("ord_stuck")
+        assert order.status == OrderStatus.CREATED
+        assert order.sweep_attempts == 0
+        assert order.claim_owner is None
+        assert repo.fetch_unpublished() == []
+        assert counts["skipped"] == 1
+
+    def test_exhaustion_leaves_the_charge_unknown(self, sweep, repo, engine, wallet_client):
+        _stuck_order(repo, engine, delivery_date=self.DELIVERY, sweep_attempts=MAX_ATTEMPTS - 1)
+        wallet_client.raise_void_unavailable = True
+        sweep.sweep_subscription_orders("corr", self.DEADLINE)
+        order = repo.get("ord_stuck")
+        assert order.status == OrderStatus.NEEDS_ATTENTION
+        assert order.failure_reason == "SWEEP_EXHAUSTED"
+        assert order.charge_state == ChargeState.UNKNOWN
+
+
+class TestSettlePass:
+    def _escalated_unknown(self, repo, engine):
+        _stuck_order(repo, engine, status="NEEDS_ATTENTION", failure_reason="SWEEP_EXHAUSTED",
+                     charge_state="UNKNOWN")
+
+    def test_voided_settles_not_charged(self, sweep, repo, engine, wallet_client, metrics):
+        self._escalated_unknown(repo, engine)
+        counts = sweep.settle_unknown_charges("corr", _now())
+        order = repo.get("ord_stuck")
+        assert order.status == OrderStatus.NEEDS_ATTENTION
+        assert order.charge_state == ChargeState.NOT_CHARGED
+        assert order.claim_owner is None
+        assert counts["settled_not_charged"] == 1
+        assert ("sweep.settle.settled_not_charged", {}) in metrics.emitted
+        assert wallet_client.calls == []  # never charges
+
+    def test_debited_settles_charged_and_alarms(
+        self, sweep, repo, engine, wallet_client, metrics, caplog
+    ):
+        self._escalated_unknown(repo, engine)
+        wallet_client.debited["ord_stuck"] = DebitLookup(5500, 94500, datetime.now(UTC))
+        with caplog.at_level("ERROR"):
+            counts = sweep.settle_unknown_charges("corr", _now())
+        order = repo.get("ord_stuck")
+        assert order.status == OrderStatus.NEEDS_ATTENTION  # status never changes here
+        assert order.charge_state == ChargeState.CHARGED
+        assert counts["escalated_charged"] == 1
+        assert ("sweep.settle.escalated_charged", {}) in metrics.emitted
+        [record] = [r for r in caplog.records if "was charged" in r.getMessage()]
+        assert (record.orderId, record.userId, record.amountPaise) == (
+            "ord_stuck", "user-1", 5500
+        )
+        assert record.debitedAt
+
+    def test_unavailable_is_retried_next_run_without_a_budget(
+        self, sweep, repo, engine, wallet_client
+    ):
+        self._escalated_unknown(repo, engine)
+        wallet_client.raise_void_unavailable = True
+        for _ in range(MAX_ATTEMPTS + 1):
+            assert sweep.settle_unknown_charges("corr", _now())["unavailable"] == 1
+        order = repo.get("ord_stuck")
+        assert order.charge_state == ChargeState.UNKNOWN
+        assert order.claim_owner is None
+        assert order.sweep_attempts == 0
+        wallet_client.raise_void_unavailable = False
+        sweep.settle_unknown_charges("corr", _now())
+        assert repo.get("ord_stuck").charge_state == ChargeState.NOT_CHARGED
+
+    def test_settled_orders_are_not_selected_again(self, sweep, repo, engine, wallet_client):
+        self._escalated_unknown(repo, engine)
+        sweep.settle_unknown_charges("corr", _now())
+        assert sweep.settle_unknown_charges("corr", _now()) == {}
+        assert wallet_client.void_calls == ["ord_stuck"]
+
+
+class TestDeadlineConfig:
+    def test_default_deadline_is_23(self, settings):
+        assert settings.subscription_charge_deadline_hour_ist == 23
+
+    @pytest.mark.parametrize("hour", ["20", "19", "24"])
+    def test_startup_rejects_a_deadline_not_after_the_cutoff(self, monkeypatch, hour):
+        monkeypatch.setenv("ORDER_SUBSCRIPTION_CHARGE_DEADLINE_HOUR_IST", hour)
+        with pytest.raises(ValueError):
+            Settings()
 
 
 class TestSelectionAndClaims:

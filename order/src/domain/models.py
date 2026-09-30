@@ -11,8 +11,8 @@ class OrderStatus(StrEnum):
     CONFIRMED = "CONFIRMED"
     PAYMENT_FAILED = "PAYMENT_FAILED"
     FAILED = "FAILED"
-    # MA-143: the sweep gave up (retry budget spent, or past the delivery
-    # cut-off before it could be charged). Terminal; operators act on it.
+    # MA-143: the sweep gave up (retry budget spent, or past the charge
+    # deadline before it could be charged). Terminal; operators act on it.
     NEEDS_ATTENTION = "NEEDS_ATTENTION"
     # MA-144 PD-1: a checkout's order that was never charged and can no
     # longer be delivered. No event: it was never confirmed.
@@ -22,6 +22,16 @@ class OrderStatus(StrEnum):
 # MA-143 failure reasons set by the sweep (orders.failure_reason).
 FAILURE_CUTOFF_PASSED = "CUTOFF_PASSED"
 FAILURE_SWEEP_EXHAUSTED = "SWEEP_EXHAUSTED"
+
+
+class ChargeState(StrEnum):
+    """MA-143 `orders.charge_state` — set only when the sweep closes an
+    order; NULL on every other order. NOT_CHARGED only after a Wallet void
+    (MA-142); UNKNOWN until the settle pass (FR-4b) resolves it."""
+
+    NOT_CHARGED = "NOT_CHARGED"
+    CHARGED = "CHARGED"
+    UNKNOWN = "UNKNOWN"
 
 
 class OrderSource(StrEnum):
@@ -61,6 +71,7 @@ class Order:
     claimed_until: datetime | None = None
     claim_owner: str | None = None
     last_sweep_error: str | None = None
+    charge_state: ChargeState | None = None
 
     def item_list(self) -> list[OrderItem]:
         """Every order as a list of lines — a SUBSCRIPTION order's single
@@ -104,9 +115,16 @@ class DebitResult:
 
 @dataclass(frozen=True)
 class DebitLookup:
-    """MA-142 — Wallet's `GET /wallet/internal/debits/{orderId}`: proof
-    that an order was charged. `None` from the client means "not debited"."""
+    """MA-142 — proof that an order was charged: Wallet's lookup, or its
+    `409 ALREADY_DEBITED` answer to a void."""
 
     amount_paise: int
     balance_after_paise: int
     debited_at: datetime
+
+
+@dataclass(frozen=True)
+class Voided:
+    """MA-142 — Wallet voided the order: no debit for it can ever commit."""
+
+    voided_at: datetime

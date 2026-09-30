@@ -7,7 +7,7 @@ services/local-dev/order/.env.local into os.environ at the process
 entrypoint (see src/main.py).
 """
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     sweep_enabled: bool = True
     sweep_interval_seconds: float = 300
     subscription_order_stale_seconds: float = 900
+    # MA-143 D-5 (amended 2026-09-29): a subscription order is created by the
+    # Daily Run at the 20:00 cut-off, so it can't also be its deadline. It
+    # may still be charged until this hour IST on the day before delivery —
+    # the latest a charged order still makes the dispatch list.
+    subscription_charge_deadline_hour_ist: int = 23
     checkout_stale_seconds: float = 600  # MA-144
     sweep_max_attempts: int = 6
     # Must outlast one dependency call (≈12 s with retries); the holder
@@ -57,6 +62,15 @@ class Settings(BaseSettings):
         if value < 60:
             raise ValueError("ORDER_SWEEP_LEASE_SECONDS must be at least 60")
         return value
+
+    @model_validator(mode="after")
+    def _deadline_after_cutoff(self) -> "Settings":
+        if not self.checkout_cutoff_hour_ist < self.subscription_charge_deadline_hour_ist <= 23:
+            raise ValueError(
+                "ORDER_SUBSCRIPTION_CHARGE_DEADLINE_HOUR_IST must be later than the "
+                f"{self.checkout_cutoff_hour_ist}:00 cut-off and at most 23"
+            )
+        return self
 
 
 def get_settings() -> Settings:

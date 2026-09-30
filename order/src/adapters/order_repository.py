@@ -1,5 +1,5 @@
 """SQLAlchemy Core repository for `orders` / `order_items` / `checkouts` /
-`outbox`.
+`carried_subscription_keys` / `outbox`.
 
 SQLAlchemy Core only (mirrors wallet/subscription/catalog/inventory) —
 the same Table definitions run against Postgres (production) and an
@@ -34,6 +34,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -49,6 +50,7 @@ from domain.exceptions import CheckoutInProgressError, LeaseLostError, ServiceUn
 from domain.models import (
     FAILURE_CUTOFF_PASSED,
     FAILURE_SWEEP_EXHAUSTED,
+    ChargeState,
     Order,
     OrderItem,
     OrderSource,
@@ -91,6 +93,7 @@ orders_table = Table(
     Column("claimed_until", DateTime(timezone=True), nullable=True),
     Column("claim_owner", String(64), nullable=True),
     Column("last_sweep_error", Text, nullable=True),
+    Column("charge_state", String(16), nullable=True),
     UniqueConstraint(
         "subscription_id", "delivery_date", name="uq_orders_subscription_delivery_date"
     ),
@@ -143,6 +146,18 @@ checkouts_table = Table(
         sqlite_where=text("status = 'IN_PROGRESS'"),
         postgresql_where=text("status = 'IN_PROGRESS'"),
     ),
+)
+
+# MA-144 FR-4a (PD-2): a subscription create whose outcome is unknown,
+# carried to the next checkout of the same cart line (0003_sweep.sql).
+carried_subscription_keys_table = Table(
+    "carried_subscription_keys",
+    metadata,
+    Column("user_id", String(64), primary_key=True),
+    Column("cart_line_id", String(64), primary_key=True),
+    Column("idempotency_key", String(128), nullable=False),
+    Column("checkout_id", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
 outbox_table = Table(
@@ -498,7 +513,14 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
         status: CheckoutStatus | None = None,
         subscription_results: list[SubscriptionLineResult] | None = None,
         result: dict | None = None,
+        user_id: str | None = None,
+        carry_keys: dict[str, str] | None = None,
+        forget_line_ids: list[str] | None = None,
     ) -> None:
+        """`carry_keys` ({lineId: idempotency key}) and `forget_line_ids`
+        (MA-144 FR-4a) change `user_id`'s carried subscription keys in the
+        same transaction as the checkout update: carried with the PD-2
+        FAILED results, forgotten with a line's definitive result."""
         values: dict = {"updated_at": func.now()}
         if step is not None:
             values["step"] = step.value
@@ -517,6 +539,42 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                     .where(checkouts_table.c.id == checkout_id)
                     .values(**values)
                 )
+                for line_id, key in (carry_keys or {}).items():
+                    # ON CONFLICT DO NOTHING: a line that fails again keeps
+                    # the key its first attempt used.
+                    conn.execute(
+                        self._insert(carried_subscription_keys_table)
+                        .values(
+                            user_id=user_id,
+                            cart_line_id=line_id,
+                            idempotency_key=key,
+                            checkout_id=checkout_id,
+                        )
+                        .on_conflict_do_nothing(index_elements=["user_id", "cart_line_id"])
+                    )
+                if forget_line_ids:
+                    conn.execute(
+                        carried_subscription_keys_table.delete().where(
+                            carried_subscription_keys_table.c.user_id == user_id,
+                            carried_subscription_keys_table.c.cart_line_id.in_(forget_line_ids),
+                        )
+                    )
+
+    def get_carried_keys(self, user_id: str) -> dict[str, tuple[str, str]]:
+        """MA-144 FR-4a — {cart line id: (idempotency key, checkout id that
+        carried it)} for `user_id`."""
+        with self._db_operation("get_carried_keys", "Failed to load carried keys"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(carried_subscription_keys_table).where(
+                        carried_subscription_keys_table.c.user_id == user_id
+                    )
+                ).fetchall()
+        return {r.cart_line_id: (r.idempotency_key, r.checkout_id) for r in rows}
+
+    def _insert(self, table):
+        dialect = postgresql if self._engine.dialect.name == "postgresql" else sqlite
+        return dialect.insert(table)
 
     # --- MA-143: sweep lease + selection ---
     #
@@ -601,7 +659,9 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
     ) -> bool:
         """One failed sweep attempt: +1 attempt, remember why, release the
         lease, and escalate to NEEDS_ATTENTION(SWEEP_EXHAUSTED) in the same
-        update if that reaches `max_attempts`. Returns whether it escalated."""
+        update if that reaches `max_attempts` — with charge_state UNKNOWN,
+        since no void succeeded (the settle pass resolves it). Returns
+        whether it escalated."""
         exhausted = orders_table.c.sweep_attempts + 1 >= max_attempts
         with self._db_operation("record_order_sweep_failure", "Failed to record attempt"):
             with self._engine.begin() as conn:
@@ -623,6 +683,10 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                             (exhausted, FAILURE_SWEEP_EXHAUSTED),
                             else_=orders_table.c.failure_reason,
                         ),
+                        charge_state=case(
+                            (exhausted, ChargeState.UNKNOWN.value),
+                            else_=orders_table.c.charge_state,
+                        ),
                         **_LEASE_CLEARED,
                     )
                 )
@@ -631,9 +695,10 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                 ).scalar_one()
         return status == OrderStatus.NEEDS_ATTENTION.value
 
-    def escalate_order(self, order_id: str, owner: str, reason: str) -> bool:
-        """CREATED -> NEEDS_ATTENTION(reason) without charging; releases the lease."""
-        with self._db_operation("escalate_order", "Failed to escalate order"):
+    def close_order(self, order_id: str, owner: str, reason: str) -> bool:
+        """MA-143 FR-4a — CREATED -> NEEDS_ATTENTION(reason), NOT_CHARGED;
+        releases the lease. Only after Wallet voided the order."""
+        with self._db_operation("close_order", "Failed to close order"):
             with self._engine.begin() as conn:
                 result = conn.execute(
                     orders_table.update()
@@ -645,8 +710,52 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                     .values(
                         status=OrderStatus.NEEDS_ATTENTION.value,
                         failure_reason=reason,
+                        charge_state=ChargeState.NOT_CHARGED.value,
                         **_LEASE_CLEARED,
                     )
+                )
+        return result.rowcount == 1
+
+    # --- MA-143 FR-4b: charge settle pass ---
+
+    def list_unknown_charge_orders(self, limit: int) -> list[str]:
+        with self._db_operation("list_unknown_charge_orders", "Failed to list orders"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(orders_table.c.id)
+                    .where(
+                        orders_table.c.status == OrderStatus.NEEDS_ATTENTION.value,
+                        orders_table.c.charge_state == ChargeState.UNKNOWN.value,
+                        self._lease_free(orders_table),
+                    )
+                    .order_by(orders_table.c.created_at)
+                    .limit(limit)
+                ).fetchall()
+        return [r.id for r in rows]
+
+    def claim_unknown_charge_order(self, order_id: str, owner: str, lease_seconds: float) -> bool:
+        return self._claim(
+            orders_table,
+            order_id,
+            owner,
+            lease_seconds,
+            orders_table.c.status == OrderStatus.NEEDS_ATTENTION.value,
+            orders_table.c.charge_state == ChargeState.UNKNOWN.value,
+        )
+
+    def settle_charge_state(self, order_id: str, owner: str, charge_state: ChargeState) -> bool:
+        """UNKNOWN -> what Wallet said; releases the lease. `status` never
+        changes here."""
+        with self._db_operation("settle_charge_state", "Failed to settle charge"):
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    orders_table.update()
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.claim_owner == owner,
+                        orders_table.c.charge_state == ChargeState.UNKNOWN.value,
+                    )
+                    .values(charge_state=charge_state.value, **_LEASE_CLEARED)
                 )
         return result.rowcount == 1
 
@@ -726,8 +835,9 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
     def cancel_checkout_and_order(
         self, checkout_id: str, order_id: str, owner: str, result: dict
     ) -> None:
-        """PD-1, one transaction: the never-charged order -> CANCELLED and the
-        checkout -> CANCELLED (lease and one-live lock released). Either both
+        """PD-1, one transaction: the never-charged order (voided in Wallet,
+        or ₹0) -> CANCELLED, NOT_CHARGED, and the checkout -> CANCELLED
+        (lease and one-live lock released). Either both
         change or neither: a guard that matches nothing raises LeaseLostError
         and rolls back."""
         with self._db_operation("cancel_checkout_and_order", "Failed to cancel checkout"):
@@ -739,7 +849,9 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                         orders_table.c.status == OrderStatus.CREATED.value,
                     )
                     .values(
-                        status=OrderStatus.CANCELLED.value, failure_reason=FAILURE_CUTOFF_PASSED
+                        status=OrderStatus.CANCELLED.value,
+                        failure_reason=FAILURE_CUTOFF_PASSED,
+                        charge_state=ChargeState.NOT_CHARGED.value,
                     )
                 ).rowcount
                 checkout_rows = conn.execute(
@@ -766,7 +878,8 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
         self, checkout_id: str, owner: str, error_code: str, order_id: str | None
     ) -> None:
         """Checkout -> NEEDS_ATTENTION (lease and one-live lock released) and,
-        if given and still unpaid, its order -> NEEDS_ATTENTION(SWEEP_EXHAUSTED)."""
+        if given and still unpaid, its order -> NEEDS_ATTENTION(SWEEP_EXHAUSTED)
+        with charge_state UNKNOWN for the settle pass."""
         with self._db_operation("escalate_checkout", "Failed to escalate checkout"):
             with self._engine.begin() as conn:
                 conn.execute(
@@ -793,6 +906,7 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                         .values(
                             status=OrderStatus.NEEDS_ATTENTION.value,
                             failure_reason=FAILURE_SWEEP_EXHAUSTED,
+                            charge_state=ChargeState.UNKNOWN.value,
                         )
                     )
 
@@ -855,6 +969,7 @@ def _row_to_order(row, items: list[OrderItem] | None = None) -> Order:
         claimed_until=row.claimed_until,
         claim_owner=row.claim_owner,
         last_sweep_error=row.last_sweep_error,
+        charge_state=ChargeState(row.charge_state) if row.charge_state else None,
     )
 
 

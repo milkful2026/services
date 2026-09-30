@@ -46,6 +46,7 @@ from domain.exceptions import (
     CheckoutIncompleteError,
     CheckoutInProgressError,
     CheckoutNeedsAttentionError,
+    DebitVoidedError,
     DeliveryAddressUnknownError,
     DependencyUnavailableError,
     InsufficientBalanceError,
@@ -62,7 +63,7 @@ from domain.exceptions import (
     WalletNotActiveError,
     WalletUnavailableError,
 )
-from domain.models import Order, OrderItem, OrderSource, OrderStatus
+from domain.models import Order, OrderItem, OrderSource, OrderStatus, Voided
 
 logger = logging.getLogger(__name__)
 
@@ -222,9 +223,10 @@ class CheckoutService:
             raise
         try:
             self._drive(live, correlation_id, known_balance_paise=None)
-        except (InsufficientBalanceError, WalletNotActiveError):
-            # The abandoned checkout is now PAYMENT_FAILED — terminal, so
-            # it no longer blocks. This request runs its own balance check.
+        except (InsufficientBalanceError, WalletNotActiveError, CheckoutCancelledError):
+            # The abandoned checkout is now PAYMENT_FAILED or CANCELLED —
+            # terminal, so it no longer blocks. This request runs its own
+            # balance check.
             pass
 
     # --- MA-144: lease, PD-1 cancellation, PD-2 partial finish ---
@@ -265,30 +267,40 @@ class CheckoutService:
     def cancel_if_cutoff_passed(
         self, checkout: Checkout, now: datetime | None = None
     ) -> str | None:
-        """MA-144 FR-2 (PD-1). For a checkout whose charge never started and
-        whose delivery date has passed its cut-off, ask Wallet whether a
-        lost-response debit landed anyway:
-        - no debit  -> cancel checkout + order, no charge  -> "cancelled"
-        - debit     -> leave it for the caller to resume   -> "charged"
-        - not eligible                                     -> None
-        Raises WalletUnavailableError if Wallet can't be asked — never
-        cancels on an unknown answer. The caller holds the lease."""
+        """MA-144 FR-2 (PD-1). A checkout whose charge never happened and
+        whose delivery date has passed its cut-off is closed without charge:
+        - ₹0 order (never debited)         -> cancel, no Wallet call -> "cancelled"
+        - Wallet voids it (MA-142)         -> cancel                 -> "cancelled"
+        - Wallet says it was debited       -> caller resumes         -> "charged"
+        - not eligible                                               -> None
+        Only the void proves "uncharged": it also fences a lost-response
+        debit still running inside Wallet. Raises WalletUnavailableError if
+        Wallet can't be asked — never cancels on an unknown answer. The
+        caller holds the lease."""
         if checkout.step != CheckoutStep.STARTED or checkout.order_id is None:
             return None
         order = self._repo.get(checkout.order_id)
-        if order is None or order.status != OrderStatus.CREATED or order.amount_paise <= 0:
+        if order is None or order.status != OrderStatus.CREATED:
             return None
         if not delivery_cutoff_passed(
             checkout.delivery_date, now or datetime.now(UTC), self._cutoff_hour_ist
         ):
             return None
-        self._renew_lease(checkout)
-        if self._wallet.get_debit(order.id) is not None:
-            logger.warning(
-                "checkout.charged_after_cutoff",
-                extra={"checkoutId": checkout.id, "orderId": order.id},
-            )
-            return "charged"
+        if order.amount_paise > 0:
+            self._renew_lease(checkout)
+            if not isinstance(self._wallet.void_debit(order.user_id, order.id), Voided):
+                logger.warning(
+                    "checkout.charged_after_cutoff",
+                    extra={"checkoutId": checkout.id, "orderId": order.id},
+                )
+                return "charged"
+        self._cancel(checkout, order)
+        return "cancelled"
+
+    def _cancel(self, checkout: Checkout, order: Order) -> CheckoutCancelledError:
+        """Order + checkout -> CANCELLED in one transaction, the replayable
+        CHECKOUT_CANCELLED stored. Only for an order that can never be
+        charged (voided, or ₹0)."""
         exc = CheckoutCancelledError(_CANCELLED_MESSAGE, {"checkoutId": checkout.id})
         self._repo.cancel_checkout_and_order(
             checkout.id, order.id, checkout.claim_owner, {"error": _error_body(exc)}
@@ -297,7 +309,35 @@ class CheckoutService:
             "checkout.cancelled_cutoff_passed",
             extra={"checkoutId": checkout.id, "orderId": order.id},
         )
-        return "cancelled"
+        return exc
+
+    def _cancel_voided(self, checkout: Checkout, order_id: str) -> CheckoutCancelledError:
+        """MA-144 FR-3 — Wallet refused our debit: another worker voided the
+        order and cancelled it, or crashed before it could. Finish the
+        cancel (the repeated void returns Voided) and report it."""
+        order = self._repo.get(order_id)
+        if order.status == OrderStatus.CANCELLED:
+            return CheckoutCancelledError(_CANCELLED_MESSAGE, {"checkoutId": checkout.id})
+        self._renew_lease(checkout)
+        try:
+            outcome = self._wallet.void_debit(order.user_id, order.id)
+        except WalletUnavailableError as exc:
+            raise CheckoutIncompleteError(
+                "Couldn't finish placing the order — retry to continue",
+                {"checkoutId": checkout.id},
+            ) from exc
+        if not isinstance(outcome, Voided):
+            # Impossible (MA-142: a debit and a void never both exist) —
+            # never cancel a charged order; leave it for a retry/escalation.
+            logger.error(
+                "checkout.void_contradiction",
+                extra={"checkoutId": checkout.id, "orderId": order.id},
+            )
+            raise CheckoutIncompleteError(
+                "Couldn't finish placing the order — retry to continue",
+                {"checkoutId": checkout.id},
+            )
+        return self._cancel(checkout, order)
 
     def _cancel_or_wallet_unavailable(self, checkout: Checkout, now: datetime | None) -> str | None:
         """PD-1 on the customer path: an unreachable Wallet is a retryable
@@ -318,11 +358,16 @@ class CheckoutService:
     def finish_partial(self, checkout: Checkout, correlation_id: str) -> dict:
         """MA-144 FR-4 (PD-2): the checkout is paid but its subscriptions kept
         failing for the whole retry budget. Record every unstarted line as
-        FAILED (so it stays in the cart for the customer), clear the rest and
-        complete. Raises CheckoutIncompleteError if the cart clear fails."""
+        FAILED (so it stays in the cart for the customer), carry its
+        subscription key to the next checkout of that line (FR-4a: its
+        create may have landed), clear the rest and complete. Raises
+        CheckoutIncompleteError if the cart clear fails."""
         done = {r.line_id for r in checkout.subscription_results}
+        carried = self._repo.get_carried_keys(checkout.user_id)
+        carry: dict[str, str] = {}
         for line in checkout.subscription_lines:
             if line.line_id not in done:
+                carry[line.line_id] = _subscription_key(checkout, line, carried)
                 checkout.subscription_results.append(
                     SubscriptionLineResult(
                         line_id=line.line_id,
@@ -335,6 +380,8 @@ class CheckoutService:
             checkout.id,
             step=CheckoutStep.SUBSCRIPTIONS_DONE,
             subscription_results=checkout.subscription_results,
+            user_id=checkout.user_id,
+            carry_keys=carry,
         )
         checkout.step = CheckoutStep.SUBSCRIPTIONS_DONE
         return self._run(checkout, correlation_id, known_balance_paise=None)
@@ -529,6 +576,8 @@ class CheckoutService:
                 "Couldn't finish placing the order — retry to continue",
                 {"checkoutId": checkout.id},
             ) from exc
+        except DebitVoidedError as exc:
+            raise self._cancel_voided(checkout, order.id) from exc
 
         if debit.status == "DEBITED":
             now = datetime.now(UTC)
@@ -614,9 +663,11 @@ class CheckoutService:
 
     def _start_subscriptions(self, checkout: Checkout, correlation_id: str) -> None:
         done = {r.line_id for r in checkout.subscription_results}
-        for line in checkout.subscription_lines:
-            if line.line_id in done:
-                continue
+        pending = [line for line in checkout.subscription_lines if line.line_id not in done]
+        # MA-144 FR-4a: a line an earlier checkout gave up on (PD-2) repeats
+        # that checkout's key, so a create that did land is replayed.
+        carried = self._repo.get_carried_keys(checkout.user_id) if pending else {}
+        for line in pending:
             self._renew_lease(checkout)
             try:
                 created = self._subscriptions.create(
@@ -628,7 +679,7 @@ class CheckoutService:
                     slot_id=line.slot_id,
                     # Derived per line, so a resumed checkout gets the same
                     # subscription back instead of creating a second one.
-                    idempotency_key=f"checkout:{checkout.id}:{line.line_id}",
+                    idempotency_key=_subscription_key(checkout, line, carried),
                     correlation_id=correlation_id,
                 )
                 result = SubscriptionLineResult(
@@ -642,6 +693,8 @@ class CheckoutService:
                     "checkout.subscription_created",
                     extra={"checkoutId": checkout.id, "lineId": line.line_id},
                 )
+                if line.line_id in carried:
+                    self._log_if_replayed_with_changes(checkout, line, carried[line.line_id][1])
             except SubscriptionRejectedError as exc:
                 # FR-6 (Product, 2026-09-25): one line failing doesn't block
                 # the rest; the line stays in the cart.
@@ -668,8 +721,33 @@ class CheckoutService:
                     {"checkoutId": checkout.id},
                 ) from exc
             checkout.subscription_results.append(result)
+            # A definitive result (created or rejected) retires a carried key.
             self._repo.update_checkout(
-                checkout.id, subscription_results=checkout.subscription_results
+                checkout.id,
+                subscription_results=checkout.subscription_results,
+                user_id=checkout.user_id,
+                forget_line_ids=[line.line_id] if line.line_id in carried else None,
+            )
+
+    def _log_if_replayed_with_changes(
+        self, checkout: Checkout, line: CheckoutLine, carried_by: str
+    ) -> None:
+        """FR-4a: the replayed subscription keeps the details it was created
+        with; if the customer edited the line since, say so (they change it
+        from My Subscriptions — preferred over a second subscription)."""
+        earlier = self._repo.get_checkout_by_id(carried_by)
+        before = next(
+            (x for x in (earlier.lines if earlier else []) if x.line_id == line.line_id), None
+        )
+        if before is not None and before != line:
+            logger.info(
+                "checkout.subscription_replayed_with_changes",
+                extra={
+                    "metric": "checkout.subscription_replayed_with_changes",
+                    "checkoutId": checkout.id,
+                    "lineId": line.line_id,
+                    "carriedFrom": carried_by,
+                },
             )
 
     def _clear_cart(self, checkout: Checkout) -> None:
@@ -764,6 +842,16 @@ _NEEDS_ATTENTION_MESSAGE = (
     "We couldn't finish this order automatically. Our team has been alerted, "
     "and you won't be charged twice."
 )
+
+
+def _subscription_key(
+    checkout: Checkout, line: CheckoutLine, carried: dict[str, tuple[str, str]]
+) -> str:
+    """The carried key for this cart line if an earlier checkout left one
+    (FR-4a), else this checkout's own `checkout:{id}:{lineId}`."""
+    if line.line_id in carried:
+        return carried[line.line_id][0]
+    return f"checkout:{checkout.id}:{line.line_id}"
 
 
 def _request_owner() -> str:

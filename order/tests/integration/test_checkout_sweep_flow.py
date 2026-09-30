@@ -36,13 +36,14 @@ def client(service, checkout_service):
 
 
 @pytest.fixture
-def sweep(repo, service, checkout_service):
+def sweep(repo, service, checkout_service, wallet_client):
     return SweepService(
         repo,
         service,
         _Metrics(),
         owner="sweep:test",
-        cutoff_hour_ist=20,
+        wallet_client=wallet_client,
+        charge_deadline_hour_ist=23,
         subscription_order_stale_seconds=900,
         max_attempts=3,
         lease_seconds=120,

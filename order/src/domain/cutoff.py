@@ -1,6 +1,6 @@
-"""The IST delivery cut-off, in one place so checkout (MA-136 FR-8), the
-subscription-order sweep (MA-143 D-5) and checkout recovery (MA-144 PD-1)
-can't drift apart."""
+"""The IST day-before deadlines, in one place so checkout (MA-136 FR-8),
+checkout recovery (MA-144 PD-1) and the subscription-order sweep's charge
+deadline (MA-143 D-5, a later hour than the cut-off) can't drift apart."""
 
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -10,7 +10,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def delivery_cutoff_passed(delivery_date: date, now: datetime, cutoff_hour_ist: int) -> bool:
-    """True once `delivery_date` can no longer be scheduled: at or after
-    `cutoff_hour_ist`:00 IST on the day before it."""
+    """True at or after `cutoff_hour_ist`:00 IST on the day before
+    `delivery_date` — the checkout cut-off, or (with the charge-deadline
+    hour) the last moment a subscription order may still be charged."""
     cutoff = datetime.combine(delivery_date - timedelta(days=1), time(cutoff_hour_ist), IST)
     return now.astimezone(IST) >= cutoff

@@ -245,7 +245,21 @@ class TestSqsResumeLease:
     def test_redelivery_for_escalated_order_is_a_no_op(self, service, repo, wallet_client):
         self._precreate(repo)
         repo.claim_order("ord_precreated", "sweep:x", 120)
-        repo.escalate_order("ord_precreated", "sweep:x", "CUTOFF_PASSED")
+        repo.close_order("ord_precreated", "sweep:x", "CUTOFF_PASSED")
         _materialize(service, claim_owner="sqs:m1")
         assert wallet_client.calls == []
         assert repo.get("ord_precreated").status == OrderStatus.NEEDS_ATTENTION
+
+    def test_debit_refused_voided_releases_and_returns(self, service, repo, wallet_client, caplog):
+        # FR-5: the sweep voided this order past its deadline; ack, never charge.
+        from datetime import UTC, datetime
+
+        self._precreate(repo)
+        wallet_client.voided["ord_precreated"] = datetime.now(UTC)
+        with caplog.at_level("WARNING"):
+            _materialize(service, claim_owner="sqs:m1")
+        order = repo.get("ord_precreated")
+        assert order.status == OrderStatus.CREATED  # the sweep finishes the close
+        assert order.claim_owner is None
+        assert "order.debit_refused_voided" in caplog.text
+        assert repo.fetch_unpublished() == []

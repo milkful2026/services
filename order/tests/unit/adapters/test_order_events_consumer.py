@@ -116,3 +116,28 @@ def test_order_leased_by_the_sweep_is_not_acked(consumer_factory, repo, wallet_c
     c.poll_once()
     assert c._sqs.deleted == []
     assert wallet_client.calls == []
+
+
+def test_debit_refused_voided_is_acked(consumer_factory, repo, wallet_client):
+    # MA-143 FR-5: the sweep closed the order; redelivering would change nothing.
+    from datetime import UTC, datetime
+
+    from domain.models import Order, OrderStatus
+
+    repo.insert_created(
+        Order(
+            id="ord_pre",
+            user_id="user-1",
+            subscription_id="sub-1",
+            product_id="prod-1",
+            quantity=2,
+            amount_paise=5500,
+            delivery_date=date(2026, 2, 1),
+            status=OrderStatus.CREATED,
+        )
+    )
+    wallet_client.voided["ord_pre"] = datetime.now(UTC)
+    c = consumer_factory([_msg("SubscriptionOrderDue", _sod())])
+    c.poll_once()
+    assert c._sqs.deleted == ["rh-1"]
+    assert "ord_pre" not in wallet_client.debited

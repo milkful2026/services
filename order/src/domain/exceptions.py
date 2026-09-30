@@ -208,6 +208,15 @@ class WalletBalanceUnavailableError(OrderError):
     http_status = 503
 
 
+class DebitVoidedError(OrderError):
+    """MA-142 FR-6 — Wallet refused the debit (`409 DEBIT_VOIDED`): another
+    worker voided this order while closing it without charge. Never
+    retried; the order must not be charged."""
+
+    error_code = "DEBIT_VOIDED"
+    http_status = 409
+
+
 class OrderBusyError(OrderError):
     """MA-143 FR-5 — another worker (the sweep) holds this order's lease.
     Raised on the SQS resume path only; the consumer leaves the message

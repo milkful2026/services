@@ -67,9 +67,10 @@ def get_sweep_service() -> SweepService:
         SqlAlchemyOrderRepository(_engine()),
         get_order_service(),
         LoggingMetricsRecorder(),
+        wallet_client=HttpWalletClient(settings.wallet_internal_base_url),
         # Unique per task, so a lease names the process that holds it.
         owner=f"sweep:{socket.gethostname()}:{os.getpid()}",
-        cutoff_hour_ist=settings.checkout_cutoff_hour_ist,
+        charge_deadline_hour_ist=settings.subscription_charge_deadline_hour_ist,
         subscription_order_stale_seconds=settings.subscription_order_stale_seconds,
         max_attempts=settings.sweep_max_attempts,
         lease_seconds=settings.sweep_lease_seconds,

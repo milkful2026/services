@@ -10,12 +10,13 @@ from adapters.order_repository import checkouts_table
 from domain.checkout_models import CheckoutStatus, CheckoutStep
 from domain.cutoff import IST
 from domain.exceptions import (
+    CheckoutCancelledError,
     CheckoutIncompleteError,
     CheckoutInProgressError,
     CheckoutNeedsAttentionError,
     StoredCheckoutFailureError,
 )
-from domain.models import OrderStatus
+from domain.models import ChargeState, OrderStatus
 from domain.sweep_service import SweepService
 
 NOW = datetime(2026, 9, 25, 14, 0, tzinfo=IST)  # checkout placed; delivery 2026-09-26
@@ -38,13 +39,14 @@ def metrics():
 
 
 @pytest.fixture
-def sweep(repo, service, checkout_service, metrics):
+def sweep(repo, service, checkout_service, metrics, wallet_client):
     return SweepService(
         repo,
         service,
         metrics,
         owner="sweep:test",
-        cutoff_hour_ist=20,
+        wallet_client=wallet_client,
+        charge_deadline_hour_ist=23,
         subscription_order_stale_seconds=900,
         max_attempts=MAX_ATTEMPTS,
         lease_seconds=120,
@@ -179,6 +181,8 @@ def test_uncharged_past_cutoff_is_cancelled_without_charging(
     order = repo.get(checkout.order_id)
     assert order.status == OrderStatus.CANCELLED
     assert order.failure_reason == "CUTOFF_PASSED"
+    assert order.charge_state == ChargeState.NOT_CHARGED
+    assert wallet_client.void_calls == [order.id]  # proven uncharged by the void
     assert wallet_client.calls == []  # never charged
     assert cart_client.remove_calls == []  # cart untouched
     assert repo.fetch_unpublished() == []  # no event for a never-confirmed order
@@ -192,7 +196,7 @@ def test_one_second_before_cutoff_is_charged_not_cancelled(
     checkout_id = _abandoned_uncharged(checkout_service, engine, cart_client, wallet_client)
     sweep.sweep_checkouts("corr", BEFORE_CUTOFF)
     assert _only_checkout(repo, checkout_id).status == CheckoutStatus.COMPLETED
-    assert wallet_client.lookup_calls == []  # not eligible, so Wallet isn't even asked
+    assert wallet_client.void_calls == []  # not eligible, so Wallet isn't even asked
     assert len(wallet_client.calls) == 1
 
 
@@ -213,11 +217,11 @@ def test_lost_response_debit_found_is_completed_not_cancelled(
     assert ("sweep.checkout.charged_after_cutoff", {}) in metrics.emitted
 
 
-def test_lookup_unavailable_never_cancels(
+def test_void_unavailable_never_cancels(
     sweep, checkout_service, repo, engine, cart_client, wallet_client
 ):
     checkout_id = _abandoned_uncharged(checkout_service, engine, cart_client, wallet_client)
-    wallet_client.raise_lookup_unavailable = True
+    wallet_client.raise_void_unavailable = True
 
     counts = sweep.sweep_checkouts("corr", AT_CUTOFF)
 
@@ -244,7 +248,9 @@ def test_exhausted_before_charge_escalates_checkout_and_order(
     checkout = _only_checkout(repo, checkout_id)
     assert checkout.status == CheckoutStatus.NEEDS_ATTENTION
     assert checkout.last_sweep_error == "CHARGE_UNKNOWN"
-    assert repo.get(checkout.order_id).status == OrderStatus.NEEDS_ATTENTION
+    order = repo.get(checkout.order_id)
+    assert order.status == OrderStatus.NEEDS_ATTENTION
+    assert order.charge_state == ChargeState.UNKNOWN  # for the settle pass
     assert counts["escalated"] == 1
 
 
@@ -266,6 +272,10 @@ def test_exhausted_after_payment_completes_with_lines_left_in_cart(
     assert [i["id"] for i in cart_client.items] == ["li-2"]
     assert counts["completed_partial"] == 1
     assert ("sweep.checkout.escalated", {"reason": "SUBSCRIPTIONS_ABANDONED"}) in metrics.emitted
+    assert repo.get_carried_keys("user-1") == {
+        "li-2": (f"checkout:{checkout_id}:li-2", checkout_id)
+    }
+    assert "carried" not in str(checkout.result)  # internal only
 
 
 def test_exhausted_at_cart_clear_escalates_and_keeps_the_paid_order(
@@ -418,3 +428,175 @@ def test_incomplete_request_hands_its_lease_back(
         _checkout(checkout_service)
     checkout = _only_checkout(repo, info.value.details["checkoutId"])
     assert checkout.claim_owner is None and checkout.claimed_until is None
+
+
+# --- PD-1 for a ₹0 order ---------------------------------------------------------
+
+
+def _abandoned_free(checkout_service, engine, cart_client, pricing_client, monkeypatch):
+    """A ₹0 one-time order left CREATED at STARTED (the request died
+    before _charge confirmed it)."""
+    cart_client.items = [_one_time()]
+    pricing_client.net_payable = 0.0
+
+    def crash(*args, **kwargs):
+        raise CheckoutIncompleteError("crashed", {"checkoutId": "?"})
+
+    with monkeypatch.context() as m:
+        m.setattr(checkout_service, "_charge", crash)
+        with pytest.raises(CheckoutIncompleteError):
+            _checkout(checkout_service)
+    _age(engine)
+    [row] = engine.connect().execute(checkouts_table.select()).fetchall()
+    return row.id
+
+
+def test_free_order_before_cutoff_is_confirmed_without_wallet(
+    sweep, checkout_service, repo, engine, cart_client, pricing_client, wallet_client,
+    monkeypatch,
+):
+    checkout_id = _abandoned_free(checkout_service, engine, cart_client, pricing_client,
+                                  monkeypatch)
+    sweep.sweep_checkouts("corr", BEFORE_CUTOFF)
+    checkout = _only_checkout(repo, checkout_id)
+    assert checkout.status == CheckoutStatus.COMPLETED
+    assert repo.get(checkout.order_id).status == OrderStatus.CONFIRMED
+    assert wallet_client.calls == [] and wallet_client.void_calls == []
+
+
+def test_free_order_after_cutoff_is_cancelled_without_wallet_or_event(
+    sweep, checkout_service, repo, engine, cart_client, pricing_client, wallet_client,
+    monkeypatch,
+):
+    # Regression for the PR #25 finding: never confirmed for a missed date.
+    checkout_id = _abandoned_free(checkout_service, engine, cart_client, pricing_client,
+                                  monkeypatch)
+    counts = sweep.sweep_checkouts("corr", AT_CUTOFF)
+    checkout = _only_checkout(repo, checkout_id)
+    assert checkout.status == CheckoutStatus.CANCELLED
+    order = repo.get(checkout.order_id)
+    assert (order.status, order.charge_state) == (OrderStatus.CANCELLED, ChargeState.NOT_CHARGED)
+    assert wallet_client.calls == [] and wallet_client.void_calls == []
+    assert [e for e in repo.fetch_unpublished() if e["event_type"] == "OrderConfirmed"] == []
+    assert counts["cancelled"] == 1
+
+
+# --- DEBIT_VOIDED from the charge (FR-3) ---------------------------------------
+
+
+def test_debit_refused_voided_finishes_the_cancel(
+    sweep, checkout_service, repo, engine, cart_client, wallet_client
+):
+    # Another worker voided the order, then crashed before cancelling it.
+    checkout_id = _abandoned_uncharged(checkout_service, engine, cart_client, wallet_client)
+    order_id = _only_checkout(repo, checkout_id).order_id
+    wallet_client.voided[order_id] = datetime.now(UTC)
+
+    counts = sweep.sweep_checkouts("corr", BEFORE_CUTOFF)
+
+    checkout = _only_checkout(repo, checkout_id)
+    assert checkout.status == CheckoutStatus.CANCELLED
+    assert checkout.result["error"]["errorCode"] == "CHECKOUT_CANCELLED"
+    order = repo.get(order_id)
+    assert (order.status, order.charge_state) == (OrderStatus.CANCELLED, ChargeState.NOT_CHARGED)
+    assert order_id not in wallet_client.debited
+    assert repo.fetch_unpublished() == []
+    assert counts["cancelled"] == 1
+
+
+def test_customer_debit_refused_voided_is_409_cancelled(
+    checkout_service, repo, engine, cart_client, wallet_client
+):
+    checkout_id = _abandoned_uncharged(checkout_service, engine, cart_client, wallet_client)
+    order_id = _only_checkout(repo, checkout_id).order_id
+    wallet_client.voided[order_id] = datetime.now(UTC)
+
+    with pytest.raises(CheckoutCancelledError) as info:
+        _checkout(checkout_service, now=BEFORE_CUTOFF)
+    assert info.value.http_status == 409
+    assert _only_checkout(repo, checkout_id).status == CheckoutStatus.CANCELLED
+    with pytest.raises(StoredCheckoutFailureError) as replay:
+        _checkout(checkout_service, now=BEFORE_CUTOFF)
+    assert replay.value.error_code == "CHECKOUT_CANCELLED"
+
+
+def test_same_key_retry_after_cutoff_sees_a_landed_debit_and_completes(
+    checkout_service, repo, engine, cart_client, wallet_client
+):
+    # The first request timed out but its debit committed inside Wallet.
+    checkout_id = _abandoned_uncharged(checkout_service, engine, cart_client, wallet_client)
+    order_id = _only_checkout(repo, checkout_id).order_id
+    from domain.models import DebitLookup
+
+    wallet_client.debited[order_id] = DebitLookup(5500, 94500, datetime.now(UTC))
+    result = _checkout(checkout_service, now=AT_CUTOFF)
+    assert result["status"] == "COMPLETED"
+    assert repo.get(order_id).status == OrderStatus.CONFIRMED
+    assert order_id not in wallet_client.voided
+
+
+# --- carried subscription keys (FR-4a) -----------------------------------------
+
+
+def _pd2(sweep, checkout_service, engine, cart_client, subscription_client):
+    """Checkout A pays, its subscription line fails for the whole budget."""
+    cart_client.items = [_one_time(), _daily()]
+    subscription_client.unavailable_for = {"cow-milk"}
+    checkout_id = _abandon(checkout_service, engine, sweep_attempts=MAX_ATTEMPTS - 1)
+    sweep.sweep_checkouts("corr", BEFORE_CUTOFF)
+    subscription_client.unavailable_for = set()
+    subscription_client.calls.clear()
+    return checkout_id
+
+
+def test_next_checkout_reuses_the_carried_key_and_replays(
+    sweep, checkout_service, repo, engine, cart_client, subscription_client
+):
+    a = _pd2(sweep, checkout_service, engine, cart_client, subscription_client)
+    # A's create had actually landed; only its response was lost.
+    landed = subscription_client.create(
+        user_id="user-1", product_id="cow-milk", quantity=2, schedule_type="DAILY",
+        start_date=_only_checkout(repo, a).lines[1].start_date, slot_id="slot-am",
+        idempotency_key=f"checkout:{a}:li-2", correlation_id="c",
+    )
+    subscription_client.calls.clear()
+
+    result = _checkout(checkout_service, key="key-00000002", version=cart_client.cart_version)
+
+    [call] = subscription_client.calls
+    assert call["idempotency_key"] == f"checkout:{a}:li-2"  # not checkout:{B}:li-2
+    [line] = result["subscriptions"]
+    assert (line["status"], line["subscriptionId"]) == ("CREATED", landed["subscriptionId"])
+    assert cart_client.items == []
+    assert repo.get_carried_keys("user-1") == {}
+
+
+def test_rejected_create_forgets_the_carried_key(
+    sweep, checkout_service, repo, engine, cart_client, subscription_client
+):
+    _pd2(sweep, checkout_service, engine, cart_client, subscription_client)
+    subscription_client.reject = {"cow-milk": "PRODUCT_NOT_ELIGIBLE"}
+    _checkout(checkout_service, key="key-00000002", version=cart_client.cart_version)
+    assert repo.get_carried_keys("user-1") == {}
+
+
+def test_transient_failure_keeps_the_original_key(
+    sweep, checkout_service, repo, engine, cart_client, subscription_client
+):
+    a = _pd2(sweep, checkout_service, engine, cart_client, subscription_client)
+    subscription_client.unavailable_for = {"cow-milk"}
+    with pytest.raises(CheckoutIncompleteError):
+        _checkout(checkout_service, key="key-00000002", version=cart_client.cart_version)
+    assert repo.get_carried_keys("user-1") == {"li-2": (f"checkout:{a}:li-2", a)}
+
+
+def test_edited_line_keeps_the_replayed_subscription_and_logs(
+    sweep, checkout_service, repo, engine, cart_client, subscription_client, caplog
+):
+    _pd2(sweep, checkout_service, engine, cart_client, subscription_client)
+    cart_client.items[0]["quantity"] = 5  # edited since checkout A
+    with caplog.at_level("INFO"):
+        result = _checkout(checkout_service, key="key-00000002",
+                           version=cart_client.cart_version)
+    assert result["subscriptions"][0]["status"] == "CREATED"
+    assert "checkout.subscription_replayed_with_changes" in caplog.text

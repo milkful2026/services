@@ -2,15 +2,22 @@
 a dependency outage left half-done.
 
 Subscription orders stuck CREATED (MA-143 FR-4): charged once through the
-same debit step `materialize`'s crash-resume uses, or — once the delivery
-can no longer be scheduled — escalated to NEEDS_ATTENTION without
-charging.
+same debit step `materialize`'s crash-resume uses while before their
+charge deadline (23:00 IST the day before delivery by default — not the
+20:00 cut-off, which has already passed when the Daily Run creates them);
+past it, closed without charge (FR-4a): Wallet voids the order first, so a
+lost-response debit can never land on a closed order, and one that already
+landed is confirmed instead.
 
 Checkouts abandoned IN_PROGRESS (MA-144): resumed through the same steps
-a customer retry runs; cancelled without charging when nothing was
+a customer retry runs; cancelled through the same void when nothing was
 charged and the delivery date has passed its cut-off (PD-1); completed
-with the unstarted subscription lines left in the cart when the budget
-runs out after payment (PD-2); otherwise escalated.
+with the unstarted subscription lines left in the cart (their keys
+carried) when the budget runs out after payment (PD-2); otherwise
+escalated.
+
+Escalated orders whose charge is unknown are settled against Wallet each
+run (FR-4b), and a charged one is alarmed.
 
 Every record is worked under a lease (see the repository), so the sweep,
 SQS redelivery and several Order tasks never run the same record at once.
@@ -25,19 +32,28 @@ from datetime import datetime
 from domain.checkout_models import CheckoutStatus, CheckoutStep
 from domain.cutoff import delivery_cutoff_passed
 from domain.exceptions import (
+    CheckoutCancelledError,
     CheckoutIncompleteError,
+    DebitVoidedError,
     InsufficientBalanceError,
     LeaseLostError,
     OrderError,
     WalletNotActiveError,
     WalletUnavailableError,
 )
-from domain.models import FAILURE_CUTOFF_PASSED, FAILURE_SWEEP_EXHAUSTED, OrderStatus
+from domain.models import (
+    FAILURE_CUTOFF_PASSED,
+    FAILURE_SWEEP_EXHAUSTED,
+    ChargeState,
+    OrderStatus,
+    Voided,
+)
 
 logger = logging.getLogger(__name__)
 
 _ORDER_FLOW = "sweep.subscription_order"
 _CHECKOUT_FLOW = "sweep.checkout"
+_SETTLE_FLOW = "sweep.settle"
 
 
 class SweepService:
@@ -47,8 +63,9 @@ class SweepService:
         order_service,
         metrics,
         *,
+        wallet_client,
         owner: str,
-        cutoff_hour_ist: int,
+        charge_deadline_hour_ist: int,
         subscription_order_stale_seconds: float,
         max_attempts: int,
         lease_seconds: float,
@@ -59,8 +76,9 @@ class SweepService:
         self._repo = repository
         self._order_service = order_service
         self._metrics = metrics
+        self._wallet = wallet_client
         self._owner = owner
-        self._cutoff_hour_ist = cutoff_hour_ist
+        self._charge_deadline_hour_ist = charge_deadline_hour_ist
         self._order_stale_seconds = subscription_order_stale_seconds
         self._max_attempts = max_attempts
         self._lease_seconds = lease_seconds
@@ -101,25 +119,58 @@ class SweepService:
             return None
         attempt = order.sweep_attempts + 1
 
-        if delivery_cutoff_passed(order.delivery_date, now, self._cutoff_hour_ist):
-            # D-5: too late to deliver — never charge it.
-            self._repo.escalate_order(order.id, self._owner, FAILURE_CUTOFF_PASSED)
-            self._log(order.id, attempt, "escalated", correlation_id, FAILURE_CUTOFF_PASSED)
-            self._metrics.emit(f"{_ORDER_FLOW}.escalated", reason=FAILURE_CUTOFF_PASSED)
-            return "escalated"
-
-        self._metrics.emit(f"{_ORDER_FLOW}.resumed")
         try:
+            if delivery_cutoff_passed(order.delivery_date, now, self._charge_deadline_hour_ist):
+                return self._close_without_charge(order, attempt, correlation_id)
+            self._metrics.emit(f"{_ORDER_FLOW}.resumed")
             # Charges once, or replays a debit the crashed attempt already made.
             self._order_service.resume_debit(order, correlation_id)
         except WalletUnavailableError as exc:
             return self._record_order_failure(order.id, exc.error_code, correlation_id)
+        except DebitVoidedError:
+            # Another worker closed this order (FR-4a); nothing to do here.
+            self._repo.release_order(order.id, self._owner)
+            self._log(order.id, attempt, "skipped_voided", correlation_id)
+            return "skipped"
+        except LeaseLostError:
+            self._log(order.id, attempt, "lease_lost", correlation_id)
+            return "lease_lost"
+        return self._order_outcome(order.id, attempt, correlation_id)
 
-        after = self._repo.get(order.id)
+    def _close_without_charge(self, order, attempt: int, correlation_id: str) -> str:
+        """MA-143 FR-4a — past the charge deadline. Close only once Wallet
+        has voided the order; if a lost debit already landed, confirm it
+        (its debit replays) and alarm. WalletUnavailableError propagates:
+        never close on an unknown answer."""
+        self._renew_order_lease(order.id)
+        outcome = self._wallet.void_debit(order.user_id, order.id)
+        if isinstance(outcome, Voided):
+            self._repo.close_order(order.id, self._owner, FAILURE_CUTOFF_PASSED)
+            self._log(
+                order.id, attempt, "escalated", correlation_id, FAILURE_CUTOFF_PASSED,
+                charge_state=ChargeState.NOT_CHARGED,
+            )
+            self._metrics.emit(f"{_ORDER_FLOW}.escalated", reason=FAILURE_CUTOFF_PASSED)
+            return "escalated"
+        logger.warning(
+            "sweep.subscription_order: charged after the deadline",
+            extra={"orderId": order.id, "correlationId": correlation_id},
+        )
+        self._metrics.emit(f"{_ORDER_FLOW}.charged_after_cutoff")
+        self._renew_order_lease(order.id)
+        self._order_service.resume_debit(order, correlation_id)
+        return self._order_outcome(order.id, attempt, correlation_id)
+
+    def _order_outcome(self, order_id: str, attempt: int, correlation_id: str) -> str:
+        after = self._repo.get(order_id)
         outcome = "confirmed" if after.status == OrderStatus.CONFIRMED else "payment_failed"
-        self._log(order.id, attempt, outcome, correlation_id)
+        self._log(order_id, attempt, outcome, correlation_id)
         self._metrics.emit(f"{_ORDER_FLOW}.{outcome}")
         return outcome
+
+    def _renew_order_lease(self, order_id: str) -> None:
+        if not self._repo.renew_order(order_id, self._owner, self._lease_seconds):
+            raise LeaseLostError("Lease lost mid-sweep", {"orderId": order_id})
 
     def _record_order_failure(self, order_id: str, error_code: str, correlation_id: str) -> str:
         self._metrics.emit(f"{_ORDER_FLOW}.failed_attempt", error=error_code)
@@ -135,11 +186,73 @@ class SweepService:
             )
             return "failed_attempt"
         if escalated:
-            self._log(order_id, None, "escalated", correlation_id, FAILURE_SWEEP_EXHAUSTED)
+            self._log(order_id, None, "escalated", correlation_id, FAILURE_SWEEP_EXHAUSTED,
+                      charge_state=ChargeState.UNKNOWN)
             self._metrics.emit(f"{_ORDER_FLOW}.escalated", reason=FAILURE_SWEEP_EXHAUSTED)
             return "escalated"
         self._log(order_id, None, "failed_attempt", correlation_id, error_code)
         return "failed_attempt"
+
+    # --- FR-4b: charge settle pass ---
+
+    def settle_unknown_charges(self, correlation_id: str, now: datetime) -> Counter:
+        """Escalated orders whose charge is UNKNOWN: void them now that
+        Wallet may be back. Never changes `status` and never charges; it only
+        records what happened, and alarms if the customer was charged."""
+        counts: Counter = Counter()
+        for order_id in self._repo.list_unknown_charge_orders(self._batch_size):
+            counts["found"] += 1
+            try:
+                outcome = self._settle(order_id, correlation_id)
+            except Exception:  # noqa: BLE001 — one record never stops the run
+                logger.exception(
+                    "sweep.settle: unexpected error",
+                    extra={"orderId": order_id, "correlationId": correlation_id},
+                )
+                self._release_quietly(order_id)
+                outcome = "failed"
+            if outcome:
+                counts[outcome] += 1
+        return counts
+
+    def _settle(self, order_id: str, correlation_id: str) -> str | None:
+        if not self._repo.claim_unknown_charge_order(order_id, self._owner, self._lease_seconds):
+            return None
+        order = self._repo.get(order_id)
+        try:
+            outcome = self._wallet.void_debit(order.user_id, order.id)
+        except WalletUnavailableError:
+            # No budget: already escalated and alarmed; retried next run.
+            self._repo.release_order(order_id, self._owner)
+            return "unavailable"
+        if isinstance(outcome, Voided):
+            self._repo.settle_charge_state(order_id, self._owner, ChargeState.NOT_CHARGED)
+            self._metrics.emit(f"{_SETTLE_FLOW}.settled_not_charged")
+            self._log(order_id, None, "settled_not_charged", correlation_id,
+                      charge_state=ChargeState.NOT_CHARGED)
+            return "settled_not_charged"
+        self._repo.settle_charge_state(order_id, self._owner, ChargeState.CHARGED)
+        self._metrics.emit(f"{_SETTLE_FLOW}.escalated_charged")
+        # Alarm: paid for an order that isn't confirmed — ops deliver or refund.
+        logger.error(
+            "sweep.settle: escalated order was charged",
+            extra={
+                "orderId": order.id,
+                "userId": order.user_id,
+                "amountPaise": outcome.amount_paise,
+                "debitedAt": outcome.debited_at.isoformat(),
+                "chargeState": ChargeState.CHARGED.value,
+                "correlationId": correlation_id,
+                "claimOwner": self._owner,
+            },
+        )
+        return "escalated_charged"
+
+    def _release_quietly(self, order_id: str) -> None:
+        try:
+            self._repo.release_order(order_id, self._owner)
+        except OrderError:
+            pass  # the lease expires on its own
 
     # --- MA-144: abandoned checkouts ---
 
@@ -185,6 +298,9 @@ class SweepService:
             self._checkout_service.resume(checkout, correlation_id)
         except (InsufficientBalanceError, WalletNotActiveError):
             return self._checkout_outcome(checkout_id, "payment_failed", correlation_id)
+        except CheckoutCancelledError:
+            # FR-3: our debit was refused DEBIT_VOIDED; the cancel is finished.
+            return self._checkout_outcome(checkout_id, "cancelled", correlation_id)
         except LeaseLostError:
             logger.warning(
                 "sweep.checkout: lease lost mid-run, stopping",
@@ -282,15 +398,17 @@ class SweepService:
         outcome: str,
         correlation_id: str,
         reason: str | None = None,
+        *,
+        charge_state: ChargeState | None = None,
     ) -> None:
-        logger.info(
-            "sweep.subscription_order",
-            extra={
-                "orderId": order_id,
-                "attempt": attempt,
-                "outcome": outcome,
-                "reason": reason,
-                "correlationId": correlation_id,
-                "claimOwner": self._owner,
-            },
-        )
+        extra = {
+            "orderId": order_id,
+            "attempt": attempt,
+            "outcome": outcome,
+            "reason": reason,
+            "correlationId": correlation_id,
+            "claimOwner": self._owner,
+        }
+        if charge_state is not None:
+            extra["chargeState"] = charge_state.value
+        logger.info("sweep.subscription_order", extra=extra)
