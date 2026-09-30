@@ -334,9 +334,19 @@ class SubscriptionService:
           itself calls — `pause_from=today`, `pause_until=None`
           (indefinite — MA-39's D2/§9: an account-level block overrides
           any customer-set end date), `status=PAUSED`.
-        - Is idempotent: pausing an already-PAUSED subscription is a
-          no-op (checked before calling the repository), so redelivering
-          the same `user.status.changed` event never double-writes.
+        - Is idempotent: pausing a subscription that's already PAUSED
+          *indefinitely and already in effect* (`pause_until is None`
+          and `pause_from <= today`) is a no-op (checked before calling
+          the repository), so redelivering the same `user.status.changed`
+          event never double-writes. Two cases deliberately do NOT count
+          as already-satisfied, both per spec §9/FR-1: a PAUSED
+          subscription with a real `pause_until` (a customer's own
+          temporary pause, which this call still overrides to
+          indefinite — an account-level block is a stronger override
+          than the customer's original end date), and a PAUSED
+          subscription whose `pause_from` is still in the future (a
+          not-yet-started pause, which this call re-pins to start today
+          rather than waiting for its originally-scheduled date).
 
         `reason` is accepted for traceability/log correlation (MA-140 §7
         recommends NOT persisting it on the subscription row itself —
@@ -349,15 +359,23 @@ class SubscriptionService:
         sub = self._repo.get_by_id(subscription_id)
         if sub is None:
             raise SubscriptionNotFoundError(f"No subscription {subscription_id!r}")
-        if sub.status == SubscriptionStatus.PAUSED:
+
+        now = now or datetime.now(IST)
+        today = now.astimezone(IST).date()
+
+        already_applied = (
+            sub.status == SubscriptionStatus.PAUSED
+            and sub.pause_until is None
+            and sub.pause_from is not None
+            and sub.pause_from <= today
+        )
+        if already_applied:
             logger.info(
-                "subscription.pause_for_account_status_change: already paused, no-op",
+                "subscription.pause_for_account_status_change: already paused indefinitely, no-op",
                 extra={"subscriptionId": subscription_id, "reason": reason},
             )
             return
 
-        now = now or datetime.now(IST)
-        today = now.astimezone(IST).date()
         self._repo.update_pause(
             sub.id, pause_from=today, pause_until=None, status=SubscriptionStatus.PAUSED
         )
@@ -370,7 +388,9 @@ class SubscriptionService:
             },
         )
 
-    def handle_user_status_changed(self, payload: dict) -> list[str]:
+    def handle_user_status_changed(
+        self, payload: dict, now: datetime | None = None
+    ) -> list[str]:
         """MA-140 FR-1 — orchestrates the consumer's per-event work: given
         a `user.status.changed` event's `payload` (MA-139 §8's contract —
         `userId`, `newStatus`, among others), pauses every ACTIVE-or-not-
@@ -396,7 +416,8 @@ class SubscriptionService:
 
         user_id = payload["userId"]
         reason = f"account_{new_status.lower()}"
-        today = datetime.now(IST).date()
+        now = now or datetime.now(IST)
+        today = now.astimezone(IST).date()
 
         # Spec FR-1 step 1 — ACTIVE, or PAUSED with a still-future
         # pause_from (a not-yet-started pause should also be caught here
@@ -417,7 +438,7 @@ class SubscriptionService:
 
         paused_ids: list[str] = []
         for sub in targets:
-            self.pause_for_account_status_change(sub.id, reason)
+            self.pause_for_account_status_change(sub.id, reason, now=now)
             paused_ids.append(sub.id)
         return paused_ids
 

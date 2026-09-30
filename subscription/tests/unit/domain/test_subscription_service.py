@@ -429,6 +429,125 @@ class TestPauseResumeStop:
             service.pause(sub_id, "some-other-user", from_=None, until=None, now=BEFORE_CUTOFF)
 
 
+class TestPauseForAccountStatusChange:
+    """MA-140 FR-2 — pause_for_account_status_change and FR-1's
+    orchestrator, handle_user_status_changed."""
+
+    def _create(self, service, **overrides):
+        kwargs = dict(
+            user_id="user-1",
+            product_id="prod-1",
+            quantity=1,
+            schedule=_daily_schedule(),
+            start_date=TODAY,
+            slot_id="slot-1",
+            idempotency_key="key-1",
+            correlation_id=None,
+            now=AFTER_CUTOFF,
+        )
+        kwargs.update(overrides)
+        return service.create(**kwargs)["subscriptionId"]
+
+    def test_pauses_an_active_subscription_indefinitely(self, service):
+        sub_id = self._create(service)
+        service.pause_for_account_status_change(sub_id, "account_deactivated", now=BEFORE_CUTOFF)
+
+        result = service.get(sub_id, "user-1", now=BEFORE_CUTOFF)
+        assert result["status"] == "PAUSED"
+        assert result["pauseFrom"] == TODAY.isoformat()
+        assert result["pauseUntil"] is None
+
+    def test_does_not_check_ownership_unlike_public_pause(self, service):
+        # No user_id parameter at all — this is the whole point of FR-2:
+        # an internal, system-initiated call, never exposed via a public
+        # route, so there is no owning customer to check against.
+        sub_id = self._create(service)
+        service.pause_for_account_status_change(sub_id, "account_suspended", now=BEFORE_CUTOFF)
+        result = service.get(sub_id, "user-1", now=BEFORE_CUTOFF)
+        assert result["status"] == "PAUSED"
+
+    def test_overwrites_a_customer_set_pause_until_to_indefinite(self, service):
+        # Spec section 9's edge case: an admin pause overwrites a real
+        # `pause_until` to None — the account block is a stronger,
+        # indefinite override.
+        sub_id = self._create(service)
+        service.pause(
+            sub_id, "user-1", from_=None, until=TODAY + timedelta(days=5), now=BEFORE_CUTOFF
+        )
+        service.pause_for_account_status_change(sub_id, "account_deactivated", now=BEFORE_CUTOFF)
+
+        result = service.get(sub_id, "user-1", now=BEFORE_CUTOFF)
+        assert result["pauseUntil"] is None
+
+    def test_idempotent_on_already_paused_subscription(self, service, repo):
+        sub_id = self._create(service)
+        service.pause(sub_id, "user-1", from_=None, until=None, now=BEFORE_CUTOFF)
+        before = repo.get_by_id(sub_id).updated_at
+
+        service.pause_for_account_status_change(sub_id, "account_deactivated", now=BEFORE_CUTOFF)
+
+        after = repo.get_by_id(sub_id).updated_at
+        assert before == after  # no-op — no repository write happened
+
+    def test_unknown_subscription_raises_not_found(self, service):
+        with pytest.raises(SubscriptionNotFoundError):
+            service.pause_for_account_status_change("sub_missing", "account_deactivated")
+
+    def test_handle_user_status_changed_ignores_active_reactivation(self, service, repo):
+        sub_id = self._create(service)
+        paused = service.handle_user_status_changed(
+            {"userId": "user-1", "newStatus": "Active"}, now=BEFORE_CUTOFF
+        )
+        assert paused == []
+        assert repo.get_by_id(sub_id).status == SubscriptionStatus.ACTIVE
+
+    def test_handle_user_status_changed_pauses_every_active_subscription_for_the_user(
+        self, service, repo
+    ):
+        sub_1 = self._create(service, idempotency_key="key-1")
+        sub_2 = self._create(service, idempotency_key="key-2")
+
+        paused = service.handle_user_status_changed(
+            {"userId": "user-1", "newStatus": "Deactivated"}, now=BEFORE_CUTOFF
+        )
+
+        assert set(paused) == {sub_1, sub_2}
+        assert repo.get_by_id(sub_1).status == SubscriptionStatus.PAUSED
+        assert repo.get_by_id(sub_2).status == SubscriptionStatus.PAUSED
+
+    def test_handle_user_status_changed_includes_not_yet_started_paused_subscription(
+        self, service, repo
+    ):
+        sub_id = self._create(service)
+        service.pause(
+            sub_id, "user-1", from_=TODAY + timedelta(days=5), until=None, now=BEFORE_CUTOFF
+        )
+
+        paused = service.handle_user_status_changed(
+            {"userId": "user-1", "newStatus": "Suspended"}, now=BEFORE_CUTOFF
+        )
+
+        assert paused == [sub_id]
+        updated = repo.get_by_id(sub_id)
+        assert updated.status == SubscriptionStatus.PAUSED
+        assert updated.pause_from == TODAY  # re-pinned to "now", not the future date
+
+    def test_handle_user_status_changed_excludes_stopped_subscription(self, service, repo):
+        sub_id = self._create(service)
+        service.stop(sub_id, "user-1")
+
+        paused = service.handle_user_status_changed(
+            {"userId": "user-1", "newStatus": "Deactivated"}, now=BEFORE_CUTOFF
+        )
+        assert paused == []
+
+    def test_handle_user_status_changed_zero_subscriptions_is_not_an_error(self, service):
+        paused = service.handle_user_status_changed(
+            {"userId": "user-with-no-subscriptions", "newStatus": "Deactivated"}, now=BEFORE_CUTOFF
+        )
+        assert paused == []
+
+
 class TestSkip:
     def _create_daily(self, service):
         return service.create(
