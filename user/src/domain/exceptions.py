@@ -43,3 +43,22 @@ class ExternalServiceUnavailableError(UserServiceError):
 
     error_code = "EXTERNAL_SERVICE_UNAVAILABLE"
     http_status = 503
+
+
+# --- MA-139: Customer Account Status --------------------------------------
+
+
+class CustomerNotFoundError(UserServiceError):
+    """No `users` row for the given admin-supplied customer id (MA-139
+    §4 FR-2) — a clean 404, not a 500."""
+
+    error_code = "CUSTOMER_NOT_FOUND"
+    http_status = 404
+
+
+class InvalidStatusTransitionError(UserServiceError):
+    """Suspend attempted on an already-`Deactivated` account (MA-139 §4
+    FR-3/§9) — must be reactivated first, not silently downgraded."""
+
+    error_code = "INVALID_STATUS_TRANSITION"
+    http_status = 409

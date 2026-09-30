@@ -1,6 +1,8 @@
 """Domain models. Plain dataclasses only — no SQLAlchemy/pydantic types."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from enum import StrEnum
 
 
 @dataclass
@@ -77,3 +79,68 @@ class UserProfile:
     # MA-135 FR-6 — the whole default address as saved from the onboarding
     # Google Maps / Places screen; None when no default address is set.
     default_address: Address | None = None
+
+
+# --- MA-139: Customer Account Status --------------------------------------
+
+
+class CustomerStatus(StrEnum):
+    """Mirrors identity-auth's `domain/admin_models.py::AdminStatus` style
+    (StrEnum, values matching the wire/DB strings exactly) — MA-139 §7."""
+
+    ACTIVE = "Active"
+    SUSPENDED = "Suspended"
+    DEACTIVATED = "Deactivated"
+
+
+@dataclass
+class UserStatusHistoryEntry:
+    """One row of `user_status_history` (MA-139 §7) — the audit trail
+    entry for a single status transition."""
+
+    id: str
+    user_id: str
+    previous_status: str | None
+    new_status: str
+    reason: str | None
+    effective_from: date | None
+    actor_admin_id: str
+    created_at: datetime | None = None
+
+
+@dataclass
+class CustomerAccount:
+    """MA-139 §4 FR-1/FR-2 — an admin-facing customer account summary
+    (list) or detail (with `status_history` populated) row. `id` is this
+    service's own `users.id`, not the Cognito sub."""
+
+    id: str
+    name: str
+    mobile: str
+    email: str | None
+    account_type: str
+    status: str
+    status_reason: str | None
+    # The most recent user_status_history.created_at for this account —
+    # deliberately NOT status_effective_from (only a DATE, loses
+    # time-of-day precision), per spec §4 FR-1. None if the account has
+    # never had a status change.
+    last_status_change_at: datetime | None
+    cognito_sub: str = ""
+    suspended_until: date | None = None
+    status_history: list[UserStatusHistoryEntry] = field(default_factory=list)
+
+
+@dataclass
+class CustomerPage:
+    items: list[CustomerAccount]
+    total: int
+    page: int
+    page_size: int
+
+
+@dataclass
+class BulkStatusResult:
+    customer_id: str
+    success: bool
+    error_code: str | None = None

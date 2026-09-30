@@ -129,6 +129,74 @@ class CognitoAttributeAdapter:
         except ClientError as exc:
             raise self._wrap("admin_update_user_attributes", exc) from exc
 
+    def disable_user(self, cognito_sub: str) -> None:
+        """MA-139 §4 FR-3/FR-4 — `AdminDisableUser` on the consumer pool,
+        keyed by `sub` (same lookup path as sync_profile_attributes). A
+        `cognito_sub` with no matching Cognito user (spec §9's edge case
+        — e.g. manual console deletion) surfaces as a retryable
+        ExternalServiceUnavailableError, never silently swallowed."""
+        user = self._find_user_by_sub(cognito_sub)
+        if user is None:
+            raise ExternalServiceUnavailableError(
+                "No Cognito user found for this account's sub"
+            )
+        username = user["Username"]
+
+        def _on_attempt_failure(exc: Exception, attempt: int) -> None:
+            logger.error(
+                "cognito_attribute_adapter request failed, retrying",
+                extra={
+                    "correlationId": self._correlation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                },
+            )
+
+        try:
+            call_with_retry(
+                lambda: self._client.admin_disable_user(
+                    UserPoolId=self._user_pool_id, Username=username
+                ),
+                max_retries=self._max_retries,
+                backoff_base_seconds=self._backoff_base_seconds,
+                retryable_exceptions=(ClientError,),
+                on_attempt_failure=_on_attempt_failure,
+            )
+        except ClientError as exc:
+            raise self._wrap("admin_disable_user", exc) from exc
+
+    def enable_user(self, cognito_sub: str) -> None:
+        """MA-139 §4 FR-5/FR-7 — `AdminEnableUser` on the consumer pool."""
+        user = self._find_user_by_sub(cognito_sub)
+        if user is None:
+            raise ExternalServiceUnavailableError(
+                "No Cognito user found for this account's sub"
+            )
+        username = user["Username"]
+
+        def _on_attempt_failure(exc: Exception, attempt: int) -> None:
+            logger.error(
+                "cognito_attribute_adapter request failed, retrying",
+                extra={
+                    "correlationId": self._correlation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                },
+            )
+
+        try:
+            call_with_retry(
+                lambda: self._client.admin_enable_user(
+                    UserPoolId=self._user_pool_id, Username=username
+                ),
+                max_retries=self._max_retries,
+                backoff_base_seconds=self._backoff_base_seconds,
+                retryable_exceptions=(ClientError,),
+                on_attempt_failure=_on_attempt_failure,
+            )
+        except ClientError as exc:
+            raise self._wrap("admin_enable_user", exc) from exc
+
     def _find_user_by_sub(self, cognito_sub: str) -> dict | None:
         if not _SUB_PATTERN.match(cognito_sub):
             logger.error(
