@@ -1,6 +1,6 @@
-"""Customer account status domain service (MA-139) — status-transition
-rules (spec §9's table), bulk orchestration, history-row construction,
-and the FR-7 suspension sweep.
+"""Customer account status domain service (MA-139) - status-transition
+rules (spec section 9's table), bulk orchestration, history-row
+construction, and the FR-7 suspension sweep.
 
 Kept in a separate module from registration_service.py (mirrors
 identity-auth's domain/admin_users/user_service.py living alongside its
@@ -115,7 +115,7 @@ class CustomerStatusService:
             # re-attempt the Cognito call so a retry after a prior
             # Cognito failure actually re-syncs Cognito instead of the
             # idempotency check silently swallowing every retry.
-            self._sync_cognito_disable(account.cognito_sub)
+            self._sync_cognito_disable(customer_id, account.cognito_sub)
             return account
 
         # A real transition (fresh suspend, or a re-suspend with a
@@ -134,7 +134,7 @@ class CustomerStatusService:
             suspended_until=until,
             actor_admin_id=actor_admin_id,
         )
-        self._sync_cognito_disable(updated.cognito_sub)
+        self._sync_cognito_disable(customer_id, updated.cognito_sub)
         return updated
 
     # --- FR-4: deactivate ---
@@ -162,7 +162,7 @@ class CustomerStatusService:
             # re-attempt Cognito, rather than this idempotency check
             # silently swallowing every subsequent retry with no Cognito
             # call at all.
-            self._sync_cognito_disable(account.cognito_sub)
+            self._sync_cognito_disable(customer_id, account.cognito_sub)
             return account
 
         _validate_reason(reason)
@@ -179,7 +179,7 @@ class CustomerStatusService:
             suspended_until=None,
             actor_admin_id=actor_admin_id,
         )
-        self._sync_cognito_disable(updated.cognito_sub)
+        self._sync_cognito_disable(customer_id, updated.cognito_sub)
         return updated
 
     # --- FR-5: reactivate ---
@@ -207,7 +207,7 @@ class CustomerStatusService:
             # reason as FR-3/FR-4. `reason` is optional for reactivate
             # to begin with, so there's no validation to reorder here --
             # only the missing Cognito call on this path needed fixing.
-            self._sync_cognito_enable(account.cognito_sub)
+            self._sync_cognito_enable(customer_id, account.cognito_sub)
             return account
 
         updated = self._write_status_change(
@@ -223,7 +223,7 @@ class CustomerStatusService:
             suspended_until=None,
             actor_admin_id=actor_admin_id,
         )
-        self._sync_cognito_enable(updated.cognito_sub)
+        self._sync_cognito_enable(customer_id, updated.cognito_sub)
         return updated
 
     # --- FR-6: bulk ---
@@ -238,10 +238,10 @@ class CustomerStatusService:
         now: datetime | None = None,
     ) -> list[BulkStatusResult]:
         """Applies FR-3/4/5's single-account logic once per id,
-        independently — each call below is its own DB transaction (via
+        independently -- each call below is its own DB transaction (via
         update_customer_status), so one row's failure (a 404, a 409, a
         Cognito timeout) can never roll back another row. Matches AC-6
-        by construction, not by special-casing (spec §4 FR-6)."""
+        by construction, not by special-casing (spec section 4 FR-6)."""
         if action not in _BULK_ACTIONS:
             raise ValidationError(f"action must be one of {sorted(_BULK_ACTIONS)}")
         now = now or datetime.now(UTC)
@@ -274,12 +274,22 @@ class CustomerStatusService:
 
     def run_suspension_sweep(self, now: datetime | None = None) -> int:
         """Scheduled entrypoint (see handlers/suspension_sweep_handler.py)
-        — queries every Suspended account whose suspended_until has
+        -- queries every Suspended account whose suspended_until has
         passed and auto-lifts it. One account's failure (Cognito outage,
         a stray DB error) is logged and skipped, not allowed to abort the
-        rest of the sweep — same "one bad row must not stop the batch"
+        rest of the sweep -- same "one bad row must not stop the batch"
         posture as subscription_service.run_daily and
-        outbox_publisher_handler in this same codebase."""
+        outbox_publisher_handler in this same codebase.
+
+        Also runs a second, independent pass (code-review fix, not
+        itself part of MA-139's spec): re-attempts the Cognito call for
+        every account flagged `cognito_sync_pending` -- see
+        _reconcile_cognito_sync_drift's own docstring. Kept as a second
+        pass over a distinct candidate set, not merged into the loop
+        above, since the two are unrelated (an expired suspension vs. a
+        stuck Cognito call) and the drift set can include Deactivated or
+        even Active accounts the expired-suspension query would never
+        touch."""
         now = now or datetime.now(UTC)
         today = now.date()
         candidates = self._user_repository.list_expired_suspensions(today)
@@ -296,7 +306,7 @@ class CustomerStatusService:
                     suspended_until=None,
                     actor_admin_id=_SWEEP_ACTOR,
                 )
-                self._sync_cognito_enable(updated.cognito_sub)
+                self._sync_cognito_enable(updated.id, updated.cognito_sub)
                 lifted += 1
             except UserServiceError as exc:
                 logger.error(
@@ -315,7 +325,42 @@ class CustomerStatusService:
                 "count": lifted,
             },
         )
+
+        self._reconcile_cognito_sync_drift()
+
         return lifted
+
+    def _reconcile_cognito_sync_drift(self) -> None:
+        """Code-review fix for MA-139's FR-3/FR-4/section 11 Risk 1 gap:
+        the spec's own "compensating-retry contract" relies entirely on
+        an admin (or FR-6 bulk caller) noticing a 502/COGNITO_SYNC_FAILED
+        response and manually retrying the same action -- there was no
+        automated reconciliation at all. This is a deliberately narrow,
+        best-effort mitigation, not full automated reconciliation (that
+        would need a way to read Cognito's actual current enabled/
+        disabled state and compare it against `status`, which is a
+        larger change than this fix pass -- see
+        CognitoAttributePort/cognito_attribute_adapter.py, which has no
+        such read method today): it just gives every account whose last
+        sync attempt is known to have failed (`cognito_sync_pending`,
+        set by _mark_cognito_sync_pending) one more retry per day,
+        piggybacking on the FR-7 sweep's existing schedule rather than
+        adding a new one. A still-failing account stays flagged and is
+        picked up again on the next run; this method itself never raises
+        -- one account's continued failure must not block the rest, same
+        posture as the expired-suspension loop above."""
+        pending = self._user_repository.list_cognito_sync_pending()
+        for account in pending:
+            try:
+                if account.status == CustomerStatus.ACTIVE.value:
+                    self._sync_cognito_enable(account.id, account.cognito_sub)
+                else:
+                    self._sync_cognito_disable(account.id, account.cognito_sub)
+            except CognitoSyncFailedError:
+                # Still drifted -- _sync_cognito_disable/_enable already
+                # logged it and re-set the pending flag; picked up again
+                # on tomorrow's sweep.
+                continue
 
     # --- shared helpers ---
 
@@ -339,8 +384,8 @@ class CustomerStatusService:
         # Same transactional-outbox shape register() already uses
         # (adapters/user_repository.py): the users update, the
         # user_status_history insert, and the outbox_events insert are
-        # one DB transaction (spec §6/§9) — a status change is never
-        # partially applied.
+        # one DB transaction (spec section 6/9) -- a status change is
+        # never partially applied.
         outbox_payload = {
             "userId": account.id,
             "previousStatus": account.status,
@@ -361,30 +406,62 @@ class CustomerStatusService:
             outbox_payload=outbox_payload,
         )
 
-    def _sync_cognito_disable(self, cognito_sub: str) -> None:
+    def _sync_cognito_disable(self, customer_id: str, cognito_sub: str) -> None:
         # Deliberately AFTER the DB transaction already committed (spec
-        # §6/§11 point 1) — see CognitoSyncFailedError's own docstring
-        # for why this ordering, and why a failure here is a distinct
-        # 502 rather than the generic ExternalServiceUnavailableError.
+        # section 6/11 point 1) -- see CognitoSyncFailedError's own
+        # docstring for why this ordering, and why a failure here is a
+        # distinct 502 rather than the generic
+        # ExternalServiceUnavailableError.
         try:
             self._cognito_attributes.disable_user(cognito_sub)
         except ExternalServiceUnavailableError as exc:
             logger.error(
                 "customer_status_service: DB committed but Cognito disable_user failed",
-                extra={"correlationId": self._correlation_id},
+                extra={
+                    "metric": "user.cognito_sync_drift.count",
+                    "correlationId": self._correlation_id,
+                    "customerId": customer_id,
+                    "intendedCognitoState": "disabled",
+                },
             )
+            self._mark_cognito_sync_pending(customer_id, True)
             raise CognitoSyncFailedError(
-                "Status was updated but disabling the account's login failed — retry this action"
+                "Status was updated but disabling the account's login failed -- retry this action"
             ) from exc
+        else:
+            self._mark_cognito_sync_pending(customer_id, False)
 
-    def _sync_cognito_enable(self, cognito_sub: str) -> None:
+    def _sync_cognito_enable(self, customer_id: str, cognito_sub: str) -> None:
         try:
             self._cognito_attributes.enable_user(cognito_sub)
         except ExternalServiceUnavailableError as exc:
             logger.error(
                 "customer_status_service: DB committed but Cognito enable_user failed",
-                extra={"correlationId": self._correlation_id},
+                extra={
+                    "metric": "user.cognito_sync_drift.count",
+                    "correlationId": self._correlation_id,
+                    "customerId": customer_id,
+                    "intendedCognitoState": "enabled",
+                },
             )
+            self._mark_cognito_sync_pending(customer_id, True)
             raise CognitoSyncFailedError(
-                "Status was updated but re-enabling the account's login failed — retry this action"
+                "Status was updated but re-enabling the account's login failed -- retry this action"
             ) from exc
+        else:
+            self._mark_cognito_sync_pending(customer_id, False)
+
+    def _mark_cognito_sync_pending(self, customer_id: str, pending: bool) -> None:
+        """Best-effort -- a failure writing this flag must never mask the
+        real Cognito result (success or CognitoSyncFailedError) that
+        triggered this call; it only means
+        _reconcile_cognito_sync_drift's sweep pass won't pick this
+        account up (or won't stop retrying it) until its next sync
+        attempt successfully updates the flag."""
+        try:
+            self._user_repository.set_cognito_sync_pending(customer_id, pending)
+        except UserServiceError:
+            logger.error(
+                "customer_status_service: failed to update cognito_sync_pending flag",
+                extra={"correlationId": self._correlation_id, "customerId": customer_id},
+            )

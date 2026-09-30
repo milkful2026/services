@@ -235,3 +235,30 @@ def test_list_expired_suspensions_only_returns_past_due(repository):
 
     expired = repository.list_expired_suspensions(datetime.date(2026, 9, 30))
     assert [a.id for a in expired] == [expired_id]
+
+
+def test_new_user_defaults_to_cognito_sync_not_pending(repository):
+    user_id = _register(repository)
+    account = repository.get_customer_by_id(user_id)
+    assert account.cognito_sync_pending is False
+
+
+def test_set_cognito_sync_pending_round_trips(repository):
+    user_id = _register(repository)
+
+    repository.set_cognito_sync_pending(user_id, True)
+    assert repository.get_customer_by_id(user_id).cognito_sync_pending is True
+
+    repository.set_cognito_sync_pending(user_id, False)
+    assert repository.get_customer_by_id(user_id).cognito_sync_pending is False
+
+
+def test_list_cognito_sync_pending_only_returns_flagged_accounts(repository):
+    pending_id = _register(repository, cognito_sub="sub-pending", mobile="+910000000005")
+    clean_id = _register(repository, cognito_sub="sub-clean", mobile="+910000000006")
+    repository.set_cognito_sync_pending(pending_id, True)
+
+    pending = repository.list_cognito_sync_pending()
+
+    assert [a.id for a in pending] == [pending_id]
+    assert clean_id not in [a.id for a in pending]

@@ -19,6 +19,7 @@ class FakeCustomerRepository:
         self.history: dict[str, list] = {}
         self.correlation_id = ""
         self.update_calls: list[dict] = []
+        self.pending_calls: list[tuple] = []
 
     def set_correlation_id(self, correlation_id: str) -> None:
         self.correlation_id = correlation_id
@@ -77,6 +78,15 @@ class FakeCustomerRepository:
             and a.suspended_until is not None
             and a.suspended_until <= as_of
         ]
+
+    def set_cognito_sync_pending(self, customer_id, pending):
+        self.pending_calls.append((customer_id, pending))
+        account = self.accounts.get(customer_id)
+        if account is not None:
+            account.cognito_sync_pending = pending
+
+    def list_cognito_sync_pending(self):
+        return [a for a in self.accounts.values() if a.cognito_sync_pending]
 
 
 class FakeCognitoAttributes:
@@ -251,6 +261,9 @@ def test_suspend_cognito_failure_after_commit_raises_502_but_db_already_updated(
     # DB transaction already committed (spec section 6/11) -- retry-safe.
     assert len(repo.update_calls) == 1
     assert repo.accounts["cust-1"].status == CustomerStatus.SUSPENDED.value
+    # Code-review fix: the drift-tracking flag is set so the FR-7 sweep's
+    # reconciliation pass will retry this account later.
+    assert repo.accounts["cust-1"].cognito_sync_pending is True
 
 
 # --- FR-4: deactivate ---
@@ -480,3 +493,55 @@ def test_suspension_sweep_continues_past_one_accounts_failure():
     # rows were attempted independently.
     assert lifted == 0
     assert len(repo.update_calls) == 2
+
+
+# --- Code-review fix: FR-7 sweep drift-reconciliation pass ---
+
+
+def test_suspension_sweep_retries_a_pending_deactivated_account():
+    account = _account(
+        status=CustomerStatus.DEACTIVATED.value, cognito_sync_pending=True
+    )
+    service, repo, cognito = _service([account])
+
+    service.run_suspension_sweep(now=_NOW)
+
+    assert cognito.disable_calls == [account.cognito_sub]
+    assert repo.accounts["cust-1"].cognito_sync_pending is False
+
+
+def test_suspension_sweep_retries_a_pending_active_account():
+    # A reactivate()'s AdminEnableUser can drift too -- the
+    # reconciliation pass isn't limited to Suspended/Deactivated.
+    account = _account(
+        status=CustomerStatus.ACTIVE.value, cognito_sync_pending=True
+    )
+    service, repo, cognito = _service([account])
+
+    service.run_suspension_sweep(now=_NOW)
+
+    assert cognito.enable_calls == [account.cognito_sub]
+    assert repo.accounts["cust-1"].cognito_sync_pending is False
+
+
+def test_suspension_sweep_leaves_a_still_failing_account_pending():
+    account = _account(
+        status=CustomerStatus.DEACTIVATED.value, cognito_sync_pending=True
+    )
+    repo = FakeCustomerRepository([account])
+    cognito = FakeCognitoAttributes(disable_raises=ExternalServiceUnavailableError("down"))
+    service = CustomerStatusService(repo, cognito)
+
+    service.run_suspension_sweep(now=_NOW)  # must not raise
+
+    assert repo.accounts["cust-1"].cognito_sync_pending is True
+
+
+def test_suspension_sweep_does_not_touch_clean_accounts():
+    account = _account(status=CustomerStatus.ACTIVE.value, cognito_sync_pending=False)
+    service, repo, cognito = _service([account])
+
+    service.run_suspension_sweep(now=_NOW)
+
+    assert cognito.enable_calls == []
+    assert cognito.disable_calls == []

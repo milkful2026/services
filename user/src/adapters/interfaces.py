@@ -122,8 +122,27 @@ class UserRepositoryPort(Protocol):
         ...
 
     def list_expired_suspensions(self, as_of: date) -> list[CustomerAccount]:
-        """Spec §4 FR-7 sweep candidates: `status = 'Suspended' AND
+        """Spec section 4 FR-7 sweep candidates: `status = 'Suspended' AND
         suspended_until <= as_of`."""
+        ...
+
+    def set_cognito_sync_pending(self, customer_id: str, pending: bool) -> None:
+        """Code-review fix (not itself part of MA-139's spec): flips a
+        `cognito_sync_pending` flag on the `users` row, set true when a
+        status change's DB transaction committed but the synchronous
+        AdminDisableUser/AdminEnableUser call then failed
+        (CognitoSyncFailedError), cleared once that account's Cognito
+        state is next successfully synced. Lets the FR-7 sweep find and
+        re-attempt drifted accounts without a human noticing and
+        manually retrying the same admin action."""
+        ...
+
+    def list_cognito_sync_pending(self) -> list[CustomerAccount]:
+        """Every account currently flagged `cognito_sync_pending` --
+        candidates for the FR-7 sweep's drift-reconciliation pass,
+        regardless of current status (a reactivate's AdminEnableUser can
+        drift just as much as a suspend/deactivate's AdminDisableUser
+        can)."""
         ...
 
 

@@ -128,6 +128,12 @@ class CustomerAccount:
     last_status_change_at: datetime | None
     cognito_sub: str = ""
     suspended_until: date | None = None
+    # Code-review fix -- set true when a status change's DB
+    # transaction committed but the synchronous AdminDisableUser/
+    # AdminEnableUser call then failed (CognitoSyncFailedError);
+    # cleared once Cognito is next successfully synced. See
+    # UserRepositoryPort's own docstring (adapters/interfaces.py).
+    cognito_sync_pending: bool = False
     status_history: list[UserStatusHistoryEntry] = field(default_factory=list)
 
 

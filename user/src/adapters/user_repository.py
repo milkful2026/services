@@ -74,6 +74,10 @@ users_table = Table(
     Column("status_reason", String(500), nullable=True),
     Column("status_effective_from", Date, nullable=True),
     Column("suspended_until", Date, nullable=True),
+    # Added by migrations/0005_cognito_sync_pending.sql -- code-review
+    # fix, not itself part of MA-139's spec. See UserRepositoryPort's
+    # own docstring (adapters/interfaces.py) for what this tracks.
+    Column("cognito_sync_pending", Boolean, nullable=False, default=False),
 )
 
 # MA-139 §7 — durable audit trail for every status transition. Never
@@ -638,6 +642,58 @@ class SqlAlchemyUserRepository:
 
         return [_row_to_customer_account(row, last_status_change_at=None) for row in rows]
 
+    def set_cognito_sync_pending(self, customer_id: str, pending: bool) -> None:
+        """Code-review fix -- see UserRepositoryPort's own docstring
+        (adapters/interfaces.py) for what this flag tracks. A plain,
+        single-statement UPDATE (no history row, no outbox event -- this
+        never changes `status` itself, only the Cognito-drift bookkeeping
+        flag), retried the same way every other write in this file is."""
+        def _attempt() -> None:
+            with self._engine.begin() as conn:
+                conn.execute(
+                    users_table.update()
+                    .where(users_table.c.id == customer_id)
+                    .values(cognito_sync_pending=pending)
+                )
+
+        try:
+            call_with_retry(
+                _attempt,
+                max_retries=2,
+                backoff_base_seconds=0.1,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
+        except SQLAlchemyError as exc:
+            logger.error(
+                "user_repository.set_cognito_sync_pending failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise ExternalServiceUnavailableError(
+                "Failed to update cognito_sync_pending flag"
+            ) from exc
+
+    def list_cognito_sync_pending(self) -> list[CustomerAccount]:
+        """Code-review fix -- FR-7 sweep drift-reconciliation candidates
+        (see UserRepositoryPort's own docstring). Expected to be a rare,
+        small result set (a prior Cognito call failure is the exception,
+        not the norm), so no pagination -- same posture as
+        list_expired_suspensions."""
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(users_table).where(users_table.c.cognito_sync_pending.is_(True))
+                ).fetchall()
+        except SQLAlchemyError as exc:
+            logger.error(
+                "user_repository.list_cognito_sync_pending failed",
+                extra={"correlationId": self._correlation_id, "error": str(exc)},
+            )
+            raise ExternalServiceUnavailableError(
+                "Failed to load cognito-sync-pending accounts"
+            ) from exc
+
+        return [_row_to_customer_account(row, last_status_change_at=None) for row in rows]
+
 
 def _row_to_customer_account(row, last_status_change_at) -> CustomerAccount:
     return CustomerAccount(
@@ -651,6 +707,7 @@ def _row_to_customer_account(row, last_status_change_at) -> CustomerAccount:
         last_status_change_at=last_status_change_at,
         cognito_sub=row.cognito_sub,
         suspended_until=row.suspended_until,
+        cognito_sync_pending=bool(row.cognito_sync_pending),
     )
 
 
