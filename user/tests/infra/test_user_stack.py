@@ -112,6 +112,28 @@ def test_admin_customer_routes_have_a_lambda_authorizer_attached(template):
     assert lambda_authorizers[0]["Properties"].get("AuthorizerResultTtlInSeconds", 0) == 0
 
 
+def test_admin_authorizer_fn_arn_default_is_still_a_placeholder(template):
+    # Code-review finding #7: this stack's admin_authorizer_fn_arn
+    # default (user_stack.py docstring point 8) is a known, disclosed
+    # placeholder -- infra/app.py does not yet override it, so a real
+    # `cdk deploy` today would wire the admin customer routes to this
+    # obviously-fake ARN and fail loudly at deploy time
+    # (InvalidParameterValue), rather than silently leaving the admin
+    # API unauthenticated. This test intentionally fails if the default
+    # ever changes without a human also updating infra/app.py to pass
+    # the real cross-stack ARN -- whichever change lands first should
+    # update this test too, which is the point: it forces that decision
+    # to be deliberate, not an accidental default-value change.
+    authorizers = template.find_resources("AWS::ApiGatewayV2::Authorizer")
+    lambda_authorizers = [
+        props for props in authorizers.values() if props["Properties"]["AuthorizerType"] == "REQUEST"
+    ]
+    assert len(lambda_authorizers) == 1
+    assert "PLACEHOLDER-admin-authorizer" in json.dumps(
+        lambda_authorizers[0]["Properties"]["AuthorizerUri"]
+    )
+
+
 def test_internal_address_state_route_uses_iam_not_jwt(template):
     # MA-96: this route must never end up on the same JWT authorizer as
     # the public routes above (or, worse, no authorizer at all) — see
