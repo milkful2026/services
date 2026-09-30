@@ -100,6 +100,7 @@ class UserRepositoryPort(Protocol):
         new_status: str,
         status_reason: str | None,
         status_effective_from: date | None,
+        history_effective_from: date | None,
         suspended_until: date | None,
         actor_admin_id: str,
         outbox_event_type: str,
@@ -109,8 +110,15 @@ class UserRepositoryPort(Protocol):
         status_reason/status_effective_from/suspended_until, INSERT
         user_status_history, INSERT outbox_events — mirrors register()'s
         own "one transaction, insert row + insert outbox_events row"
-        shape. Returns the updated account (status_history left empty).
-        Raises CustomerNotFoundError if no such row exists."""
+        shape. `status_effective_from` (the `users` column — "when did
+        the current status take effect") and `history_effective_from`
+        (the `user_status_history` row's own `effective_from`) are
+        deliberately separate parameters: spec §7 requires the history
+        row's `effective_from` to be null specifically for a reactivation
+        (`new_status = Active`), even though the `users` column itself is
+        still updated to record that the Active status took effect now.
+        Returns the updated account (status_history left empty). Raises
+        CustomerNotFoundError if no such row exists."""
         ...
 
     def list_expired_suspensions(self, as_of: date) -> list[CustomerAccount]:

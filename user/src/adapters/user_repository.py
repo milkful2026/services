@@ -542,6 +542,7 @@ class SqlAlchemyUserRepository:
         new_status: str,
         status_reason: str | None,
         status_effective_from: date | None,
+        history_effective_from: date | None,
         suspended_until: date | None,
         actor_admin_id: str,
         outbox_event_type: str,
@@ -575,7 +576,7 @@ class SqlAlchemyUserRepository:
                         previous_status=existing.status,
                         new_status=new_status,
                         reason=status_reason,
-                        effective_from=status_effective_from,
+                        effective_from=history_effective_from,
                         actor_admin_id=actor_admin_id,
                     )
                 )
