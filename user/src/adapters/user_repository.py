@@ -566,9 +566,19 @@ class SqlAlchemyUserRepository:
         outbox_event_type: str,
         outbox_payload: dict,
     ) -> CustomerAccount:
-        """One transaction (spec §6/§9): UPDATE users + INSERT
-        user_status_history + INSERT outbox_events — same shape as
-        register()'s own transactional-outbox write."""
+        """One transaction (spec section 6/9): UPDATE users + INSERT
+        user_status_history + INSERT outbox_events -- same shape as
+        register()'s own transactional-outbox write.
+
+        Code-review fix (finding #8a): builds its return value from the
+        row it already fetched/wrote instead of a second
+        get_customer_by_id round trip afterward. `history_created_at`
+        is captured client-side and passed explicitly into the history
+        insert (instead of relying on that column's
+        server_default=func.now()), so the returned
+        last_status_change_at is exactly the value that lands in the
+        DB, not a re-derived approximation."""
+        history_created_at = datetime.now(UTC)
         try:
             with self._engine.begin() as conn:
                 existing = conn.execute(
@@ -596,6 +606,7 @@ class SqlAlchemyUserRepository:
                         reason=status_reason,
                         effective_from=history_effective_from,
                         actor_admin_id=actor_admin_id,
+                        created_at=history_created_at,
                     )
                 )
                 conn.execute(
@@ -616,10 +627,19 @@ class SqlAlchemyUserRepository:
             )
             raise ExternalServiceUnavailableError("Failed to update customer status") from exc
 
-        updated = self.get_customer_by_id(customer_id)
-        if updated is None:  # pragma: no cover — can't happen, just committed the row
-            raise CustomerNotFoundError(f"No customer {customer_id!r}")
-        return updated
+        return CustomerAccount(
+            id=existing.id,
+            name=existing.name,
+            mobile=existing.mobile,
+            email=existing.email,
+            account_type=existing.account_type,
+            status=new_status,
+            status_reason=status_reason,
+            last_status_change_at=history_created_at,
+            cognito_sub=existing.cognito_sub,
+            suspended_until=suspended_until,
+            cognito_sync_pending=bool(existing.cognito_sync_pending),
+        )
 
     def list_expired_suspensions(self, as_of: date) -> list[CustomerAccount]:
         """Spec §4 FR-7 sweep candidates. `last_status_change_at` is left
