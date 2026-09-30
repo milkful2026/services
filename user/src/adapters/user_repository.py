@@ -422,37 +422,42 @@ class SqlAlchemyUserRepository:
     def list_customers(
         self, status: str | None, search: str | None, page: int, page_size: int
     ) -> CustomerPage:
-        """Spec §4 FR-1. `lastStatusChangeAt` is computed via an outer
-        join to a per-user MAX(created_at) subquery over
-        user_status_history — NULL for an account that's never had a
+        """Spec section 4 FR-1. `lastStatusChangeAt` is computed via an
+        outer join to a per-user MAX(created_at) subquery over
+        user_status_history -- NULL for an account that's never had a
         status change, exactly as the spec requires (never falls back to
-        status_effective_from, which is a DATE, not a timestamptz)."""
-        try:
-            with self._engine.connect() as conn:
-                last_change_subq = (
-                    select(
-                        user_status_history_table.c.user_id,
-                        func.max(user_status_history_table.c.created_at).label(
-                            "last_status_change_at"
-                        ),
-                    )
-                    .group_by(user_status_history_table.c.user_id)
-                    .subquery()
+        status_effective_from, which is a DATE, not a timestamptz).
+        Wrapped in call_with_retry (adapters/retry.py) -- same shape as
+        identity-auth's structurally identical admin_user_repository.py
+        list() -- so this DB read gets the same retry resilience every
+        other adapter call in this service has, instead of failing on
+        the first transient error."""
+        last_change_subq = (
+            select(
+                user_status_history_table.c.user_id,
+                func.max(user_status_history_table.c.created_at).label(
+                    "last_status_change_at"
+                ),
+            )
+            .group_by(user_status_history_table.c.user_id)
+            .subquery()
+        )
+
+        conditions = []
+        if status is not None:
+            conditions.append(users_table.c.status == status)
+        if search:
+            like = f"%{search.strip().lower()}%"
+            conditions.append(
+                or_(
+                    func.lower(users_table.c.name).like(like),
+                    func.lower(users_table.c.mobile).like(like),
+                    func.lower(func.coalesce(users_table.c.email, "")).like(like),
                 )
+            )
 
-                conditions = []
-                if status is not None:
-                    conditions.append(users_table.c.status == status)
-                if search:
-                    like = f"%{search.strip().lower()}%"
-                    conditions.append(
-                        or_(
-                            func.lower(users_table.c.name).like(like),
-                            func.lower(users_table.c.mobile).like(like),
-                            func.lower(func.coalesce(users_table.c.email, "")).like(like),
-                        )
-                    )
-
+        def _attempt():
+            with self._engine.connect() as conn:
                 count_query = select(func.count()).select_from(users_table)
                 if conditions:
                     count_query = count_query.where(and_(*conditions))
@@ -470,6 +475,15 @@ class SqlAlchemyUserRepository:
                     .limit(page_size)
                     .offset((page - 1) * page_size)
                 ).fetchall()
+                return total, rows
+
+        try:
+            total, rows = call_with_retry(
+                _attempt,
+                max_retries=2,
+                backoff_base_seconds=0.1,
+                retryable_exceptions=(SQLAlchemyError,),
+            )
         except SQLAlchemyError as exc:
             logger.error(
                 "user_repository.list_customers failed",
