@@ -109,6 +109,23 @@ class ExternalServiceUnavailableError(IdentityAuthError):
     http_status = 503
 
 
+class AccountDeactivatedError(IdentityAuthError):
+    """MA-39/MA-139 §8 checklist item — a consumer Cognito user disabled
+    via User Service's AdminDisableUser (suspend/deactivate) surfaces
+    here as Cognito's own NotAuthorizedException("User is disabled.")
+    from AdminInitiateAuth/InitiateAuth, which cognito_adapter.py's
+    issue_tokens maps to this clean, actionable error rather than letting
+    it fall through to the generic 503 ExternalServiceUnavailableError
+    every other ClientError gets — a disabled account is a real, expected
+    client-facing state, not an upstream outage."""
+
+    error_code = "ACCOUNT_DEACTIVATED"
+    http_status = 403
+
+    def __init__(self, message: str = "This account has been suspended or deactivated") -> None:
+        super().__init__(message)
+
+
 class NotificationPublishError(IdentityAuthError):
     """EventBridge publish failed after retries — non-fatal to the caller,
     but the caller decides whether to surface it (see FR-1 edge cases)."""
