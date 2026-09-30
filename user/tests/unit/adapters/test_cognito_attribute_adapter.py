@@ -188,3 +188,96 @@ def test_moto_does_not_enforce_schema_for_undefined_custom_attributes(cognito_us
     adapter = CognitoAttributeAdapter(user_pool_id=pool_id, region_name="ap-south-1")
 
     adapter.sync_profile_attributes(cognito_sub, "Priya Sharma", "560001")  # moto allows this
+
+
+# --- MA-139: disable_user / enable_user ---
+
+
+def test_disable_user_calls_admin_disable_user(pool_with_default_pincode_attribute):
+    client = pool_with_default_pincode_attribute["client"]
+    pool_id = pool_with_default_pincode_attribute["pool_id"]
+    client.admin_create_user(
+        UserPoolId=pool_id,
+        Username="+919876543210",
+        UserAttributes=[{"Name": "phone_number", "Value": "+919876543210"}],
+        MessageAction="SUPPRESS",
+    )
+    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")[
+        "UserAttributes"
+    ]
+    cognito_sub = next(a["Value"] for a in user_attrs if a["Name"] == "sub")
+
+    adapter = CognitoAttributeAdapter(user_pool_id=pool_id, region_name="ap-south-1")
+    adapter.disable_user(cognito_sub)
+
+    user = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")
+    assert user["Enabled"] is False
+
+
+def test_enable_user_calls_admin_enable_user(pool_with_default_pincode_attribute):
+    client = pool_with_default_pincode_attribute["client"]
+    pool_id = pool_with_default_pincode_attribute["pool_id"]
+    client.admin_create_user(
+        UserPoolId=pool_id,
+        Username="+919876543210",
+        UserAttributes=[{"Name": "phone_number", "Value": "+919876543210"}],
+        MessageAction="SUPPRESS",
+    )
+    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")[
+        "UserAttributes"
+    ]
+    cognito_sub = next(a["Value"] for a in user_attrs if a["Name"] == "sub")
+    client.admin_disable_user(UserPoolId=pool_id, Username="+919876543210")
+
+    adapter = CognitoAttributeAdapter(user_pool_id=pool_id, region_name="ap-south-1")
+    adapter.enable_user(cognito_sub)
+
+    user = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")
+    assert user["Enabled"] is True
+
+
+def test_disable_user_raises_when_no_matching_cognito_user(pool_with_default_pincode_attribute):
+    """Spec section 9's orphaned-Cognito-state edge case — a cognito_sub
+    with no matching Cognito user must surface as a retryable error, never
+    be silently swallowed the way sync_profile_attributes's own no-op
+    behavior is for that same "user not found" case."""
+    adapter = CognitoAttributeAdapter(
+        user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
+    )
+    with pytest.raises(ExternalServiceUnavailableError):
+        adapter.disable_user(_FAKE_UUID_SUB)
+
+
+def test_enable_user_raises_when_no_matching_cognito_user(pool_with_default_pincode_attribute):
+    adapter = CognitoAttributeAdapter(
+        user_pool_id=pool_with_default_pincode_attribute["pool_id"], region_name="ap-south-1"
+    )
+    with pytest.raises(ExternalServiceUnavailableError):
+        adapter.enable_user(_FAKE_UUID_SUB)
+
+
+def test_disable_user_wraps_admin_disable_user_client_error(
+    pool_with_default_pincode_attribute, monkeypatch
+):
+    client = pool_with_default_pincode_attribute["client"]
+    pool_id = pool_with_default_pincode_attribute["pool_id"]
+    client.admin_create_user(
+        UserPoolId=pool_id,
+        Username="+919876543210",
+        UserAttributes=[{"Name": "phone_number", "Value": "+919876543210"}],
+        MessageAction="SUPPRESS",
+    )
+    user_attrs = client.admin_get_user(UserPoolId=pool_id, Username="+919876543210")[
+        "UserAttributes"
+    ]
+    cognito_sub = next(a["Value"] for a in user_attrs if a["Name"] == "sub")
+
+    adapter = CognitoAttributeAdapter(user_pool_id=pool_id, region_name="ap-south-1")
+
+    def _raise(*args, **kwargs):
+        raise ClientError({"Error": {"Code": "InternalErrorException"}}, "AdminDisableUser")
+
+    monkeypatch.setattr(adapter._client, "admin_disable_user", _raise)
+
+    with pytest.raises(ExternalServiceUnavailableError):
+        adapter.disable_user(cognito_sub)
