@@ -54,3 +54,8 @@ def handler(event: dict, context) -> dict:
             extra={"correlationId": correlation_id, "errorCode": exc.error_code},
         )
         return error_response(exc)
+    except Exception:
+        logger.exception(
+            "admin_customers.list: unexpected error", extra={"correlationId": correlation_id}
+        )
+        return error_response(UserServiceError("An unexpected error occurred"))

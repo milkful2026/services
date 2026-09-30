@@ -74,3 +74,11 @@ def test_bulk_status_handler_invalid_action_is_a_request_level_400():
         _event({"customerIds": ["cust-1"], "action": "not-real"}), None
     )
     assert response["statusCode"] == 400
+
+
+def test_bulk_status_handler_unexpected_exception_returns_500():
+    _inject(raises=RuntimeError("boom"))
+    response = bulk_status_handler.handler(
+        _event({"customerIds": ["cust-1"], "action": "deactivate", "reason": "closure"}), None
+    )
+    assert response["statusCode"] == 500

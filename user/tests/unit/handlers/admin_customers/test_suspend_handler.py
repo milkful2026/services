@@ -100,3 +100,9 @@ def test_suspend_handler_missing_reason_is_validation_error():
     _inject()
     response = suspend_handler.handler(_event({"until": "2026-12-01"}), None)
     assert response["statusCode"] == 400
+
+
+def test_suspend_handler_unexpected_exception_returns_500():
+    _inject(raises=RuntimeError("boom"))
+    response = suspend_handler.handler(_event({"reason": "fraud", "until": "2026-12-01"}), None)
+    assert response["statusCode"] == 500
