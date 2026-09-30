@@ -62,3 +62,17 @@ class InvalidStatusTransitionError(UserServiceError):
 
     error_code = "INVALID_STATUS_TRANSITION"
     http_status = 409
+
+
+class CognitoSyncFailedError(UserServiceError):
+    """MA-139 §6/§11 — the `users`/`user_status_history`/outbox DB
+    transaction already committed before this is raised; only the
+    synchronous `AdminDisableUser`/`AdminEnableUser` call failed. A
+    distinct 502 (not the generic 503 ExternalServiceUnavailableError)
+    per spec §6's explicit compensating-retry contract: the DB state is
+    already correct and safe to retry (FR-3/FR-4 are idempotent on
+    status), so the caller should treat this as "retry the same action",
+    not as "nothing happened"."""
+
+    error_code = "COGNITO_SYNC_FAILED"
+    http_status = 502

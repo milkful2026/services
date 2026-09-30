@@ -1,0 +1,357 @@
+"""Customer account status domain service (MA-139) — status-transition
+rules (spec §9's table), bulk orchestration, history-row construction,
+and the FR-7 suspension sweep.
+
+Kept in a separate module from registration_service.py (mirrors
+identity-auth's domain/admin_users/user_service.py living alongside its
+own pre-existing domain/otp_service.py) so the existing registration flow
+is never touched by this additive feature.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, date, datetime
+
+from adapters.interfaces import CognitoAttributePort, UserRepositoryPort
+from domain.exceptions import (
+    CognitoSyncFailedError,
+    CustomerNotFoundError,
+    ExternalServiceUnavailableError,
+    InvalidStatusTransitionError,
+    UserServiceError,
+    ValidationError,
+)
+from domain.models import BulkStatusResult, CustomerAccount, CustomerPage, CustomerStatus
+
+logger = logging.getLogger(__name__)
+
+_VALID_STATUSES = {s.value for s in CustomerStatus}
+_BULK_ACTIONS = {"suspend", "deactivate", "reactivate"}
+_SWEEP_ACTOR = "system:suspension-sweep"
+
+
+def _validate_status_filter(status: str) -> None:
+    if status not in _VALID_STATUSES:
+        raise ValidationError(f"status must be one of {sorted(_VALID_STATUSES)}")
+
+
+def _validate_reason(reason: str | None) -> None:
+    if not reason or not reason.strip():
+        raise ValidationError("reason is required")
+
+
+def _validate_until(until: date | None, today: date) -> None:
+    if until is None:
+        raise ValidationError("until is required for suspend")
+    if until <= today:
+        raise ValidationError("until must be a future date")
+
+
+class CustomerStatusService:
+    def __init__(
+        self,
+        user_repository: UserRepositoryPort,
+        cognito_attributes: CognitoAttributePort,
+        correlation_id: str = "",
+    ) -> None:
+        self._user_repository = user_repository
+        self._cognito_attributes = cognito_attributes
+        self._correlation_id = correlation_id
+
+    def set_correlation_id(self, correlation_id: str) -> None:
+        self._correlation_id = correlation_id
+        self._user_repository.set_correlation_id(correlation_id)
+        self._cognito_attributes.set_correlation_id(correlation_id)
+
+    # --- FR-1/FR-2: read APIs ---
+
+    def list_customers(
+        self, status: str | None, search: str | None, page: int, page_size: int
+    ) -> CustomerPage:
+        if status is not None:
+            _validate_status_filter(status)
+        if page < 1:
+            raise ValidationError("page must be >= 1")
+        if not (1 <= page_size <= 100):
+            raise ValidationError("pageSize must be between 1 and 100")
+        return self._user_repository.list_customers(status, search, page, page_size)
+
+    def get_customer_detail(self, customer_id: str) -> CustomerAccount:
+        account = self._get_or_404(customer_id)
+        account.status_history = self._user_repository.get_status_history(customer_id)
+        return account
+
+    # --- FR-3: suspend ---
+
+    def suspend(
+        self,
+        customer_id: str,
+        reason: str,
+        until: date,
+        actor_admin_id: str,
+        now: datetime | None = None,
+    ) -> CustomerAccount:
+        now = now or datetime.now(UTC)
+        today = now.date()
+        account = self._get_or_404(customer_id)
+        _validate_reason(reason)
+        _validate_until(until, today)
+
+        if account.status == CustomerStatus.DEACTIVATED.value:
+            raise InvalidStatusTransitionError(
+                "Cannot suspend a deactivated account — reactivate it first"
+            )
+        if account.status == CustomerStatus.SUSPENDED.value:
+            # Idempotent — spec §9's "already in that exact status" row:
+            # no duplicate history row, no duplicate event, no repeat
+            # Cognito call (the account is already disabled).
+            return account
+
+        updated = self._write_status_change(
+            account,
+            new_status=CustomerStatus.SUSPENDED.value,
+            reason=reason,
+            status_effective_from=today,
+            history_effective_from=today,
+            suspended_until=until,
+            actor_admin_id=actor_admin_id,
+        )
+        self._sync_cognito_disable(updated.cognito_sub)
+        return updated
+
+    # --- FR-4: deactivate ---
+
+    def deactivate(
+        self,
+        customer_id: str,
+        reason: str,
+        actor_admin_id: str,
+        now: datetime | None = None,
+    ) -> CustomerAccount:
+        now = now or datetime.now(UTC)
+        today = now.date()
+        account = self._get_or_404(customer_id)
+        _validate_reason(reason)
+
+        if account.status == CustomerStatus.DEACTIVATED.value:
+            # Idempotent — spec §4 FR-4: "returns 200 with the existing
+            # state unchanged (not an error)", which FR-6's bulk action
+            # relies on.
+            return account
+
+        # Deactivating an already-Suspended account is allowed —
+        # Deactivated supersedes Suspended; suspended_until is cleared
+        # (spec §9).
+        updated = self._write_status_change(
+            account,
+            new_status=CustomerStatus.DEACTIVATED.value,
+            reason=reason,
+            status_effective_from=today,
+            history_effective_from=today,
+            suspended_until=None,
+            actor_admin_id=actor_admin_id,
+        )
+        self._sync_cognito_disable(updated.cognito_sub)
+        return updated
+
+    # --- FR-5: reactivate ---
+
+    def reactivate(
+        self,
+        customer_id: str,
+        reason: str | None,
+        actor_admin_id: str,
+        now: datetime | None = None,
+    ) -> CustomerAccount:
+        """Does not touch any of the customer's subscriptions (D2) — this
+        method only ever changes `users.status` and Cognito state (spec
+        §9's own edge case)."""
+        now = now or datetime.now(UTC)
+        today = now.date()
+        account = self._get_or_404(customer_id)
+
+        if account.status == CustomerStatus.ACTIVE.value:
+            # Same idempotency posture as suspend/deactivate above —
+            # spec §9 generalizes "already in that exact status" to every
+            # transition, not just FR-4's explicitly-worded case.
+            return account
+
+        updated = self._write_status_change(
+            account,
+            new_status=CustomerStatus.ACTIVE.value,
+            reason=reason,
+            status_effective_from=today,
+            # Spec §7: effective_from is null in the HISTORY row for a
+            # reactivation, even though the `users` column itself is
+            # still stamped with today (see update_customer_status's own
+            # docstring for why these two are separate parameters).
+            history_effective_from=None,
+            suspended_until=None,
+            actor_admin_id=actor_admin_id,
+        )
+        self._sync_cognito_enable(updated.cognito_sub)
+        return updated
+
+    # --- FR-6: bulk ---
+
+    def bulk_status_change(
+        self,
+        customer_ids: list[str],
+        action: str,
+        reason: str | None,
+        until: date | None,
+        actor_admin_id: str,
+        now: datetime | None = None,
+    ) -> list[BulkStatusResult]:
+        """Applies FR-3/4/5's single-account logic once per id,
+        independently — each call below is its own DB transaction (via
+        update_customer_status), so one row's failure (a 404, a 409, a
+        Cognito timeout) can never roll back another row. Matches AC-6
+        by construction, not by special-casing (spec §4 FR-6)."""
+        if action not in _BULK_ACTIONS:
+            raise ValidationError(f"action must be one of {sorted(_BULK_ACTIONS)}")
+        now = now or datetime.now(UTC)
+
+        results: list[BulkStatusResult] = []
+        for customer_id in customer_ids:
+            try:
+                if action == "suspend":
+                    self.suspend(customer_id, reason, until, actor_admin_id, now=now)
+                elif action == "deactivate":
+                    self.deactivate(customer_id, reason, actor_admin_id, now=now)
+                else:
+                    self.reactivate(customer_id, reason, actor_admin_id, now=now)
+                results.append(BulkStatusResult(customer_id=customer_id, success=True))
+            except UserServiceError as exc:
+                logger.info(
+                    "customer_status_service.bulk_status_change: row failed",
+                    extra={
+                        "correlationId": self._correlation_id,
+                        "customerId": customer_id,
+                        "errorCode": exc.error_code,
+                    },
+                )
+                results.append(
+                    BulkStatusResult(customer_id=customer_id, success=False, error_code=exc.error_code)
+                )
+        return results
+
+    # --- FR-7: suspension sweep ---
+
+    def run_suspension_sweep(self, now: datetime | None = None) -> int:
+        """Scheduled entrypoint (see handlers/suspension_sweep_handler.py)
+        — queries every Suspended account whose suspended_until has
+        passed and auto-lifts it. One account's failure (Cognito outage,
+        a stray DB error) is logged and skipped, not allowed to abort the
+        rest of the sweep — same "one bad row must not stop the batch"
+        posture as subscription_service.run_daily and
+        outbox_publisher_handler in this same codebase."""
+        now = now or datetime.now(UTC)
+        today = now.date()
+        candidates = self._user_repository.list_expired_suspensions(today)
+
+        lifted = 0
+        for account in candidates:
+            try:
+                updated = self._write_status_change(
+                    account,
+                    new_status=CustomerStatus.ACTIVE.value,
+                    reason=None,
+                    status_effective_from=today,
+                    history_effective_from=None,
+                    suspended_until=None,
+                    actor_admin_id=_SWEEP_ACTOR,
+                )
+                self._sync_cognito_enable(updated.cognito_sub)
+                lifted += 1
+            except UserServiceError as exc:
+                logger.error(
+                    "customer_status_service.run_suspension_sweep: failed for one account, continuing",
+                    extra={
+                        "correlationId": self._correlation_id,
+                        "customerId": account.id,
+                        "errorCode": exc.error_code,
+                    },
+                )
+        logger.info(
+            "user.suspension_sweep_lifted_count",
+            extra={
+                "metric": "user.suspension_sweep_lifted_count",
+                "correlationId": self._correlation_id,
+                "count": lifted,
+            },
+        )
+        return lifted
+
+    # --- shared helpers ---
+
+    def _get_or_404(self, customer_id: str) -> CustomerAccount:
+        account = self._user_repository.get_customer_by_id(customer_id)
+        if account is None:
+            raise CustomerNotFoundError(f"No customer {customer_id!r}")
+        return account
+
+    def _write_status_change(
+        self,
+        account: CustomerAccount,
+        *,
+        new_status: str,
+        reason: str | None,
+        status_effective_from: date | None,
+        history_effective_from: date | None,
+        suspended_until: date | None,
+        actor_admin_id: str,
+    ) -> CustomerAccount:
+        # Same transactional-outbox shape register() already uses
+        # (adapters/user_repository.py): the users update, the
+        # user_status_history insert, and the outbox_events insert are
+        # one DB transaction (spec §6/§9) — a status change is never
+        # partially applied.
+        outbox_payload = {
+            "userId": account.id,
+            "previousStatus": account.status,
+            "newStatus": new_status,
+            "reason": reason,
+            "effectiveFrom": history_effective_from.isoformat() if history_effective_from else None,
+            "actorAdminId": actor_admin_id,
+        }
+        return self._user_repository.update_customer_status(
+            account.id,
+            new_status=new_status,
+            status_reason=reason,
+            status_effective_from=status_effective_from,
+            history_effective_from=history_effective_from,
+            suspended_until=suspended_until,
+            actor_admin_id=actor_admin_id,
+            outbox_event_type="user.status.changed",
+            outbox_payload=outbox_payload,
+        )
+
+    def _sync_cognito_disable(self, cognito_sub: str) -> None:
+        # Deliberately AFTER the DB transaction already committed (spec
+        # §6/§11 point 1) — see CognitoSyncFailedError's own docstring
+        # for why this ordering, and why a failure here is a distinct
+        # 502 rather than the generic ExternalServiceUnavailableError.
+        try:
+            self._cognito_attributes.disable_user(cognito_sub)
+        except ExternalServiceUnavailableError as exc:
+            logger.error(
+                "customer_status_service: DB committed but Cognito disable_user failed",
+                extra={"correlationId": self._correlation_id},
+            )
+            raise CognitoSyncFailedError(
+                "Status was updated but disabling the account's login failed — retry this action"
+            ) from exc
+
+    def _sync_cognito_enable(self, cognito_sub: str) -> None:
+        try:
+            self._cognito_attributes.enable_user(cognito_sub)
+        except ExternalServiceUnavailableError as exc:
+            logger.error(
+                "customer_status_service: DB committed but Cognito enable_user failed",
+                extra={"correlationId": self._correlation_id},
+            )
+            raise CognitoSyncFailedError(
+                "Status was updated but re-enabling the account's login failed — retry this action"
+            ) from exc
