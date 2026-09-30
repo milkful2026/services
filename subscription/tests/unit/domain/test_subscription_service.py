@@ -532,6 +532,45 @@ class TestPauseForAccountStatusChange:
         assert updated.status == SubscriptionStatus.PAUSED
         assert updated.pause_from == TODAY  # re-pinned to "now", not the future date
 
+    def test_handle_user_status_changed_overrides_an_in_progress_customer_pause(
+        self, service, repo
+    ):
+        # Regression test for the bug where the target filter excluded a
+        # subscription that is PAUSED with pause_from already in the past
+        # (a customer's temporary pause already in effect today) --
+        # deactivation/suspension must override that in-progress pause to
+        # indefinite (MA-140 section 9), not skip it. This goes through
+        # handle_user_status_changed (not pause_for_account_status_change
+        # directly) so it exercises the actual target filter, not just the
+        # inner method's own idempotent-override logic.
+        sub_id = self._create(service)
+        service.pause(
+            sub_id,
+            "user-1",
+            from_=TODAY,
+            until=TODAY + timedelta(days=5),
+            now=BEFORE_CUTOFF,
+        )
+
+        # Advance "now" so the pause is already in effect (pause_from is
+        # in the past relative to this later moment) but has not yet
+        # reached its own pause_until -- exactly the case the buggy
+        # filter excluded.
+        later = BEFORE_CUTOFF + timedelta(days=2)
+        pre = repo.get_by_id(sub_id)
+        assert pre.status == SubscriptionStatus.PAUSED
+        assert pre.pause_from < later.astimezone(IST).date()
+        assert pre.pause_until == TODAY + timedelta(days=5)
+
+        paused = service.handle_user_status_changed(
+            {"userId": "user-1", "newStatus": "Deactivated"}, now=later
+        )
+
+        assert paused == [sub_id]
+        updated = repo.get_by_id(sub_id)
+        assert updated.status == SubscriptionStatus.PAUSED
+        assert updated.pause_until is None
+
     def test_handle_user_status_changed_excludes_stopped_subscription(self, service, repo):
         sub_id = self._create(service)
         service.stop(sub_id, "user-1")

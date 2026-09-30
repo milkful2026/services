@@ -419,21 +419,25 @@ class SubscriptionService:
         now = now or datetime.now(IST)
         today = now.astimezone(IST).date()
 
-        # Spec FR-1 step 1 — ACTIVE, or PAUSED with a still-future
-        # pause_from (a not-yet-started pause should also be caught here
-        # rather than left to independently resolve) — mirrors
-        # list_active()'s own "non-STOPPED" Daily Run filter precedent,
-        # just narrowed to this one user's subscriptions via list_by_user
-        # instead of a full-table scan.
+        # Spec FR-1 step 1 - every non-STOPPED subscription (ACTIVE, or any
+        # PAUSED subscription regardless of pause_from/pause_until) is a
+        # target - mirrors list_active()'s own "non-STOPPED" Daily Run
+        # filter precedent, just narrowed to this one user's subscriptions
+        # via list_by_user instead of a full-table scan. This must include
+        # a PAUSED subscription whose pause is already in effect today (a
+        # customer's own temporary pause with a real pause_until, or an
+        # already-indefinite admin pause), not just a not-yet-started one -
+        # deactivation/suspension is a stronger, indefinite override that
+        # must take effect even over an in-progress customer pause (MA-140
+        # section 9's "admin pause overwrites pause_until to None" edge
+        # case). We deliberately do not pre-filter out an already-
+        # indefinitely-paused subscription here; that idempotency is
+        # pause_for_account_status_change's own job (its already_applied
+        # no-op check), keeping this filter a single source of truth for
+        # "is this subscription a candidate at all" (STOPPED vs. not), not
+        # a second place status-transition rules have to be kept in sync.
         targets = [
-            sub
-            for sub in self._repo.list_by_user(user_id)
-            if sub.status == SubscriptionStatus.ACTIVE
-            or (
-                sub.status == SubscriptionStatus.PAUSED
-                and sub.pause_from is not None
-                and sub.pause_from > today
-            )
+            sub for sub in self._repo.list_by_user(user_id) if sub.status != SubscriptionStatus.STOPPED
         ]
 
         paused_ids: list[str] = []
