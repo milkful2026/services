@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/UserStatusChanged.schema.json",
+  "title": "UserStatusChanged",
+  "description": "The `payload` object of the `user.status.changed` event (MA-139 section 8). Producer: milkful.user (MA-139), via User Service's own adapters/outbox_event_publisher.py — note that publisher wraps this shape one level deeper, under a `payload` key inside the full envelope ({eventId, eventType, eventVersion, source, timestamp, correlationId, payload}), unlike the flat shared/adapters/outbox_event_publisher.py shape most of PaymentConfirmed/OrderConfirmed's own sibling schemas in this directory describe. Consumer: Subscription Service's user_status_changed_consumer.py (MA-140), which unwraps that envelope before validating against this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["userId", "previousStatus", "newStatus", "actorAdminId"],
+  "properties": {
+    "userId": { "type": "string", "minLength": 1 },
+    "previousStatus": { "type": "string", "enum": ["Active", "Suspended", "Deactivated"] },
+    "newStatus": { "type": "string", "enum": ["Active", "Suspended", "Deactivated"] },
+    "reason": { "type": ["string", "null"] },
+    "effectiveFrom": { "type": ["string", "null"], "format": "date" },
+    "actorAdminId": { "type": "string", "minLength": 1 }
+  }
+}

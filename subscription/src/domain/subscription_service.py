@@ -317,6 +317,110 @@ class SubscriptionService:
         )
         return self._detail_response(updated, now)
 
+    def pause_for_account_status_change(
+        self, subscription_id: str, reason: str, now: datetime | None = None
+    ) -> None:
+        """MA-140 FR-2 — internal, system-initiated pause triggered by
+        User Service's `user.status.changed` event (MA-139), invoked only
+        from adapters/user_status_changed_consumer.py, never from any
+        public API route. Deliberately NOT a parameter added to `pause()`
+        above, which stays exactly as MA-131 built it (still customer-
+        only, still requires `user_id` ownership) — this method:
+
+        - Skips `_get_owned`'s ownership check entirely (ownership has no
+          meaning for a system-initiated call; there is no calling
+          customer to check against).
+        - Calls the exact same `self._repo.update_pause(...)` `pause()`
+          itself calls — `pause_from=today`, `pause_until=None`
+          (indefinite — MA-39's D2/§9: an account-level block overrides
+          any customer-set end date), `status=PAUSED`.
+        - Is idempotent: pausing an already-PAUSED subscription is a
+          no-op (checked before calling the repository), so redelivering
+          the same `user.status.changed` event never double-writes.
+
+        `reason` is accepted for traceability/log correlation (MA-140 §7
+        recommends NOT persisting it on the subscription row itself —
+        the source event's own userStatusHistory in User Service is the
+        durable "why" — so it's logged, not stored, here) but is not
+        currently used as a repository column; see this method's own
+        module-level flag in the PR description if that trade-off needs
+        revisiting.
+        """
+        sub = self._repo.get_by_id(subscription_id)
+        if sub is None:
+            raise SubscriptionNotFoundError(f"No subscription {subscription_id!r}")
+        if sub.status == SubscriptionStatus.PAUSED:
+            logger.info(
+                "subscription.pause_for_account_status_change: already paused, no-op",
+                extra={"subscriptionId": subscription_id, "reason": reason},
+            )
+            return
+
+        now = now or datetime.now(IST)
+        today = now.astimezone(IST).date()
+        self._repo.update_pause(
+            sub.id, pause_from=today, pause_until=None, status=SubscriptionStatus.PAUSED
+        )
+        logger.info(
+            "subscription.admin_pause",
+            extra={
+                "metric": "subscription.admin_pause.count",
+                "subscriptionId": subscription_id,
+                "reason": reason,
+            },
+        )
+
+    def handle_user_status_changed(self, payload: dict) -> list[str]:
+        """MA-140 FR-1 — orchestrates the consumer's per-event work: given
+        a `user.status.changed` event's `payload` (MA-139 §8's contract —
+        `userId`, `newStatus`, among others), pauses every ACTIVE-or-not-
+        yet-started-PAUSED subscription for that user. Mirrors this
+        codebase's existing convention of a domain method taking the raw
+        event payload dict directly (see wallet's own
+        WalletService.create_wallet/credit_recharge).
+
+        Only acts when `newStatus` is Suspended or Deactivated — this
+        consumer is one-directional (no auto-resume on reactivation, per
+        MA-39's D2) — though in practice the EventBridge rule (see
+        services/local-dev/bootstrap.py) already filters this before the
+        message ever reaches this queue; this check is defense in depth,
+        not the only gate.
+        """
+        new_status = payload.get("newStatus")
+        if new_status not in ("Suspended", "Deactivated"):
+            logger.info(
+                "subscription.handle_user_status_changed: ignoring non-pause-triggering status",
+                extra={"newStatus": new_status},
+            )
+            return []
+
+        user_id = payload["userId"]
+        reason = f"account_{new_status.lower()}"
+        today = datetime.now(IST).date()
+
+        # Spec FR-1 step 1 — ACTIVE, or PAUSED with a still-future
+        # pause_from (a not-yet-started pause should also be caught here
+        # rather than left to independently resolve) — mirrors
+        # list_active()'s own "non-STOPPED" Daily Run filter precedent,
+        # just narrowed to this one user's subscriptions via list_by_user
+        # instead of a full-table scan.
+        targets = [
+            sub
+            for sub in self._repo.list_by_user(user_id)
+            if sub.status == SubscriptionStatus.ACTIVE
+            or (
+                sub.status == SubscriptionStatus.PAUSED
+                and sub.pause_from is not None
+                and sub.pause_from > today
+            )
+        ]
+
+        paused_ids: list[str] = []
+        for sub in targets:
+            self.pause_for_account_status_change(sub.id, reason)
+            paused_ids.append(sub.id)
+        return paused_ids
+
     def resume(self, subscription_id: str, user_id: str, *, now: datetime | None = None) -> dict:
         sub = self._get_owned(subscription_id, user_id)
         if sub.status == SubscriptionStatus.STOPPED:

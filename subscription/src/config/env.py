@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     # skip/edit's "before/after cut-off" rule (MA-131 §4 FR-1/FR-5/FR-6).
     cutoff_hour_ist: int = 20
 
+    # MA-140 — SQS queue this service consumes `user.status.changed`
+    # from. Unset (default) means the consumer thread doesn't start
+    # (see main.py), same "no queue configured -> no consumer" posture
+    # wallet's own WALLET_EVENTS_QUEUE_URL already established.
+    user_status_events_queue_url: str = ""
+
 
 def get_settings() -> Settings:
     """Instantiated lazily so tests can inject env vars before first access."""
