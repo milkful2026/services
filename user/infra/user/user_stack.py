@@ -44,6 +44,30 @@ silently decided):
    empty (route is unreachable by anyone), and a human wires Cart
    Service's real role ARN in here once MA-96's own CDK stack is
    deployed and that ARN is known.
+8. **MA-139's `/v1/admin/customers*` routes reference Identity & Auth's
+   MA-129 admin authorizer Lambda cross-stack, by ARN.** Per MA-139 §6
+   point 2, these routes are "behind the existing admin JWT authorizer
+   path (MA-129's authorizer, already role-aware — extended, not
+   duplicated)" — i.e. the SAME Lambda function identity-auth's own
+   stack already deploys for its own `/v1/admin/*` routes, referenced
+   here via `HttpLambdaAuthorizer.from_lambda_function_arn` (API Gateway
+   supports one Lambda authorizer backing routes across multiple HTTP
+   APIs), not a second copy of that authorizer's Cognito/Aurora/IP-
+   allowlist logic. `admin_authorizer_fn_arn` is a placeholder
+   constructor parameter — same "placeholder until the other side
+   exists" shape as points 1 and 7 above — a human wires identity-auth's
+   real authorizer function ARN in once that stack exports it (e.g. via
+   `CfnOutput`/SSM Parameter Store, the same lowest-friction option point
+   1 already recommends for the Cognito pool ID export this stack also
+   needs).
+9. **FR-7's suspension sweep is a new, separate EventBridge Scheduler
+   rule**, deliberately not reusing `_build_outbox_scheduler`'s rule —
+   spec §11 point 3 flags this as a small new operational surface, kept
+   apart from Subscription Service's own Daily Run schedule so the two
+   unrelated jobs' failure/redrive domains aren't coupled. Runs daily at
+   03:00 UTC (~08:30 IST) — an arbitrary off-peak default per spec §12.2,
+   not a fixed decision; a human should confirm this doesn't collide with
+   Subscription's own Daily Run cut-off window before relying on it.
 """
 
 from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
@@ -73,6 +97,14 @@ class UserStack(Stack):
         cognito_client_id: str,
         inventory_internal_base_url: str = "http://PLACEHOLDER-inventory-internal-alb.local",
         internal_caller_role_arns: tuple[str, ...] = (),
+        # MA-139 — placeholder until identity-auth's stack exports its
+        # real MA-129 admin authorizer function ARN (module docstring
+        # point 8). An obviously-fake ARN rather than None so a forgotten
+        # wire-up fails loudly at deploy time (InvalidParameterValue),
+        # not silently with an unauthenticated admin API.
+        admin_authorizer_fn_arn: str = (
+            "arn:aws:lambda:ap-south-1:000000000000:function:PLACEHOLDER-admin-authorizer"
+        ),
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -147,14 +179,88 @@ class UserStack(Stack):
             **common_lambda_kwargs,
         )
 
-        for fn in (register_fn, delivery_slots_fn, outbox_publisher_fn, get_me_fn, address_state_fn):
+        # MA-139 — admin customer-status endpoints (spec §4 FR-1..FR-6).
+        admin_customers_list_fn = lambda_.Function(
+            self,
+            "AdminCustomersListFunction",
+            handler="handlers.admin_customers.list_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_customers_detail_fn = lambda_.Function(
+            self,
+            "AdminCustomersDetailFunction",
+            handler="handlers.admin_customers.detail_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_customers_suspend_fn = lambda_.Function(
+            self,
+            "AdminCustomersSuspendFunction",
+            handler="handlers.admin_customers.suspend_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_customers_deactivate_fn = lambda_.Function(
+            self,
+            "AdminCustomersDeactivateFunction",
+            handler="handlers.admin_customers.deactivate_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_customers_reactivate_fn = lambda_.Function(
+            self,
+            "AdminCustomersReactivateFunction",
+            handler="handlers.admin_customers.reactivate_handler.handler",
+            **common_lambda_kwargs,
+        )
+        admin_customers_bulk_status_fn = lambda_.Function(
+            self,
+            "AdminCustomersBulkStatusFunction",
+            handler="handlers.admin_customers.bulk_status_handler.handler",
+            **common_lambda_kwargs,
+        )
+        # MA-139 FR-7 — scheduled daily sweep, not an HTTP route.
+        suspension_sweep_fn = lambda_.Function(
+            self,
+            "SuspensionSweepFunction",
+            handler="handlers.suspension_sweep_handler.handler",
+            **common_lambda_kwargs,
+        )
+
+        admin_customer_fns = (
+            admin_customers_list_fn,
+            admin_customers_detail_fn,
+            admin_customers_suspend_fn,
+            admin_customers_deactivate_fn,
+            admin_customers_reactivate_fn,
+            admin_customers_bulk_status_fn,
+            suspension_sweep_fn,
+        )
+
+        for fn in (
+            register_fn,
+            delivery_slots_fn,
+            outbox_publisher_fn,
+            get_me_fn,
+            address_state_fn,
+            *admin_customer_fns,
+        ):
             secret.grant_read(fn)
 
         http_api = self._build_http_api(
-            register_fn, delivery_slots_fn, get_me_fn, address_state_fn, cognito_client_id
+            register_fn,
+            delivery_slots_fn,
+            get_me_fn,
+            address_state_fn,
+            cognito_client_id,
+            admin_customers_list_fn=admin_customers_list_fn,
+            admin_customers_detail_fn=admin_customers_detail_fn,
+            admin_customers_suspend_fn=admin_customers_suspend_fn,
+            admin_customers_deactivate_fn=admin_customers_deactivate_fn,
+            admin_customers_reactivate_fn=admin_customers_reactivate_fn,
+            admin_customers_bulk_status_fn=admin_customers_bulk_status_fn,
+            admin_authorizer_fn_arn=admin_authorizer_fn_arn,
         )
         self._grant_internal_callers(http_api, internal_caller_role_arns)
         self._build_outbox_scheduler(outbox_publisher_fn)
+        self._build_suspension_sweep_scheduler(suspension_sweep_fn)
 
     def _build_vpc(self) -> ec2.Vpc:
         return ec2.Vpc(
@@ -215,6 +321,16 @@ class UserStack(Stack):
                 actions=["cognito-idp:AdminUpdateUserAttributes"], resources=[pool_arn]
             )
         )
+        # MA-139 — additive least-privilege grant on the same consumer
+        # pool ARN, per spec §1's own framing ("not a new trust
+        # boundary"); IAM credentials scoped only to this pool (spec §5
+        # Security), no broader Cognito access granted.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cognito-idp:AdminDisableUser", "cognito-idp:AdminEnableUser"],
+                resources=[pool_arn],
+            )
+        )
         role.add_to_policy(
             iam.PolicyStatement(
                 actions=["events:PutEvents"],
@@ -230,6 +346,14 @@ class UserStack(Stack):
         get_me_fn: lambda_.Function,
         address_state_fn: lambda_.Function,
         cognito_client_id: str,
+        *,
+        admin_customers_list_fn: lambda_.Function,
+        admin_customers_detail_fn: lambda_.Function,
+        admin_customers_suspend_fn: lambda_.Function,
+        admin_customers_deactivate_fn: lambda_.Function,
+        admin_customers_reactivate_fn: lambda_.Function,
+        admin_customers_bulk_status_fn: lambda_.Function,
+        admin_authorizer_fn_arn: str,
     ) -> apigwv2.HttpApi:
         issuer = f"https://cognito-idp.{self.region}.amazonaws.com/{self._cognito_user_pool_id}"
         authorizer = apigwv2_authorizers.HttpJwtAuthorizer(
@@ -268,6 +392,72 @@ class UserStack(Stack):
                 "InternalAddressStateIntegration", address_state_fn
             ),
             authorizer=apigwv2_authorizers.HttpIamAuthorizer(),
+        )
+
+        # MA-139 — behind Identity & Auth's own MA-129 admin authorizer
+        # Lambda, referenced cross-stack by ARN (module docstring point
+        # 8) — never a second copy of that authorizer's logic. Caching
+        # disabled (authorizer_result_ttl default is CDK's own 300s
+        # otherwise) to match identity-auth's own admin_authorizer's
+        # TTL=0 posture (spec §11.2 / identity_auth_stack.py's own
+        # precedent) — a role/deactivation change must take effect on
+        # the very next request, not after a cache TTL.
+        admin_authorizer_fn = lambda_.Function.from_function_arn(
+            self, "AdminAuthorizerFunction", admin_authorizer_fn_arn
+        )
+        admin_authorizer = apigwv2_authorizers.HttpLambdaAuthorizer(
+            "AdminCustomersAuthorizer",
+            admin_authorizer_fn,
+            response_types=[apigwv2_authorizers.HttpLambdaResponseType.SIMPLE],
+            results_cache_ttl=Duration.seconds(0),
+        )
+        http_api.add_routes(
+            path="/v1/admin/customers",
+            methods=[apigwv2.HttpMethod.GET],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "AdminCustomersListIntegration", admin_customers_list_fn
+            ),
+            authorizer=admin_authorizer,
+        )
+        http_api.add_routes(
+            path="/v1/admin/customers/{id}",
+            methods=[apigwv2.HttpMethod.GET],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "AdminCustomersDetailIntegration", admin_customers_detail_fn
+            ),
+            authorizer=admin_authorizer,
+        )
+        http_api.add_routes(
+            path="/v1/admin/customers/{id}/suspend",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "AdminCustomersSuspendIntegration", admin_customers_suspend_fn
+            ),
+            authorizer=admin_authorizer,
+        )
+        http_api.add_routes(
+            path="/v1/admin/customers/{id}/deactivate",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "AdminCustomersDeactivateIntegration", admin_customers_deactivate_fn
+            ),
+            authorizer=admin_authorizer,
+        )
+        http_api.add_routes(
+            path="/v1/admin/customers/{id}/reactivate",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "AdminCustomersReactivateIntegration", admin_customers_reactivate_fn
+            ),
+            authorizer=admin_authorizer,
+        )
+        http_api.add_routes(
+            path="/v1/admin/customers/bulk-status",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "AdminCustomersBulkStatusIntegration", admin_customers_bulk_status_fn
+            ),
+            authorizer=admin_authorizer,
         )
         return http_api
 
@@ -319,3 +509,15 @@ class UserStack(Stack):
             self, "OutboxPublisherSchedule", schedule=events.Schedule.rate(Duration.minutes(1))
         )
         rule.add_target(events_targets.LambdaFunction(outbox_publisher_fn))
+
+    def _build_suspension_sweep_scheduler(self, suspension_sweep_fn: lambda_.Function) -> None:
+        # MA-139 FR-7 — a new, separate schedule (module docstring point
+        # 9), not added to _build_outbox_scheduler's own rule above. Cron
+        # at 03:00 UTC daily; see this stack's module docstring for why
+        # that specific hour is a flagged default, not a fixed decision.
+        rule = events.Rule(
+            self,
+            "SuspensionSweepSchedule",
+            schedule=events.Schedule.cron(minute="0", hour="3"),
+        )
+        rule.add_target(events_targets.LambdaFunction(suspension_sweep_fn))

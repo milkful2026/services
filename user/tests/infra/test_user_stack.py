@@ -28,7 +28,7 @@ def template() -> Template:
     return Template.from_stack(stack)
 
 
-def test_five_lambdas_exist_for_the_five_handlers(template):
+def test_lambdas_exist_for_each_handler(template):
     functions = template.find_resources("AWS::Lambda::Function")
     handlers = {
         props["Properties"].get("Handler")
@@ -41,6 +41,14 @@ def test_five_lambdas_exist_for_the_five_handlers(template):
         "handlers.outbox_publisher_handler.handler",
         "handlers.get_me_handler.handler",
         "handlers.internal_address_state_handler.handler",
+        # MA-139
+        "handlers.admin_customers.list_handler.handler",
+        "handlers.admin_customers.detail_handler.handler",
+        "handlers.admin_customers.suspend_handler.handler",
+        "handlers.admin_customers.deactivate_handler.handler",
+        "handlers.admin_customers.reactivate_handler.handler",
+        "handlers.admin_customers.bulk_status_handler.handler",
+        "handlers.suspension_sweep_handler.handler",
     }
 
 
@@ -51,13 +59,24 @@ def test_aurora_serverless_v2_cluster(template):
     )
 
 
+_ADMIN_CUSTOMER_ROUTE_KEYS = {
+    "GET /v1/admin/customers",
+    "GET /v1/admin/customers/{id}",
+    "POST /v1/admin/customers/{id}/suspend",
+    "POST /v1/admin/customers/{id}/deactivate",
+    "POST /v1/admin/customers/{id}/reactivate",
+    "POST /v1/admin/customers/bulk-status",
+}
+
+
 def test_public_routes_have_jwt_authorizer_attached(template):
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 4
+    assert len(routes) == 10
     public_routes = {
         k: v
         for k, v in routes.items()
         if v["Properties"]["RouteKey"] != "GET /v1/internal/users/address-state"
+        and v["Properties"]["RouteKey"] not in _ADMIN_CUSTOMER_ROUTE_KEYS
     }
     assert len(public_routes) == 3
     for props in public_routes.values():
@@ -65,6 +84,32 @@ def test_public_routes_have_jwt_authorizer_attached(template):
 
     route_keys = {props["Properties"]["RouteKey"] for props in public_routes.values()}
     assert route_keys == {"POST /users/register", "GET /delivery/slots", "GET /users/me"}
+
+
+def test_admin_customer_routes_have_a_lambda_authorizer_attached(template):
+    # MA-139 — these routes must use the cross-stack Lambda REQUEST
+    # authorizer (user_stack.py docstring point 8), never the plain
+    # Cognito JWT authorizer every public route above uses, and never
+    # unauthenticated.
+    routes = template.find_resources("AWS::ApiGatewayV2::Route")
+    admin_routes = {
+        k: v for k, v in routes.items() if v["Properties"]["RouteKey"] in _ADMIN_CUSTOMER_ROUTE_KEYS
+    }
+    assert len(admin_routes) == len(_ADMIN_CUSTOMER_ROUTE_KEYS)
+    # AuthorizerId is itself an intrinsic ({"Ref": ...}), not a plain
+    # string — dump to JSON before deduping/hashing.
+    authorizer_ids = {
+        json.dumps(props["Properties"].get("AuthorizerId")) for props in admin_routes.values()
+    }
+    assert len(authorizer_ids) == 1
+    assert json.dumps(None) not in authorizer_ids
+
+    authorizers = template.find_resources("AWS::ApiGatewayV2::Authorizer")
+    lambda_authorizers = [
+        props for props in authorizers.values() if props["Properties"]["AuthorizerType"] == "REQUEST"
+    ]
+    assert len(lambda_authorizers) == 1
+    assert lambda_authorizers[0]["Properties"].get("AuthorizerResultTtlInSeconds", 0) == 0
 
 
 def test_internal_address_state_route_uses_iam_not_jwt(template):
@@ -135,9 +180,14 @@ def test_jwt_authorizer_references_cognito_issuer(template):
     # — a regex Matcher can't match an intrinsic object, so this checks
     # the raw synthesized JSON for the pool ID substring instead.
     authorizers = template.find_resources("AWS::ApiGatewayV2::Authorizer")
-    assert len(authorizers) == 1
-    authorizer = next(iter(authorizers.values()))
-    assert authorizer["Properties"]["AuthorizerType"] == "JWT"
+    # MA-139 added a second (REQUEST-type, Lambda) authorizer for the
+    # admin customer routes — this test only cares about the original
+    # JWT one.
+    jwt_authorizers = [
+        props for props in authorizers.values() if props["Properties"]["AuthorizerType"] == "JWT"
+    ]
+    assert len(jwt_authorizers) == 1
+    authorizer = jwt_authorizers[0]
     assert "ap-south-1_PLACEHOLDER" in json.dumps(authorizer["Properties"]["JwtConfiguration"])
 
 
@@ -163,6 +213,29 @@ def test_database_url_is_composed_not_a_dead_placeholder(template):
         db_url = json.dumps(env_vars["USER_DATABASE_URL"])
         assert "COMPOSE_FROM_USER_DB" not in db_url
         assert "postgresql+psycopg2://" in db_url
+
+
+def test_suspension_sweep_has_a_daily_schedule(template):
+    template.has_resource_properties(
+        "AWS::Events::Rule", {"ScheduleExpression": "cron(0 3 * * ? *)"}
+    )
+
+
+def test_execution_role_scopes_admin_disable_enable_user_to_pool_arn(template):
+    # MA-139 — same least-privilege posture as AdminUpdateUserAttributes:
+    # scoped to the consumer pool ARN only, never a broader Cognito grant.
+    policies = template.find_resources("AWS::IAM::Policy")
+    statement = None
+    for props in policies.values():
+        for stmt in props["Properties"]["PolicyDocument"]["Statement"]:
+            actions = stmt.get("Action")
+            if isinstance(actions, list) and set(actions) == {
+                "cognito-idp:AdminDisableUser",
+                "cognito-idp:AdminEnableUser",
+            }:
+                statement = stmt
+    assert statement is not None, "no AdminDisableUser/AdminEnableUser statement found"
+    assert "userpool/ap-south-1_PLACEHOLDER" in json.dumps(statement["Resource"])
 
 
 def test_execution_role_scopes_admin_update_user_attributes_to_pool_arn(template):
