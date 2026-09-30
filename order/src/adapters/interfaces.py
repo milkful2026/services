@@ -4,7 +4,7 @@ never imports SQLAlchemy, `requests`, or boto3 directly."""
 from datetime import datetime
 from typing import Protocol
 
-from domain.models import DebitResult, Order, OrdersPage, Quote
+from domain.models import DebitLookup, DebitResult, Order, OrdersPage, Quote, Voided
 
 
 class OrderRepositoryPort(Protocol):
@@ -89,5 +89,17 @@ class WalletClientPort(Protocol):
         """Raises WalletUnavailableError after retries for a transport
         failure or a persistent 503 WALLET_PROVISIONING_PENDING. Returns a
         typed DebitResult (never raises) for DEBITED/INSUFFICIENT_BALANCE/
-        WALLET_NOT_ACTIVE — all three are normal 200 responses."""
+        WALLET_NOT_ACTIVE — all three are normal 200 responses. Raises
+        DebitVoidedError (MA-142) if the order was voided."""
+        ...
+
+    def void_debit(self, user_id: str, order_id: str) -> Voided | DebitLookup:
+        """MA-142. `Voided`: the order can never be charged. `DebitLookup`:
+        it already was. Raises WalletUnavailableError when Wallet can't be
+        asked — callers must never read that as "not charged"."""
+        ...
+
+    def get_debit(self, order_id: str) -> DebitLookup | Voided | None:
+        """MA-142, diagnostics only. None means "not debited yet" — never
+        grounds to close an order."""
         ...

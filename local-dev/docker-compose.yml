@@ -225,6 +225,15 @@ services:
         condition: service_started
     environment:
       ENV_LOCAL_PATH: /shared/order/.env.local
+      # MA-143 reconciliation sweep, shortened for local dev (prod
+      # defaults: 300 s interval, 900/600 s stale, 6 attempts, 120 s
+      # lease). Not set on order-outbox, which doesn't run the sweep.
+      ORDER_SWEEP_INTERVAL_SECONDS: "15"
+      ORDER_SUBSCRIPTION_ORDER_STALE_SECONDS: "60"
+      ORDER_SUBSCRIPTION_CHARGE_DEADLINE_HOUR_IST: "23"
+      ORDER_CHECKOUT_STALE_SECONDS: "60"
+      ORDER_SWEEP_MAX_ATTEMPTS: "3"
+      ORDER_SWEEP_LEASE_SECONDS: "60"
     volumes:
       - order-env:/shared/order
 

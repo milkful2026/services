@@ -1,7 +1,10 @@
 import pytest
 
-from adapters.wallet_repository import ledger_entries_table, wallets_table
+from adapters.wallet_repository import debit_voids_table, ledger_entries_table, wallets_table
 from domain.exceptions import (
+    AlreadyDebitedError,
+    DebitNotFoundError,
+    DebitVoidedError,
     InvalidAmountError,
     InvalidCursorError,
     OrderUserMismatchError,
@@ -439,3 +442,127 @@ class TestDebitForOrder:
 
         monkeypatch.undo()
         assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+
+
+class TestGetDebitForOrder:
+    """MA-142 — read-only debit lookup by order id."""
+
+    def test_debited_order_returns_positive_amount(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+        )
+        debit = service.get_debit_for_order("order-1")
+        assert debit["orderId"] == "order-1"
+        assert debit["status"] == "DEBITED"
+        assert debit["amountPaise"] == 30000
+        assert debit["balanceAfterPaise"] == 70000
+        assert debit["walletId"] == "wal_1"
+        assert debit["debitedAt"]
+
+    def test_unknown_order_raises_not_found(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        with pytest.raises(DebitNotFoundError):
+            service.get_debit_for_order("order-never")
+
+    def test_lookup_does_not_change_balance(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+        )
+        service.get_debit_for_order("order-1")
+        service.get_debit_for_order("order-1")
+        assert repo.get_wallet_by_user("user-1").balance_paise == 70000
+
+    def test_non_debit_entry_on_ref_is_not_found_and_logged(self, service, engine, caplog):
+        seed_wallet(engine, balance_paise=100000)
+        with engine.begin() as conn:
+            conn.execute(
+                ledger_entries_table.insert().values(
+                    wallet_id="wal_1",
+                    type="ADJUSTMENT",
+                    amount_paise=100,
+                    balance_after_paise=100100,
+                    ref="order:odd",
+                )
+            )
+        with caplog.at_level("ERROR"), pytest.raises(DebitNotFoundError):
+            service.get_debit_for_order("odd")
+        assert "non-debit ledger entry" in caplog.text
+
+    def test_voided_order_returns_voided(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        voided = service.void_debit_for_order("user-1", "order-1")
+        assert service.get_debit_for_order("order-1") == voided
+
+
+class TestVoidDebitForOrder:
+    """MA-142 FR-2/FR-3 — the void fences an order against any later debit."""
+
+    def test_void_without_debit_records_a_void(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        body = service.void_debit_for_order("user-1", "order-1")
+        assert body["orderId"] == "order-1"
+        assert body["status"] == "VOIDED"
+        assert body["voidedAt"]
+        with engine.connect() as conn:
+            rows = conn.execute(debit_voids_table.select()).fetchall()
+        assert [(r.ref, r.user_id) for r in rows] == [("order:order-1", "user-1")]
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+
+    def test_void_after_debit_returns_the_debit_and_writes_nothing(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+        )
+        with pytest.raises(AlreadyDebitedError) as exc_info:
+            service.void_debit_for_order("user-1", "order-1")
+        details = exc_info.value.details
+        assert details["status"] == "DEBITED"
+        assert details["amountPaise"] == 30000  # positive, though the ledger stores -30000
+        assert details["balanceAfterPaise"] == 70000
+        with engine.connect() as conn:
+            assert conn.execute(debit_voids_table.select()).fetchall() == []
+        assert repo.get_wallet_by_user("user-1").balance_paise == 70000
+
+    def test_void_twice_returns_the_same_voided_at(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        first = service.void_debit_for_order("user-1", "order-1")
+        assert service.void_debit_for_order("user-1", "order-1") == first
+
+    def test_debit_after_void_is_refused_and_balance_unchanged(
+        self, service, repo, engine, caplog
+    ):
+        seed_wallet(engine, balance_paise=100000)
+        voided = service.void_debit_for_order("user-1", "order-1")
+        with caplog.at_level("WARNING"), pytest.raises(DebitVoidedError) as exc_info:
+            service.debit_for_order(
+                user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+            )
+        assert exc_info.value.details == {"orderId": "order-1", "voidedAt": voided["voidedAt"]}
+        assert "wallet.debit_refused_voided" in caplog.text
+        wallet = repo.get_wallet_by_user("user-1")
+        assert wallet.balance_paise == 100000
+        assert [e.type.value for e in repo.list_ledger_entries(wallet.id, 10, None)] == [
+            "OPENING"
+        ]
+
+    def test_debit_replay_after_commit_still_replays_and_void_sees_it(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+        )
+        with pytest.raises(AlreadyDebitedError):
+            service.void_debit_for_order("user-1", "order-1")
+        replay = service.debit_for_order(
+            user_id="user-1", order_id="order-1", amount_paise=30000, correlation_id="c"
+        )
+        assert replay.result == DebitResult.DEBITED
+        assert replay.replayed
+
+    def test_void_for_user_without_wallet_is_voided(self, service, engine):
+        assert service.void_debit_for_order("ghost", "order-1")["status"] == "VOIDED"
+
+    def test_void_ignores_wallet_status(self, service, engine):
+        seed_wallet(engine, balance_paise=100000, status="FAILED")
+        assert service.void_debit_for_order("user-1", "order-1")["status"] == "VOIDED"

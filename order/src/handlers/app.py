@@ -7,10 +7,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from config.env import get_settings
 from domain.exceptions import OrderError
 from handlers.checkout_handlers import router as checkout_router
 from handlers.dto import error_envelope
-from handlers.health import consumer_health
+from handlers.health import consumer_health, sweep_health
 from handlers.order_handlers import router as order_router
 
 app = FastAPI(title="Order Service")
@@ -42,5 +43,10 @@ def healthz() -> JSONResponse:
         return JSONResponse(
             status_code=503,
             content={"status": "unhealthy", "reason": "order_events_consumer stopped"},
+        )
+    if get_settings().sweep_enabled and not sweep_health.alive:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "reason": "order_sweep stopped"},
         )
     return JSONResponse(status_code=200, content={"status": "ok"})

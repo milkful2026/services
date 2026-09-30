@@ -3,7 +3,7 @@ never imports SQLAlchemy or boto3 directly."""
 
 from typing import Protocol
 
-from domain.models import DebitOutcome, LedgerEntry, LedgerType, Wallet
+from domain.models import DebitOutcome, DebitVoid, LedgerEntry, LedgerType, Wallet
 
 
 class WalletRepositoryPort(Protocol):
@@ -36,6 +36,20 @@ class WalletRepositoryPort(Protocol):
         self, wallet_id: str, limit: int, before: tuple[str, int] | None
     ) -> list[LedgerEntry]: ...
 
+    def get_ledger_entry_by_ref(self, ref: str) -> LedgerEntry | None:
+        """MA-142 — plain read by the unique `ref`; no lock, no write."""
+        ...
+
+    def get_void(self, ref: str) -> DebitVoid | None:
+        """MA-142 — plain read of the void for `ref`; no lock, no write."""
+        ...
+
+    def void_debit_for_order(self, user_id: str, ref: str) -> LedgerEntry | DebitVoid:
+        """MA-142 FR-2, one transaction under the user's wallet row lock:
+        the existing ledger entry for `ref` (nothing written), or the void —
+        inserted now, or the one a previous call stored."""
+        ...
+
     def find_balance_invariant_violations(self) -> list[tuple[str, int, int]]:
         """Returns (wallet_id, balance_paise, ledger_sum_paise) for every
         wallet where they disagree."""
@@ -54,9 +68,10 @@ class WalletRepositoryPort(Protocol):
         """One transaction: SELECT ... FOR UPDATE the wallet; no row ->
         raises WalletProvisioningPendingError; not ACTIVE ->
         WALLET_NOT_ACTIVE; `ref` already debited -> DEBITED replay (or
-        OrderUserMismatchError if it belongs to a different wallet);
-        insufficient balance -> INSUFFICIENT_BALANCE; otherwise inserts
-        the ORDER_DEBIT ledger row, decrements the balance, and enqueues
+        OrderUserMismatchError if it belongs to a different wallet); `ref`
+        voided -> raises DebitVoidedError; insufficient balance ->
+        INSUFFICIENT_BALANCE; otherwise inserts the ORDER_DEBIT ledger
+        row, decrements the balance, and enqueues
         a WalletDebited outbox row built by
         `outbox_payload_builder(wallet_id, balance_after_paise)`."""
         ...

@@ -3,7 +3,7 @@
 SQLAlchemy Core only (mirrors catalog/inventory) — the same Table
 definitions run against Postgres (production) and an in-memory SQLite
 engine (tests). Table columns are kept column-for-column compatible with
-migrations/0001_wallets_ledger.sql by hand.
+migrations/0001_wallets_ledger.sql + 0002_debit_voids.sql by hand.
 """
 
 import base64
@@ -29,12 +29,21 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from domain.exceptions import (
+    DebitVoidedError,
     OrderUserMismatchError,
     RetryableConsumerError,
     ServiceUnavailableError,
     WalletProvisioningPendingError,
 )
-from domain.models import DebitOutcome, DebitResult, LedgerEntry, LedgerType, Wallet, WalletStatus
+from domain.models import (
+    DebitOutcome,
+    DebitResult,
+    DebitVoid,
+    LedgerEntry,
+    LedgerType,
+    Wallet,
+    WalletStatus,
+)
 
 metadata = MetaData()
 
@@ -72,6 +81,15 @@ ledger_entries_table = Table(
     Column("ref", Text, nullable=False, unique=True),
     Column("correlation_id", Text, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+# MA-142 FR-2: a fence on `ref` — see 0002_debit_voids.sql.
+debit_voids_table = Table(
+    "debit_voids",
+    metadata,
+    Column("ref", String(80), primary_key=True),
+    Column("user_id", String(64), nullable=False),
+    Column("voided_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
 outbox_table = Table(
@@ -112,6 +130,66 @@ class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
                     select(wallets_table).where(wallets_table.c.user_id == user_id)
                 ).fetchone()
         return None if row is None else _row_to_wallet(row)
+
+    def get_ledger_entry_by_ref(self, ref: str) -> LedgerEntry | None:
+        # MA-142: read-only — deliberately no FOR UPDATE, so a lookup never
+        # contends with a debit on the same wallet.
+        with self._db_operation("get_ledger_entry_by_ref", "Failed to load ledger entry"):
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(ledger_entries_table).where(ledger_entries_table.c.ref == ref)
+                ).fetchone()
+        return None if row is None else _row_to_entry(row)
+
+    def get_void(self, ref: str) -> DebitVoid | None:
+        """MA-142 — plain read of the void for `ref`; no lock, no write."""
+        with self._db_operation("get_void", "Failed to load debit void"):
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(debit_voids_table).where(debit_voids_table.c.ref == ref)
+                ).fetchone()
+        return None if row is None else _row_to_void(row)
+
+    def void_debit_for_order(self, user_id: str, ref: str) -> LedgerEntry | DebitVoid:
+        """MA-142 FR-2, one transaction: lock the user's wallet row — the same
+        `FOR UPDATE` `debit_for_order` takes first, so a void and a debit for
+        this user serialize — then return the ledger entry if `ref` was
+        already debited (nothing written), or record the void (idempotent:
+        a repeat returns the stored one).
+
+        No wallet row means no lock to take, but also that no debit can
+        commit (the debit locks that row first and fails without it). A
+        concurrent void for the same ref without that lock loses on the
+        primary key and re-reads the winner."""
+        with self._db_operation("void_debit_for_order", "Failed to void debit"):
+            try:
+                with self._engine.begin() as conn:
+                    conn.execute(
+                        select(wallets_table.c.id)
+                        .where(wallets_table.c.user_id == user_id)
+                        .with_for_update()
+                    ).fetchone()
+                    entry = conn.execute(
+                        select(ledger_entries_table).where(ledger_entries_table.c.ref == ref)
+                    ).fetchone()
+                    if entry is not None:
+                        return _row_to_entry(entry)
+                    existing = conn.execute(
+                        select(debit_voids_table).where(debit_voids_table.c.ref == ref)
+                    ).fetchone()
+                    if existing is not None:
+                        return _row_to_void(existing)
+                    conn.execute(debit_voids_table.insert().values(ref=ref, user_id=user_id))
+                    return _row_to_void(
+                        conn.execute(
+                            select(debit_voids_table).where(debit_voids_table.c.ref == ref)
+                        ).one()
+                    )
+            except IntegrityError:
+                existing = self.get_void(ref)
+                if existing is None:
+                    raise
+                return existing
 
     def insert_wallet_if_absent(self, wallet_id: str, user_id: str) -> bool:
         with self._db_operation("insert_wallet_if_absent", "Failed to create wallet"):
@@ -227,6 +305,7 @@ class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
             already-debited order still returns DEBITED even if the
             wallet's status has since changed (e.g. FAILED) — the debit
             already happened; the status check only gates *new* debits.
+          - `ref` voided (MA-142) -> raise DebitVoidedError (409, no write).
           - row present but not ACTIVE -> WALLET_NOT_ACTIVE (no write).
           - insufficient balance -> INSUFFICIENT_BALANCE (no write).
           - otherwise -> insert the ORDER_DEBIT ledger row, decrement the
@@ -261,6 +340,18 @@ class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
                     ).fetchone()
                     if existing is not None:
                         return _replay_outcome(wallet, existing, order_id)
+
+                    # MA-142 FR-3: after the replay check (a debit that
+                    # committed before the void still replays), under the
+                    # same lock the void takes.
+                    voided = conn.execute(
+                        select(debit_voids_table).where(debit_voids_table.c.ref == ref)
+                    ).fetchone()
+                    if voided is not None:
+                        raise DebitVoidedError(
+                            f"order {order_id!r} was voided; it can no longer be debited",
+                            {"orderId": order_id, "voidedAt": _iso(voided.voided_at)},
+                        )
 
                     if wallet.status != WalletStatus.ACTIVE:
                         return DebitOutcome(result=DebitResult.WALLET_NOT_ACTIVE)
@@ -434,6 +525,14 @@ def _row_to_wallet(row) -> Wallet:
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def _row_to_void(row) -> DebitVoid:
+    return DebitVoid(ref=row.ref, user_id=row.user_id, voided_at=row.voided_at)
+
+
+def _iso(value) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 def _row_to_entry(row) -> LedgerEntry:

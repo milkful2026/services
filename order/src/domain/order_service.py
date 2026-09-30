@@ -46,7 +46,14 @@ from adapters.interfaces import (
     WalletClientPort,
 )
 from adapters.order_repository import decode_cursor, new_order_id
-from domain.exceptions import InvalidCursorError, OrderNotFoundError, ProductPricingUnknownError
+from domain.exceptions import (
+    DebitVoidedError,
+    InvalidCursorError,
+    OrderBusyError,
+    OrderNotFoundError,
+    ProductPricingUnknownError,
+    WalletUnavailableError,
+)
 from domain.models import Order, OrdersPage, OrderStatus
 
 logger = logging.getLogger(__name__)
@@ -62,11 +69,14 @@ class OrderService:
         user_client: UserClientPort,
         pricing_client: PricingClientPort,
         wallet_client: WalletClientPort,
+        *,
+        lease_seconds: float = 120,
     ) -> None:
         self._repo = repository
         self._user_client = user_client
         self._pricing_client = pricing_client
         self._wallet_client = wallet_client
+        self._lease_seconds = lease_seconds
 
     def materialize(
         self,
@@ -77,6 +87,7 @@ class OrderService:
         quantity: int,
         delivery_date,
         correlation_id: str | None,
+        claim_owner: str | None = None,
     ) -> None:
         existing = self._repo.get_by_subscription_and_date(subscription_id, delivery_date)
         if existing is not None:
@@ -84,7 +95,7 @@ class OrderService:
                 # A prior attempt crashed between insert and the debit
                 # call — resume there rather than re-inserting or
                 # silently dropping the redelivery.
-                self._debit_and_finalize(existing, correlation_id)
+                self._resume_claimed(existing, correlation_id, claim_owner)
                 return
             logger.info(
                 "order.materialize: already resolved, no-op",
@@ -144,7 +155,10 @@ class OrderService:
                 status=OrderStatus.CREATED,
             )
         )
-        self._debit_and_finalize(order, correlation_id)
+        try:
+            self._debit_and_finalize(order, correlation_id)
+        except DebitVoidedError:
+            self._debit_refused_voided(order)
 
     def _insert_payment_failed_before_pricing(
         self,
@@ -187,6 +201,43 @@ class OrderService:
         }
         order = self._repo.insert_payment_failed(order, "OrderPaymentFailed", payload)
         logger.info("order.payment_failed", extra={"orderId": order.id, "reason": reason})
+
+    def _resume_claimed(
+        self, order: Order, correlation_id: str | None, claim_owner: str | None
+    ) -> None:
+        """MA-143 FR-5 — the SQS resume path takes the order's lease first,
+        so it never debits alongside the sweep. Lost -> OrderBusyError (the
+        consumer leaves the message unacked; the redelivery then finds the
+        order terminal). A terminal transition releases the lease itself.
+
+        `DebitVoidedError`: the sweep closed (or is closing) this order past
+        its charge deadline — release, log and ack; the sweep finishes it."""
+        if claim_owner is not None and not self._repo.claim_order(
+            order.id, claim_owner, self._lease_seconds
+        ):
+            raise OrderBusyError(
+                "Order is being resumed by another worker", {"orderId": order.id}
+            )
+        try:
+            self._debit_and_finalize(order, correlation_id)
+        except WalletUnavailableError:
+            if claim_owner is not None:
+                self._repo.release_order(order.id, claim_owner)
+            raise
+        except DebitVoidedError:
+            if claim_owner is not None:
+                self._repo.release_order(order.id, claim_owner)
+            self._debit_refused_voided(order)
+
+    @staticmethod
+    def _debit_refused_voided(order: Order) -> None:
+        logger.warning("order.debit_refused_voided", extra={"orderId": order.id})
+
+    def resume_debit(self, order: Order, correlation_id: str | None) -> None:
+        """MA-143 — the sweep's entry point: the same debit step the SQS
+        crash-resume path runs. The caller already holds the lease and
+        handles WalletUnavailableError / DebitVoidedError itself."""
+        self._debit_and_finalize(order, correlation_id)
 
     def _debit_and_finalize(self, order: Order, correlation_id: str | None) -> None:
         # Deliberately outside any DB transaction — an external HTTP call

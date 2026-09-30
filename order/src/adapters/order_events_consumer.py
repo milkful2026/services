@@ -66,7 +66,7 @@ class OrderEventsConsumer:
             envelope = json.loads(message["Body"])
             detail_type = envelope.get("detail-type") or envelope.get("detailType")
             detail = envelope.get("detail", {})
-            self._dispatch(detail_type, detail)
+            self._dispatch(detail_type, detail, message.get("MessageId", ""))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.error(
                 "order_events_consumer: malformed message — left for retry/DLQ",
@@ -93,7 +93,7 @@ class OrderEventsConsumer:
         except ClientError as exc:
             logger.error("order_events_consumer.delete_message failed", extra={"error": str(exc)})
 
-    def _dispatch(self, detail_type: str | None, detail: dict) -> None:
+    def _dispatch(self, detail_type: str | None, detail: dict, message_id: str = "") -> None:
         if detail_type == "SubscriptionOrderDue":
             if jsonschema is not None and _SUBSCRIPTION_ORDER_DUE_SCHEMA is not None:
                 jsonschema.validate(detail, _SUBSCRIPTION_ORDER_DUE_SCHEMA)
@@ -104,6 +104,7 @@ class OrderEventsConsumer:
                 quantity=detail["quantity"],
                 delivery_date=date.fromisoformat(detail["deliveryDate"]),
                 correlation_id=detail.get("correlationId"),
+                claim_owner=f"sqs:{message_id}",
             )
             return
         logger.info("order_events_consumer: unhandled", extra={"dt": detail_type})

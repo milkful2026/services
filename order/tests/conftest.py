@@ -3,6 +3,8 @@
 AWS, DB, or network.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
@@ -15,6 +17,7 @@ from domain.exceptions import (
     AddressLookupUnavailableError,
     CartUnavailableError,
     CartVersionConflictError,
+    DebitVoidedError,
     PricingUnavailableError,
     ProductPricingUnknownError,
     SubscriptionRejectedError,
@@ -22,7 +25,7 @@ from domain.exceptions import (
     WalletBalanceUnavailableError,
     WalletUnavailableError,
 )
-from domain.models import DebitResult, Quote
+from domain.models import DebitLookup, DebitResult, Quote, Voided
 from domain.order_service import OrderService
 
 
@@ -34,6 +37,8 @@ def _env(monkeypatch):
     monkeypatch.setenv("ORDER_USER_INTERNAL_BASE_URL", "http://user.test")
     monkeypatch.setenv("ORDER_PRICING_BASE_URL", "http://pricing.test")
     monkeypatch.setenv("ORDER_WALLET_INTERNAL_BASE_URL", "http://wallet.test")
+    # Tests drive the sweep with run_once(); never start its thread.
+    monkeypatch.setenv("ORDER_SWEEP_ENABLED", "false")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-south-1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
@@ -111,16 +116,47 @@ class FakeWalletClient:
         # MA-136 — balance read (paise) for checkout's pre-check.
         self.balance_paise = 100_000
         self.raise_balance_unavailable = False
+        # MA-142 — Wallet's ledger (order_id -> debit) and voids (order_id ->
+        # voided_at). Like the real one, an order never has both.
+        self.debited: dict[str, DebitLookup] = {}
+        self.voided: dict[str, datetime] = {}
+        self.raise_void_unavailable = False
+        self.void_calls: list[str] = []
 
     def debit(self, user_id: str, order_id: str, amount_paise: int, correlation_id: str):
         self.calls.append((user_id, order_id, amount_paise))
         if self.raise_unavailable:
             raise WalletUnavailableError("fake unavailable")
+        if order_id in self.debited:  # replay
+            return DebitResult(
+                status="DEBITED", balance_after_paise=self.debited[order_id].balance_after_paise
+            )
+        if order_id in self.voided:
+            raise DebitVoidedError("fake voided", {"orderId": order_id})
         if self.result_status == "DEBITED":
+            self.debited[order_id] = DebitLookup(
+                amount_paise=amount_paise,
+                balance_after_paise=self.balance_paise - amount_paise,
+                debited_at=datetime.now(UTC),
+            )
             return DebitResult(
                 status="DEBITED", balance_after_paise=self.balance_paise - amount_paise
             )
         return DebitResult(status=self.result_status, balance_after_paise=self.balance_paise)
+
+    def void_debit(self, user_id: str, order_id: str) -> Voided | DebitLookup:
+        self.void_calls.append(order_id)
+        if self.raise_void_unavailable:
+            raise WalletUnavailableError("fake unavailable")
+        if order_id in self.debited:
+            return self.debited[order_id]
+        self.voided.setdefault(order_id, datetime.now(UTC))
+        return Voided(self.voided[order_id])
+
+    def get_debit(self, order_id: str) -> DebitLookup | Voided | None:
+        if order_id in self.debited:
+            return self.debited[order_id]
+        return Voided(self.voided[order_id]) if order_id in self.voided else None
 
     def get_balance(self, user_id: str) -> int:
         if self.raise_balance_unavailable:

@@ -206,3 +206,46 @@ class SubscriptionRejectedError(OrderError):
 class WalletBalanceUnavailableError(OrderError):
     error_code = "WALLET_UNAVAILABLE"
     http_status = 503
+
+
+class DebitVoidedError(OrderError):
+    """MA-142 FR-6 — Wallet refused the debit (`409 DEBIT_VOIDED`): another
+    worker voided this order while closing it without charge. Never
+    retried; the order must not be charged."""
+
+    error_code = "DEBIT_VOIDED"
+    http_status = 409
+
+
+class OrderBusyError(OrderError):
+    """MA-143 FR-5 — another worker (the sweep) holds this order's lease.
+    Raised on the SQS resume path only; the consumer leaves the message
+    unacked, and the redelivery finds the order terminal and no-ops."""
+
+    error_code = "ORDER_BUSY"
+    http_status = 409
+
+
+class CheckoutCancelledError(OrderError):
+    """MA-144 PD-1 — the checkout was abandoned before any charge and its
+    delivery date passed the cut-off, so it was cancelled without charging.
+    Any code the app doesn't know clears its pending key (MA-137), so the
+    next Confirm starts afresh."""
+
+    error_code = "CHECKOUT_CANCELLED"
+    http_status = 409
+
+
+class CheckoutNeedsAttentionError(OrderError):
+    """MA-144 FR-5 — replay of a checkout the sweep escalated."""
+
+    error_code = "CHECKOUT_NEEDS_ATTENTION"
+    http_status = 409
+
+
+class LeaseLostError(OrderError):
+    """MA-144 — this worker's lease on a record expired and someone else
+    took it over. Internal: stop without writing anything further."""
+
+    error_code = "LEASE_LOST"
+    http_status = 409

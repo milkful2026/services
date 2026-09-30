@@ -1,16 +1,17 @@
 """SQLAlchemy Core repository for `orders` / `order_items` / `checkouts` /
-`outbox`.
+`carried_subscription_keys` / `outbox`.
 
 SQLAlchemy Core only (mirrors wallet/subscription/catalog/inventory) —
 the same Table definitions run against Postgres (production) and an
 in-memory SQLite engine (tests). Table columns are kept column-for-column
-compatible with migrations/0001_orders.sql + 0002_checkout.sql by hand.
+compatible with migrations/0001_orders.sql + 0002_checkout.sql +
+0003_sweep.sql by hand.
 """
 
 import base64
 import json
 import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from shared.adapters.db_operation import SqlAlchemyOperationMixin
 from shared.adapters.json_column import JSONColumn
@@ -28,22 +29,34 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    case,
     func,
     select,
     text,
 )
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from domain.checkout_models import (
+    TERMINAL_CHECKOUT_STATUSES,
     Checkout,
     CheckoutLine,
     CheckoutStatus,
     CheckoutStep,
     SubscriptionLineResult,
 )
-from domain.exceptions import CheckoutInProgressError, ServiceUnavailableError
-from domain.models import Order, OrderItem, OrderSource, OrdersPage, OrderStatus
+from domain.exceptions import CheckoutInProgressError, LeaseLostError, ServiceUnavailableError
+from domain.models import (
+    FAILURE_CUTOFF_PASSED,
+    FAILURE_SWEEP_EXHAUSTED,
+    ChargeState,
+    Order,
+    OrderItem,
+    OrderSource,
+    OrdersPage,
+    OrderStatus,
+)
 
 metadata = MetaData()
 
@@ -75,6 +88,12 @@ orders_table = Table(
         server_default=OrderSource.SUBSCRIPTION.value,
     ),
     Column("checkout_id", String(64), nullable=True, unique=True),
+    # MA-143 sweep lease / attempt bookkeeping (0003_sweep.sql).
+    Column("sweep_attempts", Integer, nullable=False, default=0, server_default="0"),
+    Column("claimed_until", DateTime(timezone=True), nullable=True),
+    Column("claim_owner", String(64), nullable=True),
+    Column("last_sweep_error", Text, nullable=True),
+    Column("charge_state", String(16), nullable=True),
     UniqueConstraint(
         "subscription_id", "delivery_date", name="uq_orders_subscription_delivery_date"
     ),
@@ -112,6 +131,11 @@ checkouts_table = Table(
     Column("result", JSONColumn(), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    # MA-143 sweep lease / attempt bookkeeping (0003_sweep.sql).
+    Column("sweep_attempts", Integer, nullable=False, default=0, server_default="0"),
+    Column("claimed_until", DateTime(timezone=True), nullable=True),
+    Column("claim_owner", String(64), nullable=True),
+    Column("last_sweep_error", Text, nullable=True),
     UniqueConstraint("user_id", "idempotency_key", name="uq_checkouts_user_key"),
     # At most one live checkout per user — both dialects support partial
     # unique indexes, so SQLite tests exercise the same guard as Postgres.
@@ -122,6 +146,18 @@ checkouts_table = Table(
         sqlite_where=text("status = 'IN_PROGRESS'"),
         postgresql_where=text("status = 'IN_PROGRESS'"),
     ),
+)
+
+# MA-144 FR-4a (PD-2): a subscription create whose outcome is unknown,
+# carried to the next checkout of the same cart line (0003_sweep.sql).
+carried_subscription_keys_table = Table(
+    "carried_subscription_keys",
+    metadata,
+    Column("user_id", String(64), primary_key=True),
+    Column("cart_line_id", String(64), primary_key=True),
+    Column("idempotency_key", String(128), nullable=False),
+    Column("checkout_id", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
 outbox_table = Table(
@@ -207,7 +243,11 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                         orders_table.c.id == order_id,
                         orders_table.c.status == OrderStatus.CREATED.value,
                     )
-                    .values(status=OrderStatus.CONFIRMED.value, confirmed_at=confirmed_at)
+                    .values(
+                        status=OrderStatus.CONFIRMED.value,
+                        confirmed_at=confirmed_at,
+                        **_LEASE_CLEARED,
+                    )
                 )
                 if result.rowcount:
                     # Only the caller that actually transitions
@@ -241,7 +281,11 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                         orders_table.c.id == order_id,
                         orders_table.c.status == OrderStatus.CREATED.value,
                     )
-                    .values(status=OrderStatus.PAYMENT_FAILED.value, failure_reason=failure_reason)
+                    .values(
+                        status=OrderStatus.PAYMENT_FAILED.value,
+                        failure_reason=failure_reason,
+                        **_LEASE_CLEARED,
+                    )
                 )
                 if result.rowcount:
                     # Same concurrent-redelivery guard as mark_confirmed.
@@ -378,7 +422,22 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                 ).fetchone()
         return None if row is None else _row_to_checkout(row)
 
-    def start_checkout(self, checkout: Checkout, order: Order | None) -> Checkout:
+    def get_checkout_by_id(self, checkout_id: str) -> Checkout | None:
+        with self._db_operation("get_checkout_by_id", "Failed to load checkout"):
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(checkouts_table).where(checkouts_table.c.id == checkout_id)
+                ).fetchone()
+        return None if row is None else _row_to_checkout(row)
+
+    def start_checkout(
+        self,
+        checkout: Checkout,
+        order: Order | None,
+        *,
+        claim_owner: str | None = None,
+        lease_seconds: float = 0,
+    ) -> Checkout:
         """One transaction: the IN_PROGRESS checkout row, plus — when there
         are one-time lines — its CREATED order and order_items. A race on
         the same (user, key) returns the winner's row (the caller resumes
@@ -401,6 +460,11 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                             order_id=checkout.order_id,
                             subscription_results=[],
                             result=None,
+                            # MA-144: the starting request holds the lease.
+                            claim_owner=claim_owner,
+                            claimed_until=(
+                                self._db_now_plus(lease_seconds) if claim_owner else None
+                            ),
                         )
                     )
                     if order is not None:
@@ -449,12 +513,21 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
         status: CheckoutStatus | None = None,
         subscription_results: list[SubscriptionLineResult] | None = None,
         result: dict | None = None,
+        user_id: str | None = None,
+        carry_keys: dict[str, str] | None = None,
+        forget_line_ids: list[str] | None = None,
     ) -> None:
+        """`carry_keys` ({lineId: idempotency key}) and `forget_line_ids`
+        (MA-144 FR-4a) change `user_id`'s carried subscription keys in the
+        same transaction as the checkout update: carried with the PD-2
+        FAILED results, forgotten with a line's definitive result."""
         values: dict = {"updated_at": func.now()}
         if step is not None:
             values["step"] = step.value
         if status is not None:
             values["status"] = status.value
+            if status in TERMINAL_CHECKOUT_STATUSES:
+                values.update(_LEASE_CLEARED)  # MA-144: a finished checkout holds nothing
         if subscription_results is not None:
             values["subscription_results"] = [r.to_dict() for r in subscription_results]
         if result is not None:
@@ -466,6 +539,376 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                     .where(checkouts_table.c.id == checkout_id)
                     .values(**values)
                 )
+                for line_id, key in (carry_keys or {}).items():
+                    # ON CONFLICT DO NOTHING: a line that fails again keeps
+                    # the key its first attempt used.
+                    conn.execute(
+                        self._insert(carried_subscription_keys_table)
+                        .values(
+                            user_id=user_id,
+                            cart_line_id=line_id,
+                            idempotency_key=key,
+                            checkout_id=checkout_id,
+                        )
+                        .on_conflict_do_nothing(index_elements=["user_id", "cart_line_id"])
+                    )
+                if forget_line_ids:
+                    conn.execute(
+                        carried_subscription_keys_table.delete().where(
+                            carried_subscription_keys_table.c.user_id == user_id,
+                            carried_subscription_keys_table.c.cart_line_id.in_(forget_line_ids),
+                        )
+                    )
+
+    def get_carried_keys(self, user_id: str) -> dict[str, tuple[str, str]]:
+        """MA-144 FR-4a — {cart line id: (idempotency key, checkout id that
+        carried it)} for `user_id`."""
+        with self._db_operation("get_carried_keys", "Failed to load carried keys"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(carried_subscription_keys_table).where(
+                        carried_subscription_keys_table.c.user_id == user_id
+                    )
+                ).fetchall()
+        return {r.cart_line_id: (r.idempotency_key, r.checkout_id) for r in rows}
+
+    def _insert(self, table):
+        dialect = postgresql if self._engine.dialect.name == "postgresql" else sqlite
+        return dialect.insert(table)
+
+    # --- MA-143: sweep lease + selection ---
+    #
+    # Every lease timestamp comes from the database clock (never the app's),
+    # so tasks with skewed clocks agree on whether a lease has expired.
+    # None of these touch `updated_at`: a claim alone must not make a stuck
+    # checkout look fresh to the next sweep run.
+
+    def _db_now_plus(self, seconds: float):
+        if self._engine.dialect.name == "sqlite":
+            # SQLite has no interval type; datetime('now', '+N seconds') is UTC,
+            # in the same 'YYYY-MM-DD HH:MM:SS' shape SQLAlchemy stores.
+            return func.datetime("now", f"{seconds:+.0f} seconds")
+        return func.now() + timedelta(seconds=seconds)
+
+    def _lease_free(self, table):
+        return table.c.claimed_until.is_(None) | (table.c.claimed_until < self._db_now_plus(0))
+
+    def _claim(self, table, record_id: str, owner: str, lease_seconds: float, *where) -> bool:
+        with self._db_operation("claim", "Failed to claim record"):
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    table.update()
+                    .where(table.c.id == record_id, self._lease_free(table), *where)
+                    .values(claimed_until=self._db_now_plus(lease_seconds), claim_owner=owner)
+                )
+        return result.rowcount == 1
+
+    def _renew(self, table, record_id: str, owner: str, lease_seconds: float) -> bool:
+        with self._db_operation("renew", "Failed to renew lease"):
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    table.update()
+                    .where(table.c.id == record_id, table.c.claim_owner == owner)
+                    .values(claimed_until=self._db_now_plus(lease_seconds))
+                )
+        return result.rowcount == 1
+
+    def _release(self, table, record_id: str, owner: str) -> None:
+        with self._db_operation("release", "Failed to release lease"):
+            with self._engine.begin() as conn:
+                conn.execute(
+                    table.update()
+                    .where(table.c.id == record_id, table.c.claim_owner == owner)
+                    .values(**_LEASE_CLEARED)
+                )
+
+    def claim_order(self, order_id: str, owner: str, lease_seconds: float) -> bool:
+        """Leases a CREATED order to `owner`; False if anyone else holds it."""
+        return self._claim(
+            orders_table,
+            order_id,
+            owner,
+            lease_seconds,
+            orders_table.c.status == OrderStatus.CREATED.value,
+        )
+
+    def renew_order(self, order_id: str, owner: str, lease_seconds: float) -> bool:
+        return self._renew(orders_table, order_id, owner, lease_seconds)
+
+    def release_order(self, order_id: str, owner: str) -> None:
+        self._release(orders_table, order_id, owner)
+
+    def list_stale_subscription_orders(self, older_than_seconds: float, limit: int) -> list[str]:
+        with self._db_operation("list_stale_subscription_orders", "Failed to list orders"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(orders_table.c.id)
+                    .where(
+                        orders_table.c.source == OrderSource.SUBSCRIPTION.value,
+                        orders_table.c.status == OrderStatus.CREATED.value,
+                        orders_table.c.created_at < self._db_now_plus(-older_than_seconds),
+                        self._lease_free(orders_table),
+                    )
+                    .order_by(orders_table.c.created_at)
+                    .limit(limit)
+                ).fetchall()
+        return [r.id for r in rows]
+
+    def record_order_sweep_failure(
+        self, order_id: str, owner: str, error_code: str, max_attempts: int
+    ) -> bool:
+        """One failed sweep attempt: +1 attempt, remember why, release the
+        lease, and escalate to NEEDS_ATTENTION(SWEEP_EXHAUSTED) in the same
+        update if that reaches `max_attempts` — with charge_state UNKNOWN,
+        since no void succeeded (the settle pass resolves it). Returns
+        whether it escalated."""
+        exhausted = orders_table.c.sweep_attempts + 1 >= max_attempts
+        with self._db_operation("record_order_sweep_failure", "Failed to record attempt"):
+            with self._engine.begin() as conn:
+                conn.execute(
+                    orders_table.update()
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.claim_owner == owner,
+                        orders_table.c.status == OrderStatus.CREATED.value,
+                    )
+                    .values(
+                        sweep_attempts=orders_table.c.sweep_attempts + 1,
+                        last_sweep_error=error_code,
+                        status=case(
+                            (exhausted, OrderStatus.NEEDS_ATTENTION.value),
+                            else_=orders_table.c.status,
+                        ),
+                        failure_reason=case(
+                            (exhausted, FAILURE_SWEEP_EXHAUSTED),
+                            else_=orders_table.c.failure_reason,
+                        ),
+                        charge_state=case(
+                            (exhausted, ChargeState.UNKNOWN.value),
+                            else_=orders_table.c.charge_state,
+                        ),
+                        **_LEASE_CLEARED,
+                    )
+                )
+                status = conn.execute(
+                    select(orders_table.c.status).where(orders_table.c.id == order_id)
+                ).scalar_one()
+        return status == OrderStatus.NEEDS_ATTENTION.value
+
+    def close_order(self, order_id: str, owner: str, reason: str) -> bool:
+        """MA-143 FR-4a — CREATED -> NEEDS_ATTENTION(reason), NOT_CHARGED;
+        releases the lease. Only after Wallet voided the order."""
+        with self._db_operation("close_order", "Failed to close order"):
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    orders_table.update()
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.claim_owner == owner,
+                        orders_table.c.status == OrderStatus.CREATED.value,
+                    )
+                    .values(
+                        status=OrderStatus.NEEDS_ATTENTION.value,
+                        failure_reason=reason,
+                        charge_state=ChargeState.NOT_CHARGED.value,
+                        **_LEASE_CLEARED,
+                    )
+                )
+        return result.rowcount == 1
+
+    # --- MA-143 FR-4b: charge settle pass ---
+
+    def list_unknown_charge_orders(self, limit: int) -> list[str]:
+        with self._db_operation("list_unknown_charge_orders", "Failed to list orders"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(orders_table.c.id)
+                    .where(
+                        orders_table.c.status == OrderStatus.NEEDS_ATTENTION.value,
+                        orders_table.c.charge_state == ChargeState.UNKNOWN.value,
+                        self._lease_free(orders_table),
+                    )
+                    .order_by(orders_table.c.created_at)
+                    .limit(limit)
+                ).fetchall()
+        return [r.id for r in rows]
+
+    def claim_unknown_charge_order(self, order_id: str, owner: str, lease_seconds: float) -> bool:
+        return self._claim(
+            orders_table,
+            order_id,
+            owner,
+            lease_seconds,
+            orders_table.c.status == OrderStatus.NEEDS_ATTENTION.value,
+            orders_table.c.charge_state == ChargeState.UNKNOWN.value,
+        )
+
+    def settle_charge_state(self, order_id: str, owner: str, charge_state: ChargeState) -> bool:
+        """UNKNOWN -> what Wallet said; releases the lease. `status` never
+        changes here."""
+        with self._db_operation("settle_charge_state", "Failed to settle charge"):
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    orders_table.update()
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.claim_owner == owner,
+                        orders_table.c.charge_state == ChargeState.UNKNOWN.value,
+                    )
+                    .values(charge_state=charge_state.value, **_LEASE_CLEARED)
+                )
+        return result.rowcount == 1
+
+    # --- MA-144: checkout lease + recovery ---
+
+    def claim_checkout(self, checkout_id: str, owner: str, lease_seconds: float) -> bool:
+        """Leases an IN_PROGRESS checkout to `owner`; False if anyone else holds it."""
+        return self._claim(
+            checkouts_table,
+            checkout_id,
+            owner,
+            lease_seconds,
+            checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+        )
+
+    def renew_checkout(self, checkout_id: str, owner: str, lease_seconds: float) -> bool:
+        return self._renew(checkouts_table, checkout_id, owner, lease_seconds)
+
+    def release_checkout(self, checkout_id: str, owner: str) -> None:
+        self._release(checkouts_table, checkout_id, owner)
+
+    def lease_remaining_seconds(self, checkout_id: str) -> float | None:
+        """For `retryAfterSeconds` only — a hint, so the app clock is fine here."""
+        with self._db_operation("lease_remaining_seconds", "Failed to load checkout"):
+            with self._engine.connect() as conn:
+                claimed_until = conn.execute(
+                    select(checkouts_table.c.claimed_until).where(
+                        checkouts_table.c.id == checkout_id
+                    )
+                ).scalar_one_or_none()
+        if claimed_until is None:
+            return None
+        if claimed_until.tzinfo is None:
+            claimed_until = claimed_until.replace(tzinfo=UTC)  # SQLite drops the offset
+        return (claimed_until - datetime.now(UTC)).total_seconds()
+
+    def list_stale_checkouts(self, older_than_seconds: float, limit: int) -> list[str]:
+        with self._db_operation("list_stale_checkouts", "Failed to list checkouts"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(checkouts_table.c.id)
+                    .where(
+                        checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+                        checkouts_table.c.updated_at < self._db_now_plus(-older_than_seconds),
+                        self._lease_free(checkouts_table),
+                    )
+                    .order_by(checkouts_table.c.updated_at)
+                    .limit(limit)
+                ).fetchall()
+        return [r.id for r in rows]
+
+    def record_checkout_sweep_failure(self, checkout_id: str, owner: str, error_code: str) -> int:
+        """+1 sweep attempt and the reason; returns the new count. Keeps the
+        lease — the sweep decides next (release, escalate or finish), which
+        depends on how far the checkout got."""
+        with self._db_operation("record_checkout_sweep_failure", "Failed to record attempt"):
+            with self._engine.begin() as conn:
+                conn.execute(
+                    checkouts_table.update()
+                    .where(
+                        checkouts_table.c.id == checkout_id,
+                        checkouts_table.c.claim_owner == owner,
+                    )
+                    .values(
+                        sweep_attempts=checkouts_table.c.sweep_attempts + 1,
+                        last_sweep_error=error_code,
+                    )
+                )
+                return int(
+                    conn.execute(
+                        select(checkouts_table.c.sweep_attempts).where(
+                            checkouts_table.c.id == checkout_id
+                        )
+                    ).scalar_one()
+                )
+
+    def cancel_checkout_and_order(
+        self, checkout_id: str, order_id: str, owner: str, result: dict
+    ) -> None:
+        """PD-1, one transaction: the never-charged order (voided in Wallet,
+        or ₹0) -> CANCELLED, NOT_CHARGED, and the checkout -> CANCELLED
+        (lease and one-live lock released). Either both
+        change or neither: a guard that matches nothing raises LeaseLostError
+        and rolls back."""
+        with self._db_operation("cancel_checkout_and_order", "Failed to cancel checkout"):
+            with self._engine.begin() as conn:
+                order_rows = conn.execute(
+                    orders_table.update()
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.status == OrderStatus.CREATED.value,
+                    )
+                    .values(
+                        status=OrderStatus.CANCELLED.value,
+                        failure_reason=FAILURE_CUTOFF_PASSED,
+                        charge_state=ChargeState.NOT_CHARGED.value,
+                    )
+                ).rowcount
+                checkout_rows = conn.execute(
+                    checkouts_table.update()
+                    .where(
+                        checkouts_table.c.id == checkout_id,
+                        checkouts_table.c.claim_owner == owner,
+                        checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+                    )
+                    .values(
+                        status=CheckoutStatus.CANCELLED.value,
+                        result=result,
+                        updated_at=func.now(),
+                        **_LEASE_CLEARED,
+                    )
+                ).rowcount
+                if order_rows != 1 or checkout_rows != 1:
+                    raise LeaseLostError(
+                        "Checkout or order changed underneath the cancel",
+                        {"checkoutId": checkout_id},
+                    )
+
+    def escalate_checkout(
+        self, checkout_id: str, owner: str, error_code: str, order_id: str | None
+    ) -> None:
+        """Checkout -> NEEDS_ATTENTION (lease and one-live lock released) and,
+        if given and still unpaid, its order -> NEEDS_ATTENTION(SWEEP_EXHAUSTED)
+        with charge_state UNKNOWN for the settle pass."""
+        with self._db_operation("escalate_checkout", "Failed to escalate checkout"):
+            with self._engine.begin() as conn:
+                conn.execute(
+                    checkouts_table.update()
+                    .where(
+                        checkouts_table.c.id == checkout_id,
+                        checkouts_table.c.claim_owner == owner,
+                        checkouts_table.c.status == CheckoutStatus.IN_PROGRESS.value,
+                    )
+                    .values(
+                        status=CheckoutStatus.NEEDS_ATTENTION.value,
+                        last_sweep_error=error_code,
+                        updated_at=func.now(),
+                        **_LEASE_CLEARED,
+                    )
+                )
+                if order_id is not None:
+                    conn.execute(
+                        orders_table.update()
+                        .where(
+                            orders_table.c.id == order_id,
+                            orders_table.c.status == OrderStatus.CREATED.value,
+                        )
+                        .values(
+                            status=OrderStatus.NEEDS_ATTENTION.value,
+                            failure_reason=FAILURE_SWEEP_EXHAUSTED,
+                            charge_state=ChargeState.UNKNOWN.value,
+                        )
+                    )
 
     # --- outbox (used by the publisher handler) ---
 
@@ -488,6 +931,9 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                     .where(outbox_table.c.id == outbox_id)
                     .values(published_at=func.now())
                 )
+
+
+_LEASE_CLEARED = {"claimed_until": None, "claim_owner": None}
 
 
 def new_order_id() -> str:
@@ -519,6 +965,11 @@ def _row_to_order(row, items: list[OrderItem] | None = None) -> Order:
         source=OrderSource(row.source),
         checkout_id=row.checkout_id,
         items=items or [],
+        sweep_attempts=int(row.sweep_attempts or 0),
+        claimed_until=row.claimed_until,
+        claim_owner=row.claim_owner,
+        last_sweep_error=row.last_sweep_error,
+        charge_state=ChargeState(row.charge_state) if row.charge_state else None,
     )
 
 
@@ -539,4 +990,8 @@ def _row_to_checkout(row) -> Checkout:
         ],
         result=row.result,
         updated_at=row.updated_at,
+        sweep_attempts=int(row.sweep_attempts or 0),
+        claimed_until=row.claimed_until,
+        claim_owner=row.claim_owner,
+        last_sweep_error=row.last_sweep_error,
     )
