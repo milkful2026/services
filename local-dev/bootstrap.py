@@ -445,6 +445,42 @@ def bootstrap_wallet_events_queue() -> str:
     return queue_url
 
 
+def bootstrap_subscription_events_queue() -> str:
+    """MA-140's `subscription-events-q` — Subscription Service's own SQS
+    consumer queue, fed by User Service's `user.status.changed` (MA-139),
+    routed here by an EventBridge rule filtered to `detail.newStatus` in
+    `[Suspended, Deactivated]` (spec §6's `UserStatusChangedRule`) — a
+    reactivation (`newStatus = Active`) never reaches this queue at all,
+    per MA-39's D2/this spec's one-directional (pause-only) design.
+    Same queue-with-DLQ shape as `wallet-events-q`/`order-events-q`
+    above; a new, separate queue rather than sharing one, per spec §11
+    point 3 (unrelated event sources shouldn't share a failure/redrive
+    domain)."""
+    sqs = boto3.client("sqs", **_creds)
+    events = boto3.client("events", **_creds)
+
+    _dlq_url, dlq_arn = _get_or_create_queue(sqs, "subscription-events-q-dlq")
+    queue_url, queue_arn = _get_or_create_queue(
+        sqs,
+        "subscription-events-q",
+        Attributes={
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
+        },
+    )
+    _wire_rule(
+        events,
+        "UserStatusChangedRule",
+        {
+            "source": ["user"],
+            "detail-type": ["user.status.changed"],
+            "detail": {"payload": {"newStatus": ["Suspended", "Deactivated"]}},
+        },
+        "user-status-changed-target",
+        queue_arn,
+    )
+    return queue_url
+
+
 def _write_env_file(service_dir: str, values: dict[str, str]) -> None:
     # Overridable so the one-shot "bootstrap" compose service can write
     # each service's .env.local into a shared docker volume (mounted at
@@ -479,6 +515,7 @@ def main() -> None:
     stock_changed_queue_url = bootstrap_stock_changed_queue()
     wallet_events_queue_url = bootstrap_wallet_events_queue()
     order_events_queue_url = bootstrap_order_events_queue()
+    subscription_events_queue_url = bootstrap_subscription_events_queue()
 
     # AWS_ENDPOINT_URL (unprefixed): the standard env var name botocore
     # itself reads natively — written once per service's .env.local so
@@ -619,6 +656,8 @@ def main() -> None:
             "AWS_ENDPOINT_URL": ENDPOINT_URL,
             "SUBSCRIPTION_EVENT_BUS_NAME": "default",
             "SUBSCRIPTION_CATALOG_BASE_URL": CATALOG_HTTP_URL,
+            # MA-140 — consumes User Service's user.status.changed.
+            "SUBSCRIPTION_USER_STATUS_EVENTS_QUEUE_URL": subscription_events_queue_url,
             # Local dev only — Flutter web's browser-origin CORS block,
             # same reasoning as inventory/catalog/wallet's identical entries.
             "SUBSCRIPTION_CORS_ALLOW_ALL": "true",

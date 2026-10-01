@@ -24,6 +24,10 @@ class Settings(BaseSettings):
 
     outbox_batch_size: int = 25
 
+    # MA-139 §4 FR-1 — admin customer list default page size, same
+    # pattern as identity-auth's own admin_default_page_size.
+    admin_default_page_size: int = 20
+
 
 def get_settings() -> Settings:
     """Instantiated lazily so tests can inject env vars before first access."""

@@ -20,6 +20,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from domain.exceptions import (
+    AccountDeactivatedError,
     ExternalServiceUnavailableError,
     InvalidRefreshTokenError,
     SocialAccountConflictError,
@@ -225,6 +226,21 @@ class CognitoAdapter:
                 AuthParameters={"USERNAME": username, "PASSWORD": password},
             )
         except ClientError as exc:
+            # MA-39/MA-139 §8 checklist item — a consumer account
+            # disabled via User Service's AdminDisableUser (suspend/
+            # deactivate) makes AdminInitiateAuth fail with
+            # NotAuthorizedException("User is disabled."), same error
+            # code AdminInitiateAuth also uses for a wrong-password
+            # attempt — so this must check the message text, not just
+            # the error code, to tell the two apart. Same pattern
+            # revoke_token already uses below for its own error-code
+            # check; this is a message-text check specifically because
+            # Cognito has no distinct error *code* for "user is disabled"
+            # on this API (unlike, say, UserNotFoundException).
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            error_message = exc.response.get("Error", {}).get("Message", "")
+            if error_code == "NotAuthorizedException" and "disabled" in error_message.lower():
+                raise AccountDeactivatedError() from exc
             raise self._log_and_wrap("issue_tokens", exc) from exc
 
         result = auth_response["AuthenticationResult"]

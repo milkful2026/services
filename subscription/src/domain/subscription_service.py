@@ -317,6 +317,135 @@ class SubscriptionService:
         )
         return self._detail_response(updated, now)
 
+    def pause_for_account_status_change(
+        self, subscription_id: str, reason: str, now: datetime | None = None
+    ) -> None:
+        """MA-140 FR-2 — internal, system-initiated pause triggered by
+        User Service's `user.status.changed` event (MA-139), invoked only
+        from adapters/user_status_changed_consumer.py, never from any
+        public API route. Deliberately NOT a parameter added to `pause()`
+        above, which stays exactly as MA-131 built it (still customer-
+        only, still requires `user_id` ownership) — this method:
+
+        - Skips `_get_owned`'s ownership check entirely (ownership has no
+          meaning for a system-initiated call; there is no calling
+          customer to check against).
+        - Calls the exact same `self._repo.update_pause(...)` `pause()`
+          itself calls — `pause_from=today`, `pause_until=None`
+          (indefinite — MA-39's D2/§9: an account-level block overrides
+          any customer-set end date), `status=PAUSED`.
+        - Is idempotent: pausing a subscription that's already PAUSED
+          *indefinitely and already in effect* (`pause_until is None`
+          and `pause_from <= today`) is a no-op (checked before calling
+          the repository), so redelivering the same `user.status.changed`
+          event never double-writes. Two cases deliberately do NOT count
+          as already-satisfied, both per spec §9/FR-1: a PAUSED
+          subscription with a real `pause_until` (a customer's own
+          temporary pause, which this call still overrides to
+          indefinite — an account-level block is a stronger override
+          than the customer's original end date), and a PAUSED
+          subscription whose `pause_from` is still in the future (a
+          not-yet-started pause, which this call re-pins to start today
+          rather than waiting for its originally-scheduled date).
+
+        `reason` is accepted for traceability/log correlation (MA-140 §7
+        recommends NOT persisting it on the subscription row itself —
+        the source event's own userStatusHistory in User Service is the
+        durable "why" — so it's logged, not stored, here) but is not
+        currently used as a repository column; see this method's own
+        module-level flag in the PR description if that trade-off needs
+        revisiting.
+        """
+        sub = self._repo.get_by_id(subscription_id)
+        if sub is None:
+            raise SubscriptionNotFoundError(f"No subscription {subscription_id!r}")
+
+        now = now or datetime.now(IST)
+        today = now.astimezone(IST).date()
+
+        already_applied = (
+            sub.status == SubscriptionStatus.PAUSED
+            and sub.pause_until is None
+            and sub.pause_from is not None
+            and sub.pause_from <= today
+        )
+        if already_applied:
+            logger.info(
+                "subscription.pause_for_account_status_change: already paused indefinitely, no-op",
+                extra={"subscriptionId": subscription_id, "reason": reason},
+            )
+            return
+
+        self._repo.update_pause(
+            sub.id, pause_from=today, pause_until=None, status=SubscriptionStatus.PAUSED
+        )
+        logger.info(
+            "subscription.admin_pause",
+            extra={
+                "metric": "subscription.admin_pause.count",
+                "subscriptionId": subscription_id,
+                "reason": reason,
+            },
+        )
+
+    def handle_user_status_changed(
+        self, payload: dict, now: datetime | None = None
+    ) -> list[str]:
+        """MA-140 FR-1 — orchestrates the consumer's per-event work: given
+        a `user.status.changed` event's `payload` (MA-139 §8's contract —
+        `userId`, `newStatus`, among others), pauses every ACTIVE-or-not-
+        yet-started-PAUSED subscription for that user. Mirrors this
+        codebase's existing convention of a domain method taking the raw
+        event payload dict directly (see wallet's own
+        WalletService.create_wallet/credit_recharge).
+
+        Only acts when `newStatus` is Suspended or Deactivated — this
+        consumer is one-directional (no auto-resume on reactivation, per
+        MA-39's D2) — though in practice the EventBridge rule (see
+        services/local-dev/bootstrap.py) already filters this before the
+        message ever reaches this queue; this check is defense in depth,
+        not the only gate.
+        """
+        new_status = payload.get("newStatus")
+        if new_status not in ("Suspended", "Deactivated"):
+            logger.info(
+                "subscription.handle_user_status_changed: ignoring non-pause-triggering status",
+                extra={"newStatus": new_status},
+            )
+            return []
+
+        user_id = payload["userId"]
+        reason = f"account_{new_status.lower()}"
+        now = now or datetime.now(IST)
+        today = now.astimezone(IST).date()
+
+        # Spec FR-1 step 1 - every non-STOPPED subscription (ACTIVE, or any
+        # PAUSED subscription regardless of pause_from/pause_until) is a
+        # target - mirrors list_active()'s own "non-STOPPED" Daily Run
+        # filter precedent, just narrowed to this one user's subscriptions
+        # via list_by_user instead of a full-table scan. This must include
+        # a PAUSED subscription whose pause is already in effect today (a
+        # customer's own temporary pause with a real pause_until, or an
+        # already-indefinite admin pause), not just a not-yet-started one -
+        # deactivation/suspension is a stronger, indefinite override that
+        # must take effect even over an in-progress customer pause (MA-140
+        # section 9's "admin pause overwrites pause_until to None" edge
+        # case). We deliberately do not pre-filter out an already-
+        # indefinitely-paused subscription here; that idempotency is
+        # pause_for_account_status_change's own job (its already_applied
+        # no-op check), keeping this filter a single source of truth for
+        # "is this subscription a candidate at all" (STOPPED vs. not), not
+        # a second place status-transition rules have to be kept in sync.
+        targets = [
+            sub for sub in self._repo.list_by_user(user_id) if sub.status != SubscriptionStatus.STOPPED
+        ]
+
+        paused_ids: list[str] = []
+        for sub in targets:
+            self.pause_for_account_status_change(sub.id, reason, now=now)
+            paused_ids.append(sub.id)
+        return paused_ids
+
     def resume(self, subscription_id: str, user_id: str, *, now: datetime | None = None) -> dict:
         sub = self._get_owned(subscription_id, user_id)
         if sub.status == SubscriptionStatus.STOPPED:

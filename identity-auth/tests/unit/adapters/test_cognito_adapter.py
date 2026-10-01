@@ -14,6 +14,7 @@ from botocore.exceptions import ClientError
 
 from adapters.cognito_adapter import CognitoAdapter
 from domain.exceptions import (
+    AccountDeactivatedError,
     ExternalServiceUnavailableError,
     InvalidRefreshTokenError,
     SocialAccountConflictError,
@@ -134,6 +135,56 @@ def test_register_and_issue_tokens_wraps_client_error(adapter, monkeypatch):
 
     with pytest.raises(ExternalServiceUnavailableError):
         adapter.register_and_issue_tokens("+919876543210")
+
+
+def test_issue_tokens_maps_disabled_user_to_account_deactivated_error(adapter, monkeypatch):
+    """MA-39/MA-139 §8 checklist item — a consumer account disabled via
+    User Service's AdminDisableUser makes real Cognito's
+    AdminInitiateAuth fail with NotAuthorizedException("User is
+    disabled."); this must surface as a clean, actionable
+    AccountDeactivatedError (403), not the generic 503
+    ExternalServiceUnavailableError every other ClientError gets. moto
+    doesn't model a disabled user rejecting AdminInitiateAuth (known
+    fidelity gap, this module's own docstring), so this is verified via
+    monkeypatch, same as test_register_and_issue_tokens_wraps_client_error
+    above."""
+
+    adapter.register_and_issue_tokens("+919876543210")  # user must already exist in moto
+
+    def _raise(*args, **kwargs):
+        raise ClientError(
+            {"Error": {"Code": "NotAuthorizedException", "Message": "User is disabled."}},
+            "AdminInitiateAuth",
+        )
+
+    monkeypatch.setattr(adapter._client, "admin_initiate_auth", _raise)
+
+    with pytest.raises(AccountDeactivatedError):
+        adapter.issue_tokens("+919876543210")
+
+
+def test_issue_tokens_wrong_password_style_not_authorized_is_not_account_deactivated(
+    adapter, monkeypatch
+):
+    """The same NotAuthorizedException error CODE also covers other
+    causes (e.g. AdminInitiateAuth's own precondition failures) — only
+    the "disabled" message text is specific to a deactivated account, so
+    a differently-worded NotAuthorizedException must still fall through
+    to the generic external-service-unavailable mapping, not be
+    misreported as ACCOUNT_DEACTIVATED."""
+
+    adapter.register_and_issue_tokens("+919876543210")  # user must already exist in moto
+
+    def _raise(*args, **kwargs):
+        raise ClientError(
+            {"Error": {"Code": "NotAuthorizedException", "Message": "Something else entirely."}},
+            "AdminInitiateAuth",
+        )
+
+    monkeypatch.setattr(adapter._client, "admin_initiate_auth", _raise)
+
+    with pytest.raises(ExternalServiceUnavailableError):
+        adapter.issue_tokens("+919876543210")
 
 
 def test_revoke_token_calls_cognito_with_token_and_client_id(adapter, monkeypatch):
