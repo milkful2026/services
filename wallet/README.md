@@ -15,7 +15,7 @@ Service scaffold and carries both.
 |--------|------|------|---------|
 | GET | `/wallet/me` | Cognito JWT | Balance (paise), status, recharge bounds — the MA-24 shape MA-125 consumes |
 | GET | `/wallet/me/status` | Cognito JWT | **MA-1 legacy body** `{walletId, status, balance (whole rupees), currency}` — unchanged for MA-1's registration screen |
-| GET | `/wallet/me/transactions` | Cognito JWT | Paged (keyset), newest-first ledger — the contract MA-27 renders |
+| GET | `/wallet/me/transactions` | Cognito JWT | Paged (keyset), newest-first ledger — the contract MA-27 renders. Optional `types=RECHARGE,ORDER_DEBIT,…` (comma-separated ledger types, case-sensitive) filters inside the keyset query; an unknown type → 400 `VALIDATION_ERROR` (MA-148) |
 | POST | `/wallet/me/retry` | Cognito JWT | MA-1 replay of auto-provision |
 | GET | `/wallet/internal/limits` | SigV4 (VPC-only) | Recharge min/max for Payment Service (MA-126) |
 | POST | `/wallet/internal/debits/{orderId}/void` | SigV4 (VPC-only) | Body `{userId}`. Fences the order under the wallet row lock: 200 `VOIDED` (no debit for it can ever commit; the debit then returns 409 `DEBIT_VOIDED`), or 409 `ALREADY_DEBITED` with the debit if it landed first. Idempotent; never moves money. Order Service calls it before closing an order without charge (MA-142) |
@@ -39,6 +39,11 @@ balance_after_paise, ref TEXT UNIQUE, correlation_id, created_at)`,
 `SELECT … FOR UPDATE` on the wallet row make recharge crediting
 exactly-once. The void and the order debit take that same lock, so for
 any order at most one of {ledger debit, void} ever exists.
+
+**Ledger refs** (`ref` is UNIQUE): `order:{orderId}` for an order debit;
+`refund:{orderId}:{refundId}` is reserved for order refunds (MA-148 FR-3 —
+nothing writes `REFUND` yet; the future refund writer must use this format,
+with a `refundId` free of `:`, so the app can link a refund to its order).
 
 ## Local development
 

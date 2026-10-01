@@ -265,3 +265,66 @@ def test_void_invalid_id_is_400(client, bad):
     assert r.status_code == 400
     assert r.json()["data"]["errorCode"] == "VALIDATION_ERROR"
 
+
+# --- MA-148: ?types= filter ---
+
+
+def _seed_mixed(client, engine, service):
+    seed_wallet(engine, balance_paise=1_000_000)
+    for i in range(2):
+        service.credit_recharge(
+            {
+                "eventId": f"e{i}",
+                "correlationId": "c",
+                "paymentId": f"pay_{i}",
+                "userId": "user-1",
+                "purpose": "WALLET_RECHARGE",
+                "amountPaise": 10000,
+                "currency": "INR",
+                "razorpayPaymentId": f"rzp_{i}",
+                "razorpayOrderId": f"ro_{i}",
+            }
+        )
+    for i in range(3):
+        client.post(
+            "/wallet/internal/debit",
+            json={"userId": "user-1", "orderId": f"ord_{i}", "amountPaise": 1000},
+        )
+
+
+def test_transactions_types_filter(client, engine, service):
+    _seed_mixed(client, engine, service)
+    body = client.get("/wallet/me/transactions?types=RECHARGE", headers=_bearer()).json()["data"]
+    assert [i["type"] for i in body["items"]] == ["RECHARGE", "RECHARGE"]
+    assert body["nextCursor"] is None
+
+
+def test_transactions_unknown_type_is_400(client, engine):
+    seed_wallet(engine)
+    r = client.get("/wallet/me/transactions?types=BOGUS", headers=_bearer())
+    assert r.status_code == 400
+    data = r.json()["data"]
+    assert data["errorCode"] == "VALIDATION_ERROR"
+    assert data["field"] == "types"
+    assert data["invalid"] == ["BOGUS"]
+
+
+def test_transactions_filtered_cursor_stays_within_the_filter(client, engine, service):
+    _seed_mixed(client, engine, service)
+    first = client.get(
+        "/wallet/me/transactions?types=ORDER_DEBIT&limit=1", headers=_bearer()
+    ).json()["data"]
+    assert [i["ref"] for i in first["items"]] == ["order:ord_2"]
+    second = client.get(
+        f"/wallet/me/transactions?types=ORDER_DEBIT&limit=5&cursor={first['nextCursor']}",
+        headers=_bearer(),
+    ).json()["data"]
+    assert [i["ref"] for i in second["items"]] == ["order:ord_1", "order:ord_0"]
+    assert second["nextCursor"] is None
+
+
+def test_transactions_without_types_include_every_type(client, engine, service):
+    _seed_mixed(client, engine, service)
+    body = client.get("/wallet/me/transactions?limit=50", headers=_bearer()).json()["data"]
+    assert {i["type"] for i in body["items"]} == {"OPENING", "RECHARGE", "ORDER_DEBIT"}
+

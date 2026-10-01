@@ -33,8 +33,15 @@ class WalletRepositoryPort(Protocol):
         ...
 
     def list_ledger_entries(
-        self, wallet_id: str, limit: int, before: tuple[str, int] | None
-    ) -> list[LedgerEntry]: ...
+        self,
+        wallet_id: str,
+        limit: int,
+        before_id: int | None,
+        types: frozenset[LedgerType] | None = None,
+    ) -> list[LedgerEntry]:
+        """Newest first, entries with `id < before_id` when given; `types`
+        (MA-148) restricts to those ledger types."""
+        ...
 
     def get_ledger_entry_by_ref(self, ref: str) -> LedgerEntry | None:
         """MA-142 — plain read by the unique `ref`; no lock, no write."""
