@@ -45,16 +45,32 @@ _load_local_env_file()
 
 import uvicorn  # noqa: E402
 
+from adapters.catalog_updated_consumer import CatalogUpdatedConsumer  # noqa: E402
+from adapters.order_cancelled_consumer import OrderCancelledConsumer  # noqa: E402
+from adapters.stock_event_publisher import EventBridgeStockEventPublisher  # noqa: E402
+from adapters.stock_repository import SqlAlchemyStockRepository  # noqa: E402
 from adapters.zone_cache_adapter import RedisZoneCacheAdapter, build_redis_client  # noqa: E402
 from adapters.zone_update_consumer import ZoneUpdateConsumer  # noqa: E402
 from config.env import get_settings  # noqa: E402
+from domain.inventory_stock_service import InventoryStockService  # noqa: E402
+from handlers import ttl_sweep  # noqa: E402
 from handlers.app import app  # noqa: E402
 from handlers.health import consumer_health  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
-def _run_consumer() -> None:
+def _build_stock_service(settings) -> InventoryStockService:
+    engine = create_engine(settings.database_url)
+    repository = SqlAlchemyStockRepository(engine)
+    publisher = EventBridgeStockEventPublisher(
+        settings.event_bus_name, settings.event_source, settings.aws_region
+    )
+    return InventoryStockService(repository, publisher, settings.reservation_ttl_seconds)
+
+
+def _run_zone_update_consumer() -> None:
     try:
         settings = get_settings()
         zone_cache = RedisZoneCacheAdapter(
@@ -77,9 +93,57 @@ def _run_consumer() -> None:
         raise
 
 
+def _run_order_cancelled_consumer() -> None:
+    try:
+        settings = get_settings()
+        consumer = OrderCancelledConsumer(
+            queue_url=settings.order_cancelled_queue_url,
+            stock_service=_build_stock_service(settings),
+            region_name=settings.aws_region,
+        )
+        consumer.run_forever()
+    except Exception:
+        logger.critical(
+            "order_cancelled_consumer thread died — no longer consuming OrderCancelled events"
+        )
+        consumer_health.alive = False
+        raise
+
+
+def _run_catalog_updated_consumer() -> None:
+    try:
+        settings = get_settings()
+        consumer = CatalogUpdatedConsumer(
+            queue_url=settings.catalog_updated_queue_url,
+            stock_service=_build_stock_service(settings),
+            region_name=settings.aws_region,
+        )
+        consumer.run_forever()
+    except Exception:
+        logger.critical(
+            "catalog_updated_consumer thread died — no longer provisioning new products' stock rows"
+        )
+        consumer_health.alive = False
+        raise
+
+
+def _run_ttl_sweep() -> None:
+    try:
+        ttl_sweep.run_forever()
+    except Exception:
+        logger.critical("ttl_sweep thread died — expired reservations will not be auto-released")
+        consumer_health.alive = False
+        raise
+
+
 def main() -> None:
-    consumer_thread = threading.Thread(target=_run_consumer, daemon=True, name="zone-update-consumer")
-    consumer_thread.start()
+    for target, name in (
+        (_run_zone_update_consumer, "zone-update-consumer"),
+        (_run_order_cancelled_consumer, "order-cancelled-consumer"),
+        (_run_catalog_updated_consumer, "catalog-updated-consumer"),
+        (_run_ttl_sweep, "ttl-sweep"),
+    ):
+        threading.Thread(target=target, daemon=True, name=name).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)  # noqa: S104 — Fargate task, not exposed directly
 
 
