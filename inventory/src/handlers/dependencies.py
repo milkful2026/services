@@ -7,9 +7,12 @@ from functools import lru_cache
 
 from sqlalchemy import create_engine
 
+from adapters.stock_event_publisher import EventBridgeStockEventPublisher
+from adapters.stock_repository import SqlAlchemyStockRepository
 from adapters.zone_cache_adapter import RedisZoneCacheAdapter, build_redis_client
 from adapters.zone_repository import SqlAlchemyZoneRepository
 from config.env import get_settings
+from domain.inventory_stock_service import InventoryStockService
 from domain.serviceability_service import ServiceabilityService
 
 
@@ -22,3 +25,14 @@ def get_serviceability_service() -> ServiceabilityService:
         build_redis_client(settings.redis_host, settings.redis_port, settings.redis_use_tls)
     )
     return ServiceabilityService(repository, cache, settings.cache_ttl_seconds)
+
+
+@lru_cache
+def get_inventory_stock_service() -> InventoryStockService:
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    repository = SqlAlchemyStockRepository(engine)
+    publisher = EventBridgeStockEventPublisher(
+        settings.event_bus_name, settings.event_source, settings.aws_region
+    )
+    return InventoryStockService(repository, publisher, settings.reservation_ttl_seconds)

@@ -8,14 +8,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from domain.exceptions import InventoryError
+from handlers.admin_inventory_handler import router as admin_inventory_router
 from handlers.dto import error_envelope
 from handlers.health import consumer_health
 from handlers.internal_serviceability_check_handler import router as internal_router
+from handlers.inventory_handler import router as inventory_router
 from handlers.serviceability_check_handler import router as public_router
 
 app = FastAPI(title="Inventory Service")
 app.include_router(public_router)
 app.include_router(internal_router)
+app.include_router(inventory_router)
+app.include_router(admin_inventory_router)
 
 # Read directly from os.environ, not config.env.Settings — this runs at
 # import time (app-setup, before any request is handled), and Settings()
