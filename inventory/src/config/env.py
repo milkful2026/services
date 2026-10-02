@@ -25,6 +25,14 @@ class Settings(BaseSettings):
 
     zone_updated_queue_url: str = ""
 
+    # MA-118/MA-119/MA-150 ------------------------------------------------
+    event_bus_name: str = "default"
+    event_source: str = "inventory"  # matches bootstrap.py's StockChangedRule source pattern
+    reservation_ttl_seconds: int = 900  # 15 min default, MA-118 §12 Q1
+    ttl_sweep_interval_seconds: int = 30
+    order_cancelled_queue_url: str = ""
+    catalog_updated_queue_url: str = ""
+
     # Note: local-dev CORS support (INVENTORY_CORS_ALLOW_ALL) is read
     # directly from os.environ in handlers/app.py, not through this
     # class — see that file's comment for why (Settings' eager
