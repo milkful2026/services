@@ -5,15 +5,38 @@ wallet/user/cart/payment use).
 
 Wraps shared.adapters.outbox_event_publisher.EventBridgeOutboxPublisher
 (built for those services' outbox-polling loops, but its `publish()`
-method — stamp eventId/occurredAt if missing, retry, raise
-shared.errors.ServiceUnavailableError on exhaustion — is exactly the
-behavior a direct publish needs too; no reason to duplicate it) rather
-than hand-rolling a second boto3 `put_events` wrapper.
+method — retry, raise shared.errors.ServiceUnavailableError on
+exhaustion — is exactly the behavior a direct publish needs too; no
+reason to duplicate it) rather than hand-rolling a second boto3
+`put_events` wrapper.
+
+**Envelope shape, confirmed empirically while doing this story's own
+mandated live-verification step (impl-plan §3 step 3)**: FR-6's spec
+text shows its JSON example as a flat object (`eventId`, `productId`,
+...). But every *actual* SQS consumer already in this codebase —
+adapters/zone_update_consumer.py and, critically, Catalog's own
+stock_changed_consumer.py, the one this event exists to feed — parses
+`body["payload"][...]`, not the flat object directly. Publishing FR-6's
+fields flat (as its own JSON example literally shows) reached Catalog's
+real queue correctly (confirming the InputTransformer fix in
+local-dev/bootstrap.py's `_wire_rule` actually works end-to-end) but
+then failed inside Catalog's consumer with "failed to process message"
+— confirmed live, not hypothesized, against the running local-dev
+stack. Fixed here, not in Catalog: nesting FR-6's fields under
+`{"payload": {...}, "correlationId": ...}` is this repo's own
+established SQS envelope convention (used by every consumer that
+predates this story), and matching it is a one-file, inventory-only
+change versus editing Catalog's already-shipped, independently-owned
+consumer and its tests. FR-6's semantic field list is unchanged by
+this — only the wire-level wrapping the existing SQS consumers all
+already require.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import UTC, datetime
 
 from shared.adapters.outbox_event_publisher import EventBridgeOutboxPublisher
 from shared.errors import ServiceUnavailableError
@@ -44,8 +67,17 @@ class EventBridgeStockEventPublisher:
         )
 
     def _publish(self, detail_type: str, payload: dict) -> None:
+        # eventId/correlationId: a fresh uuid per publish (FR-6 — "it's
+        # what lets MA-116's consumer detect and ignore a redelivered
+        # duplicate"), stamped here rather than left to
+        # EventBridgeOutboxPublisher.publish()'s own setdefault (which
+        # would stamp the *outer* envelope, not inside "payload" where
+        # every consumer actually looks — see module docstring).
+        payload.setdefault("eventId", str(uuid.uuid4()))
+        payload.setdefault("occurredAt", datetime.now(UTC).isoformat())
+        envelope = {"payload": payload, "correlationId": payload["eventId"]}
         try:
-            self._publisher.publish(detail_type, payload)
+            self._publisher.publish(detail_type, envelope)
         except ServiceUnavailableError as exc:
             # A publish failure here is a secondary-effect failure (see
             # domain/inventory_stock_service.py's module docstring): the
