@@ -29,10 +29,57 @@ silently decided):
    `services/infrastructure/` — same reasoning as MA-92's stack.
 5. **Aurora Postgres Serverless v2** (cost-appropriate for a new,
    low-traffic service) rather than a provisioned cluster.
+6. **MA-48 (MA-118/MA-119/MA-150) additions**:
+   - `reserve`/`commit`/`release`/`GET /inventory/{productId}` are
+     deliberately **not** added to this stack's public HttpApi route
+     table at all — same "never registered, reachable only by hitting
+     the internal ALB directly from within the VPC" posture point 3
+     above already establishes for the serviceability internal route
+     (MA-118 §5 NFR: these are service-to-service calls from Cart/Order,
+     not Cognito-JWT customer traffic). See
+     `src/handlers/inventory_handler.py`'s own docstring.
+   - MA-119's `PATCH /inventory` and MA-150's four admin routes DO need
+     real public HttpApi routes (portal-ui, MA-151, calls them) — gated
+     by Identity & Auth's admin authorizer Lambda, referenced cross-stack
+     by ARN exactly like `user_stack.py`'s `admin_authorizer_fn_arn`
+     (MA-139 precedent), **inheriting that same placeholder-ARN gap**
+     rather than solving it twice (MA-150 §11 Risk 3's own framing).
+     Since this service's compute is Fargate-behind-an-ALB, not Lambda,
+     the authorizer's `{adminId, email, role}` context can't arrive for
+     free inside a Lambda `event` the way MA-139's routes get it — it's
+     forwarded via `HttpAlbIntegration`'s own `parameter_mapping`
+     (`$context.authorizer.lambda.*` -> `X-Admin-*` request headers),
+     read back on the FastAPI side by `src/handlers/admin_context.py`.
+     This exact header-forwarding path is a real, working API Gateway
+     feature, confirmed by reading the CDK L2 construct's own
+     `ParameterMapping`/`MappingValue.context_variable` API — not
+     invented here, but new to this codebase (every other admin route
+     elsewhere is Lambda-proxy, where this problem doesn't exist).
+   - New `order-cancelled`/`catalog-updated` SQS queues (+ DLQs) and
+     EventBridge rules, consumed by the two new background-thread
+     consumers (`src/adapters/order_cancelled_consumer.py`/
+     `catalog_updated_consumer.py`). Both rules' SQS target carries an
+     `InputTransformer` unwrapping EventBridge's own envelope down to
+     just its `detail` — **confirmed necessary, not precautionary**: the
+     *existing* `ZoneUpdatedRule` below has never had one and was never
+     actually exercised through a real EventBridge delivery (only ever
+     tested via a direct `send_message`, bypassing EventBridge
+     entirely) — this story's own mandated StockChanged live-
+     verification step caught that a plain SQS target (no transformer)
+     delivers `{"detail": {...}, ...}`, not the flat `{"payload":
+     {...}}` shape every consumer in this codebase actually parses.
+     `ZoneUpdatedRule` itself now carries the same `RuleTargetInput`
+     unwrap too (code-review finding, fixed alongside the two rules this
+     story adds — the bug class is identical, and the fix is one line).
+   - `events:PutEvents` on the default event bus, granted to the Fargate
+     task role — MA-118 FR-6's `StockChanged`/`LowStock` producer
+     (`src/adapters/stock_event_publisher.py`) needs this and nothing
+     in this stack granted it before now.
 """
 
 from aws_cdk import Duration, RemovalPolicy, Stack
 from aws_cdk import aws_apigatewayv2 as apigwv2
+from aws_cdk import aws_apigatewayv2_authorizers as apigwv2_authorizers
 from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecr as ecr
@@ -41,6 +88,8 @@ from aws_cdk import aws_elasticache as elasticache
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_rds as rds
 from aws_cdk import aws_sqs as sqs
@@ -48,13 +97,29 @@ from constructs import Construct
 
 
 class InventoryStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        # MA-48 (MA-119/MA-150) — placeholder until identity-auth's stack
+        # exports its real MA-129 admin authorizer function ARN (module
+        # docstring point 6, same gap user_stack.py's own
+        # admin_authorizer_fn_arn already carries). An obviously-fake ARN
+        # rather than None so a forgotten wire-up fails loudly at deploy
+        # time, not silently with an unauthenticated admin API.
+        admin_authorizer_fn_arn: str = (
+            "arn:aws:lambda:ap-south-1:000000000000:function:PLACEHOLDER-admin-authorizer"
+        ),
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         vpc = self._build_vpc()
         db_cluster, db_security_group = self._build_database(vpc)
         redis_endpoint, redis_security_group = self._build_redis(vpc)
         zone_updated_queue = self._build_queue()
+        order_cancelled_queue = self._build_order_cancelled_queue()
+        catalog_updated_queue = self._build_catalog_updated_queue()
 
         repository = ecr.Repository(
             self, "InventoryRepository", repository_name="milkful-inventory", removal_policy=RemovalPolicy.RETAIN
@@ -69,6 +134,8 @@ class InventoryStack(Stack):
             db_cluster=db_cluster,
             redis_endpoint=redis_endpoint,
             zone_updated_queue=zone_updated_queue,
+            order_cancelled_queue=order_cancelled_queue,
+            catalog_updated_queue=catalog_updated_queue,
         )
 
         db_security_group.add_ingress_rule(service_security_group, ec2.Port.tcp(5432), "Fargate -> Aurora")
@@ -85,8 +152,10 @@ class InventoryStack(Stack):
         )
 
         alb, listener = self._build_internal_alb(vpc, fargate_service, service_security_group)
-        self._build_http_api(vpc, alb, listener)
+        self._build_http_api(vpc, alb, listener, admin_authorizer_fn_arn)
         self._build_zone_updated_rule(zone_updated_queue)
+        self._build_order_cancelled_rule(order_cancelled_queue)
+        self._build_catalog_updated_rule(catalog_updated_queue)
 
     def _build_vpc(self) -> ec2.Vpc:
         return ec2.Vpc(
@@ -156,6 +225,32 @@ class InventoryStack(Stack):
             dead_letter_queue=sqs.DeadLetterQueue(max_receive_count=5, queue=dlq),
         )
 
+    def _build_order_cancelled_queue(self) -> sqs.Queue:
+        # MA-118 FR-5 — same queue+DLQ shape as `_build_queue` above.
+        dlq = sqs.Queue(
+            self, "OrderCancelledDLQ", queue_name="order-cancelled-dlq", retention_period=Duration.days(14)
+        )
+        return sqs.Queue(
+            self,
+            "OrderCancelledQueue",
+            queue_name="order-cancelled",
+            visibility_timeout=Duration.seconds(30),
+            dead_letter_queue=sqs.DeadLetterQueue(max_receive_count=5, queue=dlq),
+        )
+
+    def _build_catalog_updated_queue(self) -> sqs.Queue:
+        # MA-118 FR-8 — same queue+DLQ shape as `_build_queue` above.
+        dlq = sqs.Queue(
+            self, "CatalogUpdatedDLQ", queue_name="catalog-updated-dlq", retention_period=Duration.days(14)
+        )
+        return sqs.Queue(
+            self,
+            "CatalogUpdatedQueue",
+            queue_name="catalog-updated",
+            visibility_timeout=Duration.seconds(30),
+            dead_letter_queue=sqs.DeadLetterQueue(max_receive_count=5, queue=dlq),
+        )
+
     def _build_fargate_service(
         self,
         vpc: ec2.Vpc,
@@ -164,6 +259,8 @@ class InventoryStack(Stack):
         db_cluster: rds.DatabaseCluster,
         redis_endpoint: str,
         zone_updated_queue: sqs.Queue,
+        order_cancelled_queue: sqs.Queue,
+        catalog_updated_queue: sqs.Queue,
     ) -> tuple[ecs.FargateTaskDefinition, ec2.SecurityGroup]:
         task_definition = ecs.FargateTaskDefinition(
             self, "InventoryTaskDef", cpu=256, memory_limit_mib=512
@@ -188,6 +285,11 @@ class InventoryStack(Stack):
                 "INVENTORY_REDIS_HOST": redis_endpoint,
                 "INVENTORY_REDIS_PORT": "6379",
                 "INVENTORY_ZONE_UPDATED_QUEUE_URL": zone_updated_queue.queue_url,
+                # MA-48 (MA-118/MA-119/MA-150) ------------------------
+                "INVENTORY_ORDER_CANCELLED_QUEUE_URL": order_cancelled_queue.queue_url,
+                "INVENTORY_CATALOG_UPDATED_QUEUE_URL": catalog_updated_queue.queue_url,
+                "INVENTORY_EVENT_BUS_NAME": "default",
+                "INVENTORY_EVENT_SOURCE": "inventory",
                 # Placeholder — see module docstring point 2. Deploying
                 # with this unresolved will fail SQLAlchemy engine
                 # creation; a human must wire real composition first.
@@ -198,6 +300,17 @@ class InventoryStack(Stack):
         container.add_port_mappings(ecs.PortMapping(container_port=8000))
 
         zone_updated_queue.grant_consume_messages(task_definition.task_role)
+        order_cancelled_queue.grant_consume_messages(task_definition.task_role)
+        catalog_updated_queue.grant_consume_messages(task_definition.task_role)
+        # MA-118 FR-6 — stock_event_publisher.py's StockChanged/LowStock
+        # producer; nothing in this stack granted PutEvents before now
+        # (module docstring point 6).
+        task_definition.task_role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=["events:PutEvents"],
+                resources=[f"arn:aws:events:{self.region}:{self.account}:event-bus/default"],
+            )
+        )
 
         service_security_group = ec2.SecurityGroup(
             self, "FargateServiceSecurityGroup", vpc=vpc, description="Inventory Fargate service"
@@ -236,7 +349,11 @@ class InventoryStack(Stack):
         return alb, listener
 
     def _build_http_api(
-        self, vpc: ec2.Vpc, alb: elbv2.ApplicationLoadBalancer, listener: elbv2.ApplicationListener
+        self,
+        vpc: ec2.Vpc,
+        alb: elbv2.ApplicationLoadBalancer,
+        listener: elbv2.ApplicationListener,
+        admin_authorizer_fn_arn: str,
     ) -> apigwv2.HttpApi:
         # A VpcLink with no explicit security_groups gets an
         # auto-generated one CDK doesn't hand back a reference to, leaving
@@ -257,7 +374,10 @@ class InventoryStack(Stack):
         http_api = apigwv2.HttpApi(self, "InventoryHttpApi", api_name="inventory")
 
         # Public route only — the internal route is intentionally never
-        # registered here (see module docstring point 3).
+        # registered here (see module docstring point 3). MA-118's
+        # reserve/commit/release/read routes are, by the same reasoning,
+        # ALSO never registered here (module docstring point 6) — only
+        # MA-119/MA-150's admin routes below need a real public route.
         http_api.add_routes(
             path="/v1/serviceability/check",
             methods=[apigwv2.HttpMethod.GET],
@@ -265,18 +385,138 @@ class InventoryStack(Stack):
                 "InventoryAlbIntegration", listener, vpc_link=vpc_link
             ),
         )
+        self._build_admin_routes(http_api, listener, vpc_link, admin_authorizer_fn_arn)
         return http_api
+
+    def _build_admin_routes(
+        self,
+        http_api: apigwv2.HttpApi,
+        listener: elbv2.ApplicationListener,
+        vpc_link: apigwv2.VpcLink,
+        admin_authorizer_fn_arn: str,
+    ) -> None:
+        # MA-119 FR-1 (PATCH /inventory) + MA-150's four routes — behind
+        # Identity & Auth's own MA-129 admin authorizer Lambda, referenced
+        # cross-stack by ARN exactly like user_stack.py's MA-139 routes
+        # (module docstring point 6). Caching disabled (results_cache_ttl
+        # = 0) to match identity-auth's own admin_authorizer TTL=0
+        # posture and user_stack.py's own precedent — a role/deactivation
+        # change must take effect on the very next request.
+        admin_authorizer_fn = lambda_.Function.from_function_arn(
+            self, "AdminAuthorizerFunction", admin_authorizer_fn_arn
+        )
+        admin_authorizer = apigwv2_authorizers.HttpLambdaAuthorizer(
+            "InventoryAdminAuthorizer",
+            admin_authorizer_fn,
+            response_types=[apigwv2_authorizers.HttpLambdaResponseType.SIMPLE],
+            results_cache_ttl=Duration.seconds(0),
+        )
+
+        # This service's compute is Fargate behind an ALB (HttpAlbIntegration),
+        # not Lambda — the admin authorizer's {adminId, email, role}
+        # context has no Lambda `event` to ride along in the way MA-139's
+        # Lambda-proxy admin routes get it for free. Forwarded instead as
+        # request headers via parameter mapping (module docstring point
+        # 6) — read back by src/handlers/admin_context.py.
+        admin_parameter_mapping = apigwv2.ParameterMapping()
+        admin_parameter_mapping.append_header(
+            "x-admin-id", apigwv2.MappingValue.context_variable("authorizer.lambda.adminId")
+        )
+        admin_parameter_mapping.append_header(
+            "x-admin-email", apigwv2.MappingValue.context_variable("authorizer.lambda.email")
+        )
+        admin_parameter_mapping.append_header(
+            "x-admin-role", apigwv2.MappingValue.context_variable("authorizer.lambda.role")
+        )
+
+        def _admin_integration(integration_id: str) -> apigwv2_integrations.HttpAlbIntegration:
+            return apigwv2_integrations.HttpAlbIntegration(
+                integration_id, listener, vpc_link=vpc_link, parameter_mapping=admin_parameter_mapping
+            )
+
+        for path, method, integration_id in (
+            ("/v1/inventory", apigwv2.HttpMethod.PATCH, "AdjustIntegration"),
+            ("/v1/inventory/receive", apigwv2.HttpMethod.POST, "ReceiveIntegration"),
+            ("/v1/inventory/{productId}/batches", apigwv2.HttpMethod.GET, "BatchesIntegration"),
+            ("/v1/inventory", apigwv2.HttpMethod.GET, "ListIntegration"),
+            ("/v1/inventory/{productId}/audit-log", apigwv2.HttpMethod.GET, "AuditLogIntegration"),
+        ):
+            http_api.add_routes(
+                path=path,
+                methods=[method],
+                integration=_admin_integration(integration_id),
+                authorizer=admin_authorizer,
+            )
 
     def _build_zone_updated_rule(self, zone_updated_queue: sqs.Queue) -> None:
         # Matches events the (not-yet-built) Admin/zone-management service
         # will publish — this stack owns the consumer side of the
         # contract (rule + queue), same pattern as MA-92's OtpRequested
         # rule targeting a not-yet-existing Notification service.
+        #
+        # Unwraps EventBridge's own envelope via RuleTargetInput, same fix
+        # as OrderCancelledRule/CatalogUpdatedRule below (module docstring
+        # point 6) — this rule pre-dates this story and was originally
+        # left as a documented out-of-scope follow-up, since no real
+        # producer existed yet to actually surface the bug. zone_update_
+        # consumer.py parses `body["payload"]["pincodePrefixes"]`, the
+        # same shape every other consumer in this codebase expects; a
+        # plain SqsQueue target (as this rule had before) delivers
+        # `{"detail": {...}, ...}` instead, which would KeyError the
+        # moment a real producer is wired up via actual PutEvents rather
+        # than direct send_message in tests.
         events.Rule(
             self,
             "ZoneUpdatedRule",
             event_pattern=events.EventPattern(
                 source=["inventory-admin"], detail_type=["inventory.zone.updated"]
             ),
-            targets=[events_targets.SqsQueue(zone_updated_queue)],
+            targets=[
+                events_targets.SqsQueue(
+                    zone_updated_queue,
+                    message=events.RuleTargetInput.from_event_path("$.detail"),
+                )
+            ],
+        )
+
+    def _build_order_cancelled_rule(self, order_cancelled_queue: sqs.Queue) -> None:
+        # MA-118 FR-5. No real producer exists yet (Order Service, MA-97,
+        # not built) — this stack provisions the consumer side of the
+        # contract now, same posture as ZoneUpdatedRule above. Unwraps
+        # EventBridge's own envelope via RuleTargetInput.from_event_path
+        # (module docstring point 6) — without it, a plain SqsQueue
+        # target delivers `{"detail": {...}, ...}`, not the flat
+        # `{"payload": {...}}` shape order_cancelled_consumer.py parses
+        # (confirmed empirically against this story's own local-dev
+        # stack while live-verifying MA-118 FR-6's StockChanged producer
+        # — see local-dev/bootstrap.py's `_wire_rule` docstring for the
+        # full story).
+        events.Rule(
+            self,
+            "OrderCancelledRule",
+            event_pattern=events.EventPattern(source=["order"], detail_type=["OrderCancelled"]),
+            targets=[
+                events_targets.SqsQueue(
+                    order_cancelled_queue,
+                    message=events.RuleTargetInput.from_event_path("$.detail"),
+                )
+            ],
+        )
+
+    def _build_catalog_updated_rule(self, catalog_updated_queue: sqs.Queue) -> None:
+        # MA-118 FR-8 — worse than OrderCancelledRule's gap above:
+        # Catalog has no outbox/publish mechanism of any kind today, not
+        # just "the owning service isn't built yet" (confirmed by reading
+        # its source — see catalog_updated_consumer.py's module
+        # docstring). Same RuleTargetInput unwrap as OrderCancelledRule.
+        events.Rule(
+            self,
+            "CatalogUpdatedRule",
+            event_pattern=events.EventPattern(source=["catalog"], detail_type=["CatalogUpdated"]),
+            targets=[
+                events_targets.SqsQueue(
+                    catalog_updated_queue,
+                    message=events.RuleTargetInput.from_event_path("$.detail"),
+                )
+            ],
         )

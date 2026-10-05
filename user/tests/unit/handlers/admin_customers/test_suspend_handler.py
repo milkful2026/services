@@ -4,7 +4,7 @@ from datetime import date
 import pytest
 
 import handlers.admin_customers.suspend_handler as suspend_handler
-from domain.exceptions import InvalidStatusTransitionError, ValidationError
+from domain.exceptions import InvalidStatusTransitionError
 from domain.models import CustomerAccount, CustomerStatus
 
 

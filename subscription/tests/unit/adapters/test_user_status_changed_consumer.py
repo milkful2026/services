@@ -3,7 +3,7 @@ a fake SQS client and a real (SQLite-backed) SubscriptionService —
 mirrors wallet's own test_wallet_events_consumer.py."""
 
 import json
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 
 import pytest
 

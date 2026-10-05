@@ -85,14 +85,52 @@ def _get_or_create_queue(sqs, name: str, **create_kwargs) -> tuple[str, str]:
     return queue_url, queue_arn
 
 
-def _wire_rule(events, rule_name: str, pattern: dict, target_id: str, target_arn: str) -> None:
+def _wire_rule(
+    events,
+    rule_name: str,
+    pattern: dict,
+    target_id: str,
+    target_arn: str,
+    unwrap_detail: bool = False,
+) -> None:
     """put_rule/put_targets are both idempotent upserts — unlike queue
     creation there's no legitimate 'already exists' case to swallow, so
     any ClientError here is a genuine wiring failure and must propagate
     rather than being downgraded to a print that leaves the rest of the
-    script reporting success."""
+    script reporting success.
+
+    `unwrap_detail=True` (MA-48 addition): without an InputTransformer, a
+    real EventBridge rule delivers its *entire* envelope to an SQS target
+    (`{"id", "detail-type", "source", ..., "detail": {...}}`), not just
+    the `Detail` payload a publisher passed to `put_events`. Every
+    consumer in this codebase (zone_update_consumer.py,
+    stock_changed_consumer.py, and this story's order_cancelled_consumer.
+    py/catalog_updated_consumer.py) parses `body["payload"]` directly —
+    a shape that only ever matched because every existing consumer test
+    publishes by calling `send_message` straight to SQS, bypassing
+    EventBridge entirely. Verified directly against this stack's own
+    moto_server: a real put_events() + rule + plain SQS target delivers
+    `body["detail"]["payload"]`, not `body["payload"]` — confirmed while
+    doing this story's own mandated StockChanged live-verification step
+    (impl-plan §3 step 3), not a hypothetical. This InputTransformer
+    (`InputPathsMap: {"detail": "$.detail"}`, `InputTemplate: "<detail>"`)
+    republishes just the `detail` object as the SQS message body, closing
+    that gap for the rules this story adds/touches, and — per a
+    code-review finding — for the pre-existing `ZoneUpdatedRule` too
+    (same bug class, same one-line fix, now passed `unwrap_detail=True`
+    below to match `inventory_stack.py`'s own corrected
+    `ZoneUpdatedRule`). `OtpRequestedDebugRule` is left as-is: it's a
+    local-dev-only debug queue (see its own call site), not something any
+    real consumer parses, so there's no `body["payload"]` expectation for
+    it to violate."""
     events.put_rule(Name=rule_name, EventPattern=json.dumps(pattern), State="ENABLED")
-    events.put_targets(Rule=rule_name, Targets=[{"Id": target_id, "Arn": target_arn}])
+    target: dict = {"Id": target_id, "Arn": target_arn}
+    if unwrap_detail:
+        target["InputTransformer"] = {
+            "InputPathsMap": {"detail": "$.detail"},
+            "InputTemplate": "<detail>",
+        }
+    events.put_targets(Rule=rule_name, Targets=[target])
     print(f"[eventbridge] wired {rule_name} -> {target_id}")
 
 
@@ -333,6 +371,7 @@ def bootstrap_sqs_and_eventbridge() -> str:
         {"source": ["inventory-admin"], "detail-type": ["inventory.zone.updated"]},
         "zone-updated-target",
         queue_arn,
+        unwrap_detail=True,
     )
 
     # Local-dev-only debug queue: no real SMS provider exists locally, so
@@ -375,6 +414,70 @@ def bootstrap_stock_changed_queue() -> str:
         {"source": ["inventory"], "detail-type": ["inventory.stock.changed"]},
         "stock-changed-target",
         queue_arn,
+        unwrap_detail=True,  # MA-48 — see _wire_rule's own docstring
+    )
+    return queue_url
+
+
+def bootstrap_order_cancelled_queue() -> str:
+    """MA-118 FR-5 — Inventory's own consumer queue for `OrderCancelled`.
+    No real producer exists yet (Order Service, MA-97, not built) — same
+    "provision the consumer side of the contract now" reasoning as
+    `bootstrap_stock_changed_queue` above applied to Catalog; this one is
+    Inventory provisioning its own queue+rule ahead of Order Service
+    landing, not Catalog's."""
+    sqs = boto3.client("sqs", **_creds)
+    events = boto3.client("events", **_creds)
+
+    _dlq_url, dlq_arn = _get_or_create_queue(sqs, "order-cancelled-dlq")
+    queue_url, queue_arn = _get_or_create_queue(
+        sqs,
+        "order-cancelled",
+        Attributes={
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
+        },
+    )
+    _wire_rule(
+        events,
+        "OrderCancelledRule",
+        {"source": ["order"], "detail-type": ["OrderCancelled"]},
+        "order-cancelled-target",
+        queue_arn,
+        unwrap_detail=True,
+    )
+    return queue_url
+
+
+def bootstrap_catalog_updated_queue() -> str:
+    """MA-118 FR-8 — Inventory's consumer queue for `CatalogUpdated`, the
+    only mechanism by which a `stock` row is ever provisioned (see
+    services/inventory/src/adapters/catalog_updated_consumer.py's module
+    docstring). **Worse than OrderCancelled's gap above**: Catalog has no
+    outbox/publish mechanism of any kind today (confirmed by reading its
+    source), not just "the owning service isn't built yet" — so this
+    queue/rule has no real producer to ever feed it until Catalog grows
+    one (MA-94/MA-116's own future scope, not this story's). See
+    seed_inventory_stock.py for how local dev exercises this consumer
+    anyway, by publishing a CatalogUpdated-shaped event directly through
+    this real EventBridge/SQS wiring."""
+    sqs = boto3.client("sqs", **_creds)
+    events = boto3.client("events", **_creds)
+
+    _dlq_url, dlq_arn = _get_or_create_queue(sqs, "catalog-updated-dlq")
+    queue_url, queue_arn = _get_or_create_queue(
+        sqs,
+        "catalog-updated",
+        Attributes={
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})
+        },
+    )
+    _wire_rule(
+        events,
+        "CatalogUpdatedRule",
+        {"source": ["catalog"], "detail-type": ["CatalogUpdated"]},
+        "catalog-updated-target",
+        queue_arn,
+        unwrap_detail=True,
     )
     return queue_url
 
@@ -513,6 +616,8 @@ def main() -> None:
     cart_table_name = bootstrap_cart_table()
     queue_url = bootstrap_sqs_and_eventbridge()
     stock_changed_queue_url = bootstrap_stock_changed_queue()
+    order_cancelled_queue_url = bootstrap_order_cancelled_queue()
+    catalog_updated_queue_url = bootstrap_catalog_updated_queue()
     wallet_events_queue_url = bootstrap_wallet_events_queue()
     order_events_queue_url = bootstrap_order_events_queue()
     subscription_events_queue_url = bootstrap_subscription_events_queue()
@@ -573,6 +678,16 @@ def main() -> None:
             # through config.env.Settings) to avoid forcing eager
             # Settings validation at module-import time.
             "INVENTORY_CORS_ALLOW_ALL": "true",
+            # MA-118/MA-119/MA-150 ------------------------------------
+            "INVENTORY_EVENT_BUS_NAME": "default",
+            "INVENTORY_EVENT_SOURCE": "inventory",
+            "INVENTORY_ORDER_CANCELLED_QUEUE_URL": order_cancelled_queue_url,
+            "INVENTORY_CATALOG_UPDATED_QUEUE_URL": catalog_updated_queue_url,
+            # Shortened for local dev so a manual curl walkthrough
+            # (impl-plan §6 Acceptance Check) doesn't require waiting out
+            # a real 15-minute TTL to see the sweep act.
+            "INVENTORY_RESERVATION_TTL_SECONDS": "20",
+            "INVENTORY_TTL_SWEEP_INTERVAL_SECONDS": "5",
         },
     )
     _write_env_file(

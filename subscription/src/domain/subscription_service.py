@@ -417,7 +417,6 @@ class SubscriptionService:
         user_id = payload["userId"]
         reason = f"account_{new_status.lower()}"
         now = now or datetime.now(IST)
-        today = now.astimezone(IST).date()
 
         # Spec FR-1 step 1 - every non-STOPPED subscription (ACTIVE, or any
         # PAUSED subscription regardless of pause_from/pause_until) is a
