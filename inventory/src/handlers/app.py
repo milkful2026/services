@@ -13,6 +13,7 @@ from handlers.dto import error_envelope
 from handlers.health import consumer_health
 from handlers.internal_serviceability_check_handler import router as internal_router
 from handlers.inventory_handler import router as inventory_router
+from handlers.local_admin_auth import LocalAdminAuthMiddleware
 from handlers.serviceability_check_handler import router as public_router
 
 app = FastAPI(title="Inventory Service")
@@ -37,6 +38,13 @@ if os.environ.get("INVENTORY_CORS_ALLOW_ALL", "").lower() == "true":
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# Local dev only — see local_admin_auth.py's own docstring for why this
+# service, unlike the Lambda-shaped ones, has no other stand-in for API
+# Gateway's authorizer + parameter-mapping hop. Same env-var-gated,
+# read-at-import-time pattern as INVENTORY_CORS_ALLOW_ALL above.
+if os.environ.get("INVENTORY_LOCAL_ADMIN_AUTH", "").lower() == "true":
+    app.add_middleware(LocalAdminAuthMiddleware)
 
 
 @app.exception_handler(InventoryError)

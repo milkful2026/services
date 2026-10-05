@@ -678,6 +678,13 @@ def main() -> None:
             # through config.env.Settings) to avoid forcing eager
             # Settings validation at module-import time.
             "INVENTORY_CORS_ALLOW_ALL": "true",
+            # Local dev only — see handlers/local_admin_auth.py's own
+            # docstring. Inventory's admin routes are FastAPI/ALB, not
+            # Lambda, so they have no other local stand-in for API
+            # Gateway's authorizer + parameter-mapping hop; without this,
+            # a real browser session (which sends `Authorization: Bearer
+            # <token>`, not X-Admin-* headers) 401s on every admin route.
+            "INVENTORY_LOCAL_ADMIN_AUTH": "true",
             # MA-118/MA-119/MA-150 ------------------------------------
             "INVENTORY_EVENT_BUS_NAME": "default",
             "INVENTORY_EVENT_SOURCE": "inventory",
