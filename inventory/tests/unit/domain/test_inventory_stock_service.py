@@ -17,7 +17,6 @@ from domain.models import (
     ReservationStatus,
     Stock,
     StockBatch,
-    StockState,
 )
 
 
