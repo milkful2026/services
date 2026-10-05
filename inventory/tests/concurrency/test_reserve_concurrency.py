@@ -102,7 +102,8 @@ def test_n_concurrent_commits_for_the_same_reservation_decrement_on_hand_once(re
     repo.reserve(product_id, "order-shared", quantity=4, ttl_seconds=900)
 
     def _try_commit(_i: int):
-        return repo.commit_reservation(product_id, "order-shared").status.value
+        reservation, _changed = repo.commit_reservation(product_id, "order-shared")
+        return reservation.status.value
 
     with ThreadPoolExecutor(max_workers=n) as pool:
         futures = [pool.submit(_try_commit, i) for i in range(n)]

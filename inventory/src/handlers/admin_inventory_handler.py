@@ -54,7 +54,12 @@ def receive_inventory(
     service: InventoryStockService = Depends(get_inventory_stock_service),
 ):
     batch, stock, audit_entry = service.receive(
-        body.productId, body.quantity, body.expiryDate, admin["adminId"], body.reason
+        body.productId,
+        body.quantity,
+        body.expiryDate,
+        admin["adminId"],
+        body.reason,
+        body.availableFrom,
     )
     return success_envelope(
         {

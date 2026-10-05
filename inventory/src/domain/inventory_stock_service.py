@@ -75,29 +75,42 @@ class InventoryStockService:
         reservation, created = self._repository.reserve(
             product_id, order_ref, quantity, ttl_seconds or self._default_ttl_seconds
         )
-        if created:
-            # available decreased by `quantity`; on_hand unchanged.
-            self._publish_after_change(product_id, available_delta=-quantity)
+        # Always publish — including the created=False idempotent-replay
+        # case — so a retry after a failed first-call publish (logged and
+        # swallowed below, never raised; see module docstring) gets a
+        # second chance to reach Catalog. Every other mutator here
+        # (commit/release/handle_order_cancelled/run_ttl_sweep) already
+        # republishes unconditionally on its own no-op case; reserve() was
+        # previously the one path where a dropped event could never
+        # self-heal, since a retry with the same idempotency key always
+        # returns created=False. available_delta is 0 on replay, not
+        # -quantity again: the LowStock threshold-crossing check below
+        # derives "available before this call" from this delta, and a
+        # replay's true delta since the real (first) creation is 0 — using
+        # -quantity here would fabricate a crossing that either already
+        # fired on the original call or never happened, triggering a
+        # spurious duplicate LowStock event on every retry.
+        self._publish_after_change(product_id, available_delta=-quantity if created else 0)
         return reservation
 
     def commit(self, product_id: str, order_ref: str) -> Reservation:
         # commit() only mutates on_hand when it actually transitions
-        # RESERVED -> COMMITTED; the repository returns the reservation
-        # unchanged for the idempotent-replay (already-terminal) case.
-        # Reading on_hand before and after is how this method tells those
-        # two cases apart without threading an extra "changed" boolean
-        # through the repository port. commit() never changes
+        # RESERVED -> COMMITTED; the repository reports this directly as
+        # `changed`, observed under the same lock that performs the write
+        # — not inferred here via a separate unlocked before/after
+        # on_hand read. That previous approach raced a concurrent
+        # adjust()/receive_stock() on the same product landing between
+        # the unlocked read and the locked commit, which could corrupt
+        # the diff (masking a real transition, or firing a spurious
+        # publish for someone else's change). commit() never changes
         # `available` (on_hand and reserved both move by the same
         # amount, per stock_repository.py's module docstring), so there
         # is never a LowStock crossing to check here.
-        before = self._repository.get_stock_with_next_batch(product_id)
-        before_on_hand = before[0].on_hand if before is not None else None
-
-        reservation = self._repository.commit_reservation(product_id, order_ref)
-
-        loaded = self._repository.get_stock_with_next_batch(product_id)
-        if loaded is not None and loaded[0].on_hand != before_on_hand:
-            self._event_publisher.publish_stock_changed(_summarize(*loaded))
+        reservation, changed = self._repository.commit_reservation(product_id, order_ref)
+        if changed:
+            loaded = self._repository.get_stock_with_next_batch(product_id)
+            if loaded is not None:
+                self._event_publisher.publish_stock_changed(_summarize(*loaded))
         return reservation
 
     def release(self, product_id: str, order_ref: str) -> Reservation:
@@ -147,13 +160,16 @@ class InventoryStockService:
         expiry_date: date,
         admin_id: str,
         reason: str | None,
+        available_from: date | None = None,
     ) -> tuple[StockBatch, Stock, AuditLogEntry]:
         if quantity <= 0:
             raise ValidationError("quantity must be a positive integer")
         if expiry_date < datetime.now(UTC).date():
             raise ValidationError("expiryDate must not be in the past")
+        if available_from is not None and available_from < datetime.now(UTC).date():
+            raise ValidationError("availableFrom must not be in the past")
         batch, stock, audit_entry = self._repository.receive_stock(
-            product_id, quantity, expiry_date, admin_id, reason
+            product_id, quantity, expiry_date, admin_id, reason, available_from
         )
         self._publish_after_change(product_id, available_delta=quantity)
         return batch, stock, audit_entry

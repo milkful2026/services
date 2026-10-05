@@ -43,7 +43,7 @@ class FakeService:
             raise self.adjust_raises
         return self.adjust_result
 
-    def receive(self, product_id, quantity, expiry_date, admin_id, reason):
+    def receive(self, product_id, quantity, expiry_date, admin_id, reason, available_from=None):
         if self.receive_raises:
             raise self.receive_raises
         return self.receive_result

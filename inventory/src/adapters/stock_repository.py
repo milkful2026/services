@@ -281,7 +281,7 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
                     raise
                 return _row_to_reservation(winner), False
 
-    def commit_reservation(self, product_id: str, order_ref: str) -> Reservation:
+    def commit_reservation(self, product_id: str, order_ref: str) -> tuple[Reservation, bool]:
         with self._db_operation("commit_reservation", "Failed to commit reservation"):
             with self._engine.begin() as conn:
                 stock_row = conn.execute(
@@ -308,8 +308,13 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
                 reservation = _row_to_reservation(reservation_row)
                 if reservation.status != ReservationStatus.RESERVED:
                     # FR-3: already-terminal (COMMITTED or RELEASED) is an
-                    # idempotent no-op, not an error.
-                    return reservation
+                    # idempotent no-op, not an error. `changed=False` lets
+                    # the caller know on_hand was NOT touched by this call
+                    # — reported directly, under the same lock that would
+                    # have performed the write, rather than left for the
+                    # caller to infer via a separate unlocked before/after
+                    # read.
+                    return reservation, False
 
                 conn.execute(
                     stock_table.update()
@@ -327,7 +332,7 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
                 )
                 self._consume_batches_fifo(conn, product_id, reservation.quantity)
                 reservation.status = ReservationStatus.COMMITTED
-                return reservation
+                return reservation, True
 
     def release_reservation(self, product_id: str, order_ref: str) -> Reservation:
         with self._db_operation("release_reservation", "Failed to release reservation"):
@@ -414,13 +419,16 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
                 ).fetchall()
 
         released: list[Reservation] = []
-        # Deterministic product_id order across a single sweep batch to
-        # minimize (not eliminate) lock-ordering deadlock risk against
-        # concurrent reserve/commit/release on different products; a
-        # second concurrent sweep run naturally avoids re-picking a row
-        # already locked by this one via Postgres's own `FOR UPDATE
-        # SKIP LOCKED` inside `_sweep_one`, so no double-release is
-        # possible even without this ordering.
+        # Deterministic product_id order across a single sweep batch, same
+        # stock-row-first lock order _sweep_one itself now follows — two
+        # sweep ticks (or a sweep tick and an API commit/release) racing
+        # the same product always contend for its stock row in the same
+        # order, so no cycle is possible. A second concurrent sweep run
+        # re-picking an already-handled reservation is still safe: by the
+        # time it acquires the stock lock and then the reservation lock,
+        # the first sweep's transaction has already committed the
+        # terminal status, and _sweep_one's own status/expiry check turns
+        # that into a no-op (`return None`), not a double-release.
         for row in sorted(candidates, key=lambda r: r.product_id):
             outcome = self._sweep_one(row.product_id, row.id)
             if outcome is not None:
@@ -429,18 +437,43 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
 
     def _sweep_one(self, product_id: str, reservation_id: str) -> Reservation | None:
         with self._engine.begin() as conn:
-            # SKIP LOCKED: a concurrent sweep run (or an explicit
-            # release/commit already in flight for this reservation) just
-            # skips this row rather than blocking — the NFR's own stated
-            # "safe to run concurrently with itself" pattern. SQLite (the
-            # test double) does not support SKIP LOCKED or real row
-            # locking at all; `with_for_update` is a documented no-op
-            # there (see zone_repository.py's own fidelity-gap note) —
-            # correctness there relies on tests being single-threaded.
+            # Stock row locked FIRST, reservation row second — matching
+            # commit_reservation/release_reservation's lock order exactly
+            # (module docstring). This method previously locked the
+            # reservation row first (with SKIP LOCKED) and the stock row
+            # second — an inverted order from commit/release that could
+            # deadlock: a sweep tick locking reservation-then-blocking-on-
+            # stock, racing an API commit/release call locking stock-then-
+            # blocking-on-reservation, is a classic AB-BA deadlock
+            # Postgres resolves by killing one side with a 503. Locking
+            # stock first here closes that: any two callers now always
+            # contend for the stock row first, so whichever wins proceeds
+            # to completion before the other even attempts the reservation
+            # lock — no cycle is possible. SKIP LOCKED is dropped (no
+            # longer needed): a concurrent sweep/commit/release for the
+            # same reservation is already fully serialized by the shared
+            # stock-row lock above, so by the time this call acquires the
+            # reservation lock, any concurrent terminal transition has
+            # already committed and the status check below (not RESERVED
+            # or not yet expired) correctly turns this into a no-op
+            # instead of a double-release. SQLite (the test double) does
+            # not support real row locking at all; `with_for_update` is a
+            # documented no-op there (see zone_repository.py's own
+            # fidelity-gap note) — correctness there relies on tests being
+            # single-threaded.
+            stock_row = conn.execute(
+                select(stock_table)
+                .where(stock_table.c.product_id == product_id)
+                .with_for_update()
+            ).fetchone()
+            if stock_row is None:
+                return None
+            stock = _row_to_stock(stock_row)
+
             reservation_row = conn.execute(
                 select(reservations_table)
                 .where(reservations_table.c.id == reservation_id)
-                .with_for_update(skip_locked=True)
+                .with_for_update()
             ).fetchone()
             if reservation_row is None:
                 return None
@@ -450,15 +483,6 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
                 reservation.expires_at
             ) >= now:
                 return None
-
-            stock_row = conn.execute(
-                select(stock_table)
-                .where(stock_table.c.product_id == product_id)
-                .with_for_update()
-            ).fetchone()
-            if stock_row is None:
-                return None
-            stock = _row_to_stock(stock_row)
 
             conn.execute(
                 stock_table.update()
@@ -565,6 +589,7 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
         expiry_date: date,
         admin_id: str,
         reason: str | None,
+        available_from: date | None = None,
     ) -> tuple[StockBatch, Stock, AuditLogEntry]:
         with self._db_operation("receive_stock", "Failed to receive stock"):
             with self._engine.begin() as conn:
@@ -584,7 +609,7 @@ class SqlAlchemyStockRepository(SqlAlchemyOperationMixin):
                         product_id=product_id,
                         quantity=quantity,
                         expiry_date=expiry_date,
-                        available_from=None,
+                        available_from=available_from,
                     )
                 )
                 new_on_hand = stock.on_hand + quantity

@@ -69,13 +69,28 @@ class EventBridgeStockEventPublisher:
     def _publish(self, detail_type: str, payload: dict) -> None:
         # eventId/correlationId: a fresh uuid per publish (FR-6 — "it's
         # what lets MA-116's consumer detect and ignore a redelivered
-        # duplicate"), stamped here rather than left to
-        # EventBridgeOutboxPublisher.publish()'s own setdefault (which
-        # would stamp the *outer* envelope, not inside "payload" where
-        # every consumer actually looks — see module docstring).
+        # duplicate"), stamped here on `payload` — where every real
+        # consumer actually looks, per module docstring — not left to
+        # EventBridgeOutboxPublisher.publish()'s own `detail.setdefault(...)`.
+        # That setdefault still runs (publish() is shared code, not
+        # overridable from here), but `detail` is this method's `envelope`
+        # dict, not `payload` — envelope has no top-level "eventId"/
+        # "occurredAt" key of its own, so setdefault doesn't skip it; it
+        # silently adds a SECOND, different eventId/occurredAt at the
+        # envelope's top level, unrelated to payload["eventId"]. Setting
+        # them explicitly on envelope too (mirroring payload's own values,
+        # not a fresh uuid) makes that setdefault a true no-op — a
+        # previous version of this method only guarded `payload`, so the
+        # envelope-level fields silently diverged from the ones every
+        # consumer/dedup check actually reads.
         payload.setdefault("eventId", str(uuid.uuid4()))
         payload.setdefault("occurredAt", datetime.now(UTC).isoformat())
-        envelope = {"payload": payload, "correlationId": payload["eventId"]}
+        envelope = {
+            "payload": payload,
+            "correlationId": payload["eventId"],
+            "eventId": payload["eventId"],
+            "occurredAt": payload["occurredAt"],
+        }
         try:
             self._publisher.publish(detail_type, envelope)
         except ServiceUnavailableError as exc:

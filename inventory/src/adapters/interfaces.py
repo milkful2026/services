@@ -60,7 +60,15 @@ class StockRepositoryPort(Protocol):
         for this key) — `available` was not re-decremented."""
         ...
 
-    def commit_reservation(self, product_id: str, order_ref: str) -> Reservation: ...
+    def commit_reservation(self, product_id: str, order_ref: str) -> tuple[Reservation, bool]:
+        """Returns (reservation, changed). `changed=False` means the
+        reservation was already COMMITTED/RELEASED (idempotent replay) —
+        on_hand/reserved/batches were not touched again. Reported directly
+        by the repository (observed under the same lock that performs the
+        write) rather than inferred by the caller via a separate,
+        unlocked before/after on_hand read, which a concurrent adjust()/
+        receive_stock() on the same product could otherwise corrupt."""
+        ...
 
     def release_reservation(self, product_id: str, order_ref: str) -> Reservation: ...
 
@@ -89,8 +97,15 @@ class StockRepositoryPort(Protocol):
         expiry_date: date,
         admin_id: str,
         reason: str | None,
+        available_from: date | None = None,
     ) -> tuple[StockBatch, Stock, AuditLogEntry]:
-        """MA-150 FR-1."""
+        """MA-150 FR-1. `available_from=None` (default) means the batch is
+        available immediately — today's only previously-reachable
+        behavior, since no caller could set this before. A non-None value
+        schedules a future-available batch (MA-118's AVAILABLE_FROM
+        stockState); `on_hand` still increases immediately either way —
+        excluding a not-yet-available batch's quantity from `available`
+        until its date arrives is a separate, not-yet-built follow-up."""
         ...
 
     def get_batches(self, product_id: str) -> list[StockBatch]:

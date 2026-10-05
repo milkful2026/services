@@ -67,10 +67,10 @@ silently decided):
      entirely) — this story's own mandated StockChanged live-
      verification step caught that a plain SQS target (no transformer)
      delivers `{"detail": {...}, ...}`, not the flat `{"payload":
-     {...}}` shape every consumer in this codebase actually parses. Not
-     fixed on `ZoneUpdatedRule` itself here (out of scope, pre-existing,
-     flagged in this story's PR description for a follow-up) — fixed
-     only on the two rules this story adds.
+     {...}}` shape every consumer in this codebase actually parses.
+     `ZoneUpdatedRule` itself now carries the same `RuleTargetInput`
+     unwrap too (code-review finding, fixed alongside the two rules this
+     story adds — the bug class is identical, and the fix is one line).
    - `events:PutEvents` on the default event bus, granted to the Fargate
      task role — MA-118 FR-6's `StockChanged`/`LowStock` producer
      (`src/adapters/stock_event_publisher.py`) needs this and nothing
@@ -453,13 +453,30 @@ class InventoryStack(Stack):
         # will publish — this stack owns the consumer side of the
         # contract (rule + queue), same pattern as MA-92's OtpRequested
         # rule targeting a not-yet-existing Notification service.
+        #
+        # Unwraps EventBridge's own envelope via RuleTargetInput, same fix
+        # as OrderCancelledRule/CatalogUpdatedRule below (module docstring
+        # point 6) — this rule pre-dates this story and was originally
+        # left as a documented out-of-scope follow-up, since no real
+        # producer existed yet to actually surface the bug. zone_update_
+        # consumer.py parses `body["payload"]["pincodePrefixes"]`, the
+        # same shape every other consumer in this codebase expects; a
+        # plain SqsQueue target (as this rule had before) delivers
+        # `{"detail": {...}, ...}` instead, which would KeyError the
+        # moment a real producer is wired up via actual PutEvents rather
+        # than direct send_message in tests.
         events.Rule(
             self,
             "ZoneUpdatedRule",
             event_pattern=events.EventPattern(
                 source=["inventory-admin"], detail_type=["inventory.zone.updated"]
             ),
-            targets=[events_targets.SqsQueue(zone_updated_queue)],
+            targets=[
+                events_targets.SqsQueue(
+                    zone_updated_queue,
+                    message=events.RuleTargetInput.from_event_path("$.detail"),
+                )
+            ],
         )
 
     def _build_order_cancelled_rule(self, order_cancelled_queue: sqs.Queue) -> None:

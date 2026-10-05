@@ -115,10 +115,14 @@ def _wire_rule(
     (impl-plan §3 step 3), not a hypothetical. This InputTransformer
     (`InputPathsMap: {"detail": "$.detail"}`, `InputTemplate: "<detail>"`)
     republishes just the `detail` object as the SQS message body, closing
-    that gap for the rules this story adds/touches. Pre-existing rules
-    this story doesn't need for its own verification (ZoneUpdatedRule,
-    OtpRequestedDebugRule) are left as-is — same latent gap, out of scope
-    here, flagged in this story's PR description for a follow-up."""
+    that gap for the rules this story adds/touches, and — per a
+    code-review finding — for the pre-existing `ZoneUpdatedRule` too
+    (same bug class, same one-line fix, now passed `unwrap_detail=True`
+    below to match `inventory_stack.py`'s own corrected
+    `ZoneUpdatedRule`). `OtpRequestedDebugRule` is left as-is: it's a
+    local-dev-only debug queue (see its own call site), not something any
+    real consumer parses, so there's no `body["payload"]` expectation for
+    it to violate."""
     events.put_rule(Name=rule_name, EventPattern=json.dumps(pattern), State="ENABLED")
     target: dict = {"Id": target_id, "Arn": target_arn}
     if unwrap_detail:
@@ -367,6 +371,7 @@ def bootstrap_sqs_and_eventbridge() -> str:
         {"source": ["inventory-admin"], "detail-type": ["inventory.zone.updated"]},
         "zone-updated-target",
         queue_arn,
+        unwrap_detail=True,
     )
 
     # Local-dev-only debug queue: no real SMS provider exists locally, so

@@ -40,9 +40,10 @@ class FakeRepository:
         return reservation, created
 
     def commit_reservation(self, product_id, order_ref):
-        if self.on_hand_after_commit is not None:
+        changed = self.on_hand_after_commit is not None
+        if changed:
             self.stock.on_hand = self.on_hand_after_commit
-        return self.commit_result
+        return self.commit_result, changed
 
     def release_reservation(self, product_id, order_ref):
         return self.release_result
@@ -61,11 +62,11 @@ class FakeRepository:
             adjustment=adjustment, reason=reason,
         )
 
-    def receive_stock(self, product_id, quantity, expiry_date, admin_id, reason):
+    def receive_stock(self, product_id, quantity, expiry_date, admin_id, reason, available_from=None):
         self.stock.on_hand += quantity
         batch = StockBatch(
             id="batch-1", product_id=product_id, quantity=quantity,
-            expiry_date=expiry_date, available_from=None,
+            expiry_date=expiry_date, available_from=available_from,
         )
         audit = AuditLogEntry(
             id="audit-1", product_id=product_id, admin_id=admin_id,
@@ -153,6 +154,39 @@ def test_receive_rejects_past_expiry_date(publisher):
         service.receive("p1", 5, date(2020, 1, 1), "admin-1", None)
 
 
+def test_receive_rejects_past_available_from(publisher):
+    repo = FakeRepository(Stock("p1", on_hand=10, reserved=0, low_stock_threshold=5))
+    service = _service(repo, publisher)
+
+    with pytest.raises(ValidationError):
+        service.receive("p1", 5, date(2026, 12, 25), "admin-1", None, date(2020, 1, 1))
+
+
+def test_receive_with_no_available_from_defaults_to_available_now(publisher):
+    # Regression: receive_stock() previously hard-coded available_from=None
+    # with no field anywhere to set it to anything else — the
+    # AVAILABLE_FROM stockState (already read by get_summary()/
+    # get_batches()) had no write path at all. Confirms the (unchanged)
+    # default-omitted case still produces an immediately-available batch.
+    repo = FakeRepository(Stock("p1", on_hand=10, reserved=0, low_stock_threshold=5))
+    service = _service(repo, publisher)
+
+    batch, _stock, _audit = service.receive("p1", 5, date(2026, 12, 25), "admin-1", None)
+
+    assert batch.available_from is None
+
+
+def test_receive_can_schedule_a_future_available_from(publisher):
+    repo = FakeRepository(Stock("p1", on_hand=10, reserved=0, low_stock_threshold=5))
+    service = _service(repo, publisher)
+
+    batch, _stock, _audit = service.receive(
+        "p1", 5, date(2026, 12, 25), "admin-1", None, date(2026, 11, 1)
+    )
+
+    assert batch.available_from == date(2026, 11, 1)
+
+
 # --- FR-6 publish decisions ----------------------------------------------
 
 
@@ -168,7 +202,16 @@ def test_reserve_publishes_stock_changed_when_created(publisher):
     assert publisher.stock_changed[0].available == 7
 
 
-def test_reserve_does_not_publish_on_idempotent_replay(publisher):
+def test_reserve_still_publishes_on_idempotent_replay(publisher):
+    # Regression: reserve() previously only published when created=True,
+    # so a retry after a failed first-call publish (the first call DID
+    # create the reservation, but its publish attempt was lost) could
+    # never recover — a retry with the same idempotency key always
+    # returns created=False, and the old code silently skipped publishing
+    # every time. Every other mutator (commit/release/
+    # handle_order_cancelled/run_ttl_sweep) already republishes
+    # unconditionally on its own idempotent/no-op path; reserve() now
+    # does too, so Catalog's cache can always self-heal on a retry.
     stock = Stock("p1", on_hand=10, reserved=3, low_stock_threshold=5)
     repo = FakeRepository(stock)
     repo.reserve_result = (_reservation(quantity=3), False)
@@ -176,7 +219,23 @@ def test_reserve_does_not_publish_on_idempotent_replay(publisher):
 
     service.reserve("p1", "order-1", 3)
 
-    assert publisher.stock_changed == []
+    assert len(publisher.stock_changed) == 1
+
+
+def test_reserve_replay_does_not_fabricate_a_low_stock_crossing(publisher):
+    # A replay's StockChanged still republishes (above), but it must not
+    # pass available_delta=-quantity into the LowStock check a second
+    # time — that would derive a fake "available before this call" value
+    # and could fire a duplicate/spurious LowStock event on every retry,
+    # even when nothing has actually changed since the original call.
+    stock = Stock("p1", on_hand=10, reserved=8, low_stock_threshold=5)  # available=2, already low
+    repo = FakeRepository(stock)
+    repo.reserve_result = (_reservation(quantity=3), False)
+    service = _service(repo, publisher)
+
+    service.reserve("p1", "order-1", 3)
+
+    assert publisher.low_stock == []
 
 
 def test_reserve_crossing_threshold_also_publishes_low_stock(publisher):

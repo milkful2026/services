@@ -86,6 +86,15 @@ def test_stock_changed_delivers_fields_nested_under_payload(wired_queue, publish
     assert "eventId" in payload  # FR-6: fresh uuid per publish
     assert "occurredAt" in payload
     assert body["correlationId"] == payload["eventId"]
+    # Regression: EventBridgeOutboxPublisher.publish()'s own
+    # detail.setdefault("eventId", ...) stamps the *envelope* dict (what
+    # this method calls `detail`), not `payload` — since the envelope had
+    # no top-level eventId/occurredAt of its own, that setdefault
+    # previously added a SECOND, different eventId/occurredAt at the
+    # envelope's top level, never matching payload["eventId"] (the one
+    # every consumer's dedup logic actually reads).
+    assert body["eventId"] == payload["eventId"]
+    assert body["occurredAt"] == payload["occurredAt"]
 
 
 def test_stock_changed_available_from_is_isoformat_date_string(wired_queue, publisher):

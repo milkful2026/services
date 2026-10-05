@@ -125,9 +125,10 @@ def test_commit_decrements_on_hand_and_clears_reserved(repo, stock_engine):
     seed_batch(stock_engine, "p1", quantity=10, expiry_date=date(2026, 12, 1))
     repo.reserve("p1", "order-1", 4, ttl_seconds=900)
 
-    reservation = repo.commit_reservation("p1", "order-1")
+    reservation, changed = repo.commit_reservation("p1", "order-1")
 
     assert reservation.status == ReservationStatus.COMMITTED
+    assert changed is True
     stock, _ = repo.get_stock_with_next_batch("p1")
     assert stock.on_hand == 6
     assert stock.reserved == 0
@@ -140,7 +141,7 @@ def test_commit_consumes_batches_fifo_by_expiry(repo, stock_engine):
     far = seed_batch(stock_engine, "p1", quantity=5, expiry_date=date(2026, 12, 1))
     repo.reserve("p1", "order-1", 7, ttl_seconds=900)
 
-    repo.commit_reservation("p1", "order-1")
+    repo.commit_reservation("p1", "order-1")  # returns (reservation, changed), ignored here
 
     with stock_engine.connect() as conn:
         from adapters.stock_repository import stock_batches_table
@@ -158,11 +159,13 @@ def test_commit_is_idempotent(repo, stock_engine):
     seed_stock(stock_engine, "p1", on_hand=10, reserved=0)
     seed_batch(stock_engine, "p1", quantity=10)
     repo.reserve("p1", "order-1", 4, ttl_seconds=900)
-    repo.commit_reservation("p1", "order-1")
+    _, first_changed = repo.commit_reservation("p1", "order-1")
 
-    second = repo.commit_reservation("p1", "order-1")
+    second, second_changed = repo.commit_reservation("p1", "order-1")
 
+    assert first_changed is True
     assert second.status == ReservationStatus.COMMITTED
+    assert second_changed is False  # idempotent replay — on_hand not touched again
     stock, _ = repo.get_stock_with_next_batch("p1")
     assert stock.on_hand == 6  # not double-decremented
 
@@ -347,6 +350,29 @@ def test_receive_prefixes_supplied_reason(repo, stock_engine):
 def test_receive_unknown_product_raises_not_found(repo):
     with pytest.raises(ProductNotFoundError):
         repo.receive_stock("unknown", 10, date(2026, 12, 25), "admin-1", None)
+
+
+def test_receive_persists_available_from(repo, stock_engine):
+    # Regression: this method previously hard-coded available_from=None
+    # on every INSERT regardless of caller input — no caller had a field
+    # to set it to anything else in the first place. Confirms a supplied
+    # value actually round-trips through the DB, not just held in memory.
+    seed_stock(stock_engine, "p1", on_hand=5, reserved=0)
+
+    batch, _stock, _audit = repo.receive_stock(
+        "p1", 20, date(2026, 12, 25), "admin-1", None, date(2026, 11, 1)
+    )
+
+    assert batch.available_from == date(2026, 11, 1)
+    batches = repo.get_batches("p1")
+    assert batches[0].available_from == date(2026, 11, 1)
+    # Note what this does NOT yet prove: receive_stock() still increments
+    # on_hand immediately regardless of available_from (see its own
+    # docstring), so a product can still show IN_STOCK right after
+    # receiving a "future" batch if on_hand alone now exceeds reserved —
+    # excluding a not-yet-available batch's quantity from on_hand/
+    # available until its date arrives is a separate, not-yet-built
+    # follow-up, not something this field alone makes correct.
 
 
 def test_two_receipts_same_day_both_create_distinct_batches(repo, stock_engine):

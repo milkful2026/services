@@ -54,6 +54,16 @@ class ReceiveRequest(BaseModel):
     quantity: int
     expiryDate: date  # noqa: N815
     reason: str | None = None
+    # Optional: schedules this batch as not-yet-available (MA-118's
+    # AVAILABLE_FROM stockState, §7's stock_batches.available_from column
+    # — already read by get_summary()/get_batches(), previously had no
+    # write path at all, since this field didn't exist here). Omitted
+    # (None) means "available now", today's only behavior. Note this
+    # does NOT yet exclude the batch's quantity from on_hand/available
+    # until its date arrives — see receive_stock()'s own docstring for
+    # why that's a separate, not-yet-built follow-up, not silently
+    # assumed solved by adding this field alone.
+    availableFrom: date | None = None  # noqa: N815
 
 
 # --- MA-118/MA-119/MA-150 response serializers -----------------------------
