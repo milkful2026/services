@@ -4,6 +4,6 @@ pytest-cov
 pytest-mock
 httpx
 fakeredis
-moto[sqs]
+moto[sqs,events]
 aws-cdk-lib
 constructs
