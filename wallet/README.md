@@ -15,7 +15,7 @@ Service scaffold and carries both.
 |--------|------|------|---------|
 | GET | `/wallet/me` | Cognito JWT | Balance (paise), status, recharge bounds — the MA-24 shape MA-125 consumes |
 | GET | `/wallet/me/status` | Cognito JWT | **MA-1 legacy body** `{walletId, status, balance (whole rupees), currency}` — unchanged for MA-1's registration screen |
-| GET | `/wallet/me/transactions` | Cognito JWT | Paged (keyset), newest-first ledger — the contract MA-27 renders. Optional `types=RECHARGE,ORDER_DEBIT,…` (comma-separated ledger types, case-sensitive) filters inside the keyset query; an unknown type → 400 `VALIDATION_ERROR` (MA-148) |
+| GET | `/wallet/me/transactions` | Cognito JWT | Paged (keyset), newest-first ledger — the contract MA-27 renders. Optional `types=RECHARGE,ORDER_DEBIT,…` (comma-separated and/or repeated `types=` params, case-sensitive) filters inside the keyset query; an unknown type → 400 `VALIDATION_ERROR` (MA-148) |
 | POST | `/wallet/me/retry` | Cognito JWT | MA-1 replay of auto-provision |
 | GET | `/wallet/internal/limits` | SigV4 (VPC-only) | Recharge min/max for Payment Service (MA-126) |
 | POST | `/wallet/internal/debits/{orderId}/void` | SigV4 (VPC-only) | Body `{userId}`. Fences the order under the wallet row lock: 200 `VOIDED` (no debit for it can ever commit; the debit then returns 409 `DEBIT_VOIDED`), or 409 `ALREADY_DEBITED` with the debit if it landed first. Idempotent; never moves money. Order Service calls it before closing an order without charge (MA-142) |

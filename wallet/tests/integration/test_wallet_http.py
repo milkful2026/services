@@ -299,6 +299,21 @@ def test_transactions_types_filter(client, engine, service):
     assert body["nextCursor"] is None
 
 
+def test_transactions_repeated_types_params_are_unioned(client, engine, service):
+    _seed_mixed(client, engine, service)
+    body = client.get(
+        "/wallet/me/transactions?types=RECHARGE&types=OPENING", headers=_bearer()
+    ).json()["data"]
+    assert [i["type"] for i in body["items"]] == ["RECHARGE", "RECHARGE", "OPENING"]
+
+
+def test_transactions_repeated_types_params_validate_each_value(client, engine):
+    seed_wallet(engine)
+    r = client.get("/wallet/me/transactions?types=RECHARGE&types=BOGUS", headers=_bearer())
+    assert r.status_code == 400
+    assert r.json()["data"]["invalid"] == ["BOGUS"]
+
+
 def test_transactions_unknown_type_is_400(client, engine):
     seed_wallet(engine)
     r = client.get("/wallet/me/transactions?types=BOGUS", headers=_bearer())

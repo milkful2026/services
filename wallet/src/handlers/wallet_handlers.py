@@ -33,10 +33,12 @@ def get_wallet_transactions(
     user_id: str = Depends(current_user_id),
     limit: int | None = Query(default=None, ge=1, le=100),
     cursor: str | None = Query(default=None),
-    types: str | None = Query(default=None),
+    # A list so a repeated `?types=A&types=B` isn't truncated to its last value.
+    types: list[str] | None = Query(default=None),
     service: WalletService = Depends(get_wallet_service),
 ):
-    page = service.list_transactions(user_id, limit, cursor, types)
+    joined = ",".join(types) if types is not None else None
+    page = service.list_transactions(user_id, limit, cursor, joined)
     return success_envelope(serialize_transactions(page))
 
 
