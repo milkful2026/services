@@ -98,3 +98,38 @@ def test_non_bearer_authorization_header_is_ignored():
     response = client.get("/whoami", headers={"Authorization": "Basic dXNlcjpwYXNz"})
 
     assert response.status_code == 401
+
+
+def test_non_string_claims_do_not_crash_fall_through_to_401():
+    # Regression: admin_id.encode()/role.encode() previously assumed
+    # every claim decodes to a string — a hand-crafted/malformed local
+    # token with e.g. a numeric sub raised AttributeError instead of the
+    # documented 401.
+    client = TestClient(_build_app())
+    token = _fake_jwt({"sub": 12345, "cognito:groups": ["Ops"]})
+
+    response = client.get("/whoami", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 401
+
+
+def test_caller_supplied_admin_headers_cannot_override_the_token_derived_role():
+    # Regression: appending the derived X-Admin-* headers without
+    # stripping any pre-existing ones let a caller-supplied X-Admin-Role
+    # win, since Starlette's Headers.get() returns the first match —
+    # a Support-role token plus a spoofed X-Admin-Role: Ops header must
+    # still resolve to Support, not Ops.
+    client = TestClient(_build_app())
+    token = _fake_jwt({"sub": "admin-1", "cognito:groups": ["Support"]})
+
+    response = client.get(
+        "/whoami",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Admin-Id": "spoofed",
+            "X-Admin-Role": "Ops",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"adminId": "admin-1", "email": None, "role": "Support"}

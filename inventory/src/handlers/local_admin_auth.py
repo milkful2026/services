@@ -79,11 +79,29 @@ class LocalAdminAuthMiddleware:
             admin_id = claims.get("sub")
             groups = claims.get("cognito:groups") or []
             role = groups[0] if groups else None
+            email = claims.get("email")
+            # Claims come from an unverified token payload, not a typed
+            # schema — a hand-crafted/malformed local JWT could carry a
+            # non-string sub/group/email, which would otherwise raise
+            # AttributeError out of .encode() below instead of falling
+            # through to admin_context.py's own 401 as documented.
+            if not isinstance(admin_id, str):
+                admin_id = None
+            if not isinstance(role, str):
+                role = None
+            if not isinstance(email, str):
+                email = None
             if admin_id and role:
-                new_headers = list(scope["headers"])
+                # Strip any caller-supplied X-Admin-* headers first —
+                # Starlette's Headers.get() returns the FIRST match, so
+                # appending without stripping would let a client-sent
+                # X-Admin-Role silently win over the token-derived one.
+                admin_header_names = {ADMIN_ID_HEADER, ADMIN_ROLE_HEADER, ADMIN_EMAIL_HEADER}
+                new_headers = [
+                    (name, value) for name, value in scope["headers"] if name not in admin_header_names
+                ]
                 new_headers.append((ADMIN_ID_HEADER, admin_id.encode("utf-8")))
                 new_headers.append((ADMIN_ROLE_HEADER, role.encode("utf-8")))
-                email = claims.get("email")
                 if email:
                     new_headers.append((ADMIN_EMAIL_HEADER, email.encode("utf-8")))
                 scope["headers"] = new_headers
