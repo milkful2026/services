@@ -445,7 +445,11 @@ class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
         ]
 
     def list_ledger_entries(
-        self, wallet_id: str, limit: int, before_id: int | None
+        self,
+        wallet_id: str,
+        limit: int,
+        before_id: int | None,
+        types: frozenset[LedgerType] | None = None,
     ) -> list[LedgerEntry]:
         # Keyset on `id` alone — the BIGSERIAL id is monotonic with
         # insertion, so `id DESC` is chronological and portable across
@@ -459,6 +463,10 @@ class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
             )
             if before_id is not None:
                 stmt = stmt.where(ledger_entries_table.c.id < before_id)
+            if types is not None:
+                # MA-148: inside the keyset query, so a page holds `limit`
+                # matches whenever that many exist below the cursor.
+                stmt = stmt.where(ledger_entries_table.c.type.in_(sorted(t.value for t in types)))
             stmt = stmt.order_by(ledger_entries_table.c.id.desc()).limit(limit)
             with self._engine.connect() as conn:
                 rows = conn.execute(stmt).fetchall()

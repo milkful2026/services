@@ -23,6 +23,7 @@ from domain.exceptions import (
     DebitVoidedError,
     InvalidAmountError,
     InvalidCursorError,
+    InvalidTransactionTypeError,
     WalletError,
     WalletNotFoundError,
 )
@@ -170,8 +171,13 @@ class WalletService:
         return entry
 
     def list_transactions(
-        self, user_id: str, limit: int | None, cursor: str | None
+        self, user_id: str, limit: int | None, cursor: str | None, types: str | None = None
     ) -> TransactionsPage:
+        """Passbook, newest first, keyset-paginated on the ledger id. `types`
+        (MA-148) optionally restricts it to some ledger types; it's parsed before
+        any read, and the filter runs inside the keyset query so pages stay
+        full and gap-free."""
+        type_filter = _parse_types(types)
         wallet = self._repo.get_wallet_by_user(user_id)
         if wallet is None:
             raise WalletNotFoundError("No wallet for this account")
@@ -184,7 +190,9 @@ class WalletService:
             except Exception as exc:  # noqa: BLE001 — any decode failure is a bad cursor
                 raise InvalidCursorError("Malformed pagination cursor") from exc
 
-        entries = self._repo.list_ledger_entries(wallet.id, page_size + 1, before_id)
+        entries = self._repo.list_ledger_entries(
+            wallet.id, page_size + 1, before_id, types=type_filter
+        )
         has_more = len(entries) > page_size
         entries = entries[:page_size]
         next_cursor = encode_cursor(entries[-1].id) if (has_more and entries) else None
@@ -399,6 +407,21 @@ def _debit_body(order_id: str, entry: LedgerEntry) -> dict:
 
 def _void_body(order_id: str, void: DebitVoid) -> dict:
     return {"orderId": order_id, "status": "VOIDED", "voidedAt": void.voided_at.isoformat()}
+
+
+def _parse_types(raw: str | None) -> frozenset[LedgerType] | None:
+    """MA-148 FR-1 — comma-separated, case-sensitive ledger types; spaces
+    trimmed, duplicates collapsed. None means no filter."""
+    if raw is None:
+        return None
+    parts = [p.strip() for p in raw.split(",")]
+    valid = {t.value for t in LedgerType}
+    invalid = [p for p in parts if p not in valid]
+    if invalid:
+        raise InvalidTransactionTypeError(
+            "Unknown transaction type", {"field": "types", "invalid": invalid}
+        )
+    return frozenset(LedgerType(p) for p in parts)
 
 
 def render_description(entry: LedgerEntry) -> str:

@@ -85,6 +85,14 @@ class InvalidOrderIdError(WalletError):
     http_status = 400
 
 
+class InvalidTransactionTypeError(WalletError):
+    """MA-148 FR-1 — `GET /wallet/me/transactions?types=` named an unknown,
+    empty or malformed ledger type. Nothing is read."""
+
+    error_code = "VALIDATION_ERROR"
+    http_status = 400
+
+
 class InvalidAmountError(WalletError):
     error_code = "INVALID_AMOUNT"
     http_status = 400

@@ -7,13 +7,14 @@ from domain.exceptions import (
     DebitVoidedError,
     InvalidAmountError,
     InvalidCursorError,
+    InvalidTransactionTypeError,
     OrderUserMismatchError,
     RetryableConsumerError,
     ServiceUnavailableError,
     WalletNotFoundError,
     WalletProvisioningPendingError,
 )
-from domain.models import DebitResult
+from domain.models import DebitResult, LedgerType
 from tests.conftest import seed_wallet
 
 
@@ -117,6 +118,88 @@ class TestReadApis:
     def test_list_transactions_no_wallet(self, service):
         with pytest.raises(WalletNotFoundError):
             service.list_transactions("nobody", limit=10, cursor=None)
+
+
+def _mixed_ledger(service, engine):
+    """OPENING + 3 RECHARGE + 5 ORDER_DEBIT, interleaved by id."""
+    seed_wallet(engine, balance_paise=1_000_000)
+    for i in range(3):
+        service.credit_recharge(
+            _payment_confirmed(razorpayPaymentId=f"rzp_{i}", paymentId=f"pay_{i}")
+        )
+        service.debit_for_order(
+            user_id="user-1", order_id=f"ord_a{i}", amount_paise=1000, correlation_id="c"
+        )
+    for i in range(2):
+        service.debit_for_order(
+            user_id="user-1", order_id=f"ord_b{i}", amount_paise=1000, correlation_id="c"
+        )
+
+
+class TestTransactionTypeFilter:
+    """MA-148 — optional `types` filter on the passbook."""
+
+    def test_parse_types_trims_and_collapses(self):
+        from domain.wallet_service import _parse_types
+
+        assert _parse_types(None) is None
+        assert _parse_types(" RECHARGE , RECHARGE ") == frozenset({LedgerType.RECHARGE})
+        assert _parse_types("ORDER_DEBIT,REFUND") == frozenset(
+            {LedgerType.ORDER_DEBIT, LedgerType.REFUND}
+        )
+
+    @pytest.mark.parametrize(
+        "raw, invalid",
+        [("", [""]), ("RECHARGE,,X", ["", "X"]), ("recharge", ["recharge"]), ("BOGUS", ["BOGUS"])],
+    )
+    def test_parse_types_rejects(self, raw, invalid):
+        from domain.wallet_service import _parse_types
+
+        with pytest.raises(InvalidTransactionTypeError) as exc:
+            _parse_types(raw)
+        assert exc.value.details == {"field": "types", "invalid": invalid}
+
+    def test_filter_returns_only_matching_newest_first(self, service, engine):
+        _mixed_ledger(service, engine)
+        page = service.list_transactions("user-1", limit=10, cursor=None, types="RECHARGE")
+        assert [e.type for e in page.items] == [LedgerType.RECHARGE] * 3
+        assert [e.ref for e in page.items] == [
+            "razorpay_payment:rzp_2",
+            "razorpay_payment:rzp_1",
+            "razorpay_payment:rzp_0",
+        ]
+        assert page.next_cursor is None
+
+    def test_filtered_paging_is_full_and_gap_free(self, service, engine):
+        _mixed_ledger(service, engine)
+        first = service.list_transactions("user-1", limit=2, cursor=None, types="RECHARGE")
+        assert len(first.items) == 2 and first.next_cursor is not None
+        second = service.list_transactions(
+            "user-1", limit=2, cursor=first.next_cursor, types="RECHARGE"
+        )
+        assert [e.ref for e in second.items] == ["razorpay_payment:rzp_0"]
+        assert second.next_cursor is None
+
+    def test_several_types_and_absent_type(self, service, engine):
+        _mixed_ledger(service, engine)
+        both = service.list_transactions(
+            "user-1", limit=20, cursor=None, types="ORDER_DEBIT,RECHARGE"
+        )
+        assert len(both.items) == 8
+        ids = [e.id for e in both.items]
+        assert ids == sorted(ids, reverse=True)
+        none = service.list_transactions("user-1", limit=20, cursor=None, types="REFUND")
+        assert none.items == [] and none.next_cursor is None
+
+    def test_no_filter_is_unchanged(self, service, engine):
+        _mixed_ledger(service, engine)
+        page = service.list_transactions("user-1", limit=20, cursor=None)
+        assert len(page.items) == 9  # opening included
+
+    def test_bad_types_raise_before_any_read(self, service):
+        # No wallet exists: a read would raise WalletNotFoundError instead.
+        with pytest.raises(InvalidTransactionTypeError):
+            service.list_transactions("nobody", limit=10, cursor=None, types="BOGUS")
 
 
 class TestCreditRecharge:
