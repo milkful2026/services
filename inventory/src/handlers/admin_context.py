@@ -36,7 +36,11 @@ ADMIN_ID_HEADER = "x-admin-id"
 ADMIN_EMAIL_HEADER = "x-admin-email"
 ADMIN_ROLE_HEADER = "x-admin-role"
 
-OPS_ROLE = "Ops"
+# Ops is who normally operates Inventory day-to-day; SuperAdmin is let
+# through too (confirmed as a real business requirement, not a
+# convenience default) so a SuperAdmin never gets locked out of an
+# operational screen they should be able to reach.
+ALLOWED_ROLES = frozenset({"Ops", "SuperAdmin"})
 
 
 def get_caller_admin(request: Request) -> dict:
@@ -56,10 +60,10 @@ def get_caller_admin(request: Request) -> dict:
 
 
 def require_ops_role(request: Request) -> dict:
-    """MA-119 FR-3 / MA-150 §5: all five admin routes are gated to the
-    Ops role specifically (D4) — a non-Ops admin is authenticated but
-    still 403s, not silently allowed through."""
+    """MA-119 FR-3 / MA-150 §5: all five admin routes are gated to Ops
+    (D4) and SuperAdmin — any other role is authenticated but still
+    403s, not silently allowed through."""
     admin = get_caller_admin(request)
-    if admin["role"] != OPS_ROLE:
+    if admin["role"] not in ALLOWED_ROLES:
         raise AdminForbiddenError(f"role {admin['role']!r} is not permitted to call this route")
     return admin

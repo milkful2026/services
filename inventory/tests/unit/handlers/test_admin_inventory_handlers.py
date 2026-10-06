@@ -21,6 +21,11 @@ from handlers.app import app
 from handlers.dependencies import get_inventory_stock_service
 
 OPS_HEADERS = {"X-Admin-Id": "admin-1", "X-Admin-Email": "ops@milkful.test", "X-Admin-Role": "Ops"}
+SUPER_ADMIN_HEADERS = {
+    "X-Admin-Id": "admin-3",
+    "X-Admin-Email": "superadmin@milkful.test",
+    "X-Admin-Role": "SuperAdmin",
+}
 NON_OPS_HEADERS = {"X-Admin-Id": "admin-2", "X-Admin-Email": "support@milkful.test", "X-Admin-Role": "Support"}
 
 
@@ -114,6 +119,21 @@ def test_adjust_with_non_ops_role_returns_403(client, fake_service):
     assert response.status_code == 403
     assert response.json()["data"]["errorCode"] == "FORBIDDEN"
     assert fake_service.adjust_calls == []  # never reached the domain layer
+
+
+def test_adjust_with_super_admin_role_is_also_allowed_through(client, fake_service):
+    # SuperAdmin is a real business requirement here, not just Ops —
+    # a SuperAdmin must never get locked out of an operational route.
+    fake_service.adjust_result = (_stock(on_hand=15), _audit_entry())
+
+    response = client.patch(
+        "/v1/inventory",
+        json={"productId": "p1", "adjustment": 5, "reason": "recount"},
+        headers=SUPER_ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert fake_service.adjust_calls == [("p1", "admin-3", 5, "recount")]
 
 
 # --- MA-119 PATCH /inventory -----------------------------------------------
