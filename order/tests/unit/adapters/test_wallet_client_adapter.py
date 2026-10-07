@@ -1,9 +1,19 @@
+import json
+from datetime import datetime
+
 import pytest
+import requests
 import responses
 
 from adapters.wallet_client_adapter import HttpWalletClient
-from domain.exceptions import DebitVoidedError, WalletUnavailableError
-from domain.models import DebitLookup, Voided
+from domain.exceptions import (
+    DebitNotFoundError,
+    DebitVoidedError,
+    OrderUserMismatchError,
+    RefundExceedsDebitError,
+    WalletUnavailableError,
+)
+from domain.models import DebitLookup, Refunded, Voided
 
 
 def _client(max_retries: int = 1) -> HttpWalletClient:
@@ -246,4 +256,96 @@ def test_debit_voided_raises_and_is_not_retried():
     )
     with pytest.raises(DebitVoidedError):
         _client(max_retries=2).debit("user-1", "ord-1", 1000, "corr-1")
+    assert len(responses.calls) == 1
+
+
+# --- MA-153: refund (bodies exactly as Wallet's envelope sends them) ---
+
+_REFUND_URL = "http://wallet.test/wallet/internal/refunds"
+_REFUNDED = {
+    "data": {
+        "orderId": "ord-1",
+        "refundId": "cancel",
+        "status": "REFUNDED",
+        "amountPaise": 15500,
+        "balanceAfterPaise": 677646,
+        "ledgerEntryId": 812,
+        "refundedAt": "2026-10-07T09:12:03+00:00",
+        "replayed": False,
+    }
+}
+
+
+def _refund(client=None):
+    return (client or _client()).refund("user-1", "ord-1", "cancel", 15500, "corr-1")
+
+
+def _refused(code):
+    return {"status": "error", "data": {"errorCode": code, "message": "no"}}
+
+
+@responses.activate
+def test_refund_returns_refunded_and_sends_the_contract_body():
+    responses.add(responses.POST, _REFUND_URL, json=_REFUNDED, status=200)
+    outcome = _refund()
+    assert outcome == Refunded(
+        amount_paise=15500,
+        balance_after_paise=677646,
+        refunded_at=datetime.fromisoformat("2026-10-07T09:12:03+00:00"),
+        replayed=False,
+    )
+    sent = json.loads(responses.calls[0].request.body)
+    assert sent == {
+        "userId": "user-1",
+        "orderId": "ord-1",
+        "refundId": "cancel",
+        "amountPaise": 15500,
+        "correlationId": "corr-1",
+    }
+    assert responses.calls[0].request.headers["X-Correlation-Id"] == "corr-1"
+
+
+@responses.activate
+def test_refund_retries_503_then_succeeds():
+    responses.add(responses.POST, _REFUND_URL, json=_refused("SERVICE_UNAVAILABLE"), status=503)
+    responses.add(responses.POST, _REFUND_URL, json=_REFUNDED, status=200)
+    assert _refund(_client(max_retries=2)).amount_paise == 15500
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_refund_retries_a_timeout_then_succeeds():
+    responses.add(responses.POST, _REFUND_URL, body=requests.exceptions.ConnectTimeout())
+    responses.add(responses.POST, _REFUND_URL, json=_REFUNDED, status=200)
+    assert _refund(_client(max_retries=2)).amount_paise == 15500
+
+
+@pytest.mark.parametrize(
+    ("code", "exc"),
+    [
+        ("DEBIT_NOT_FOUND", DebitNotFoundError),
+        ("REFUND_EXCEEDS_DEBIT", RefundExceedsDebitError),
+        ("ORDER_USER_MISMATCH", OrderUserMismatchError),
+    ],
+)
+@responses.activate
+def test_refund_409_refusals_are_typed_and_not_retried(code, exc):
+    responses.add(responses.POST, _REFUND_URL, json=_refused(code), status=409)
+    with pytest.raises(exc):
+        _refund(_client(max_retries=2))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_refund_5xx_every_attempt_is_unavailable():
+    responses.add(responses.POST, _REFUND_URL, json=_refused("SERVICE_UNAVAILABLE"), status=503)
+    with pytest.raises(WalletUnavailableError):
+        _refund(_client(max_retries=2))
+
+
+@responses.activate
+def test_refund_unexpected_4xx_is_unavailable_and_not_retried():
+    responses.add(responses.POST, _REFUND_URL, json=_refused("VALIDATION_ERROR"), status=400)
+    with pytest.raises(WalletUnavailableError):
+        _refund(_client(max_retries=2))
     assert len(responses.calls) == 1

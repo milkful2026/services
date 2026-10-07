@@ -124,6 +124,17 @@ class DebitLookup:
 
 
 @dataclass(frozen=True)
+class Refunded:
+    """MA-153 — Wallet credited the order's refund (or replayed one that
+    already landed: `replayed=True`)."""
+
+    amount_paise: int
+    balance_after_paise: int
+    refunded_at: datetime
+    replayed: bool = False
+
+
+@dataclass(frozen=True)
 class Voided:
     """MA-142 — Wallet voided the order: no debit for it can ever commit."""
 

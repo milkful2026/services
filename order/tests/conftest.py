@@ -17,6 +17,7 @@ from domain.exceptions import (
     AddressLookupUnavailableError,
     CartUnavailableError,
     CartVersionConflictError,
+    DebitNotFoundError,
     DebitVoidedError,
     PricingUnavailableError,
     ProductPricingUnknownError,
@@ -25,7 +26,7 @@ from domain.exceptions import (
     WalletBalanceUnavailableError,
     WalletUnavailableError,
 )
-from domain.models import DebitLookup, DebitResult, Quote, Voided
+from domain.models import DebitLookup, DebitResult, Quote, Refunded, Voided
 from domain.order_service import OrderService
 
 
@@ -122,6 +123,11 @@ class FakeWalletClient:
         self.voided: dict[str, datetime] = {}
         self.raise_void_unavailable = False
         self.void_calls: list[str] = []
+        # MA-153 — refunds keyed (order_id, refund_id); `refund_exception`
+        # overrides every refund call while set.
+        self.refunded: dict[tuple[str, str], Refunded] = {}
+        self.refund_exception: Exception | None = None
+        self.refund_calls: list[tuple[str, str, str, int]] = []
 
     def debit(self, user_id: str, order_id: str, amount_paise: int, correlation_id: str):
         self.calls.append((user_id, order_id, amount_paise))
@@ -157,6 +163,21 @@ class FakeWalletClient:
         if order_id in self.debited:
             return self.debited[order_id]
         return Voided(self.voided[order_id]) if order_id in self.voided else None
+
+    def refund(
+        self, user_id: str, order_id: str, refund_id: str, amount_paise: int, correlation_id: str
+    ) -> Refunded:
+        self.refund_calls.append((user_id, order_id, refund_id, amount_paise))
+        if self.refund_exception is not None:
+            raise self.refund_exception
+        key = (order_id, refund_id)
+        if key in self.refunded:  # replay
+            first = self.refunded[key]
+            return Refunded(first.amount_paise, first.balance_after_paise, first.refunded_at, True)
+        if order_id not in self.debited:
+            raise DebitNotFoundError("fake: no debit", {"orderId": order_id})
+        self.refunded[key] = Refunded(amount_paise, self.balance_paise, datetime.now(UTC))
+        return self.refunded[key]
 
     def get_balance(self, user_id: str) -> int:
         if self.raise_balance_unavailable:
