@@ -19,6 +19,10 @@ escalated.
 Escalated orders whose charge is unknown are settled against Wallet each
 run (FR-4b), and a charged one is alarmed.
 
+Customer cancels whose refund is still PENDING (MA-154 FR-5) are refunded
+through the same step the cancel request runs, once they're a minute old
+(so the request's own attempt isn't raced).
+
 Every record is worked under a lease (see the repository), so the sweep,
 SQS redelivery and several Order tasks never run the same record at once.
 Failed attempts are counted; at the budget the record is escalated
@@ -46,6 +50,7 @@ from domain.models import (
     FAILURE_SWEEP_EXHAUSTED,
     ChargeState,
     OrderStatus,
+    RefundState,
     Voided,
 )
 
@@ -54,6 +59,8 @@ logger = logging.getLogger(__name__)
 _ORDER_FLOW = "sweep.subscription_order"
 _CHECKOUT_FLOW = "sweep.checkout"
 _SETTLE_FLOW = "sweep.settle"
+# MA-154 FR-5: leave the cancel request's own refund attempt a minute.
+_REFUND_GRACE_SECONDS = 60
 
 
 class SweepService:
@@ -247,6 +254,38 @@ class SweepService:
             },
         )
         return "escalated_charged"
+
+    # --- MA-154 FR-5: refunds still PENDING ---
+
+    def finish_pending_refunds(self, correlation_id: str, now: datetime) -> Counter:
+        counts: Counter = Counter()
+        for order_id in self._repo.list_pending_refunds(_REFUND_GRACE_SECONDS, self._batch_size):
+            counts["found"] += 1
+            try:
+                outcome = self._finish_refund(order_id, correlation_id)
+            except Exception:  # noqa: BLE001 — one record never stops the run
+                logger.exception(
+                    "sweep.refund: unexpected error",
+                    extra={"orderId": order_id, "correlationId": correlation_id},
+                )
+                self._release_quietly(order_id)
+                outcome = "error"
+            if outcome:
+                counts[outcome] += 1
+        oldest = self._repo.oldest_pending_refund_at()
+        age = max(0, int((now - oldest).total_seconds())) if oldest else 0
+        # Alarm when > 15 min (MA-154 FR-5).
+        self._metrics.emit("order.refund.pending_age_seconds", value=age)
+        return counts
+
+    def _finish_refund(self, order_id: str, correlation_id: str) -> str | None:
+        if not self._repo.claim_pending_refund(order_id, self._owner, self._lease_seconds):
+            return None  # another worker has it
+        order = self._repo.get(order_id)
+        if order is None or order.refund_state != RefundState.PENDING:
+            self._repo.release_order(order_id, self._owner)
+            return None
+        return self._order_service.finish_refund(order, correlation_id, owner=self._owner)
 
     def _release_quietly(self, order_id: str) -> None:
         try:

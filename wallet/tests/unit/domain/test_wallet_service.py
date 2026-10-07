@@ -1,4 +1,6 @@
+import jsonschema
 import pytest
+from shared.events import load_schema
 
 from adapters.wallet_repository import debit_voids_table, ledger_entries_table, wallets_table
 from domain.exceptions import (
@@ -9,6 +11,9 @@ from domain.exceptions import (
     InvalidCursorError,
     InvalidTransactionTypeError,
     OrderUserMismatchError,
+    RefundDebitNotFoundError,
+    RefundExceedsDebitError,
+    RefundOrderUserMismatchError,
     RetryableConsumerError,
     ServiceUnavailableError,
     WalletNotFoundError,
@@ -649,3 +654,135 @@ class TestVoidDebitForOrder:
     def test_void_ignores_wallet_status(self, service, engine):
         seed_wallet(engine, balance_paise=100000, status="FAILED")
         assert service.void_debit_for_order("user-1", "order-1")["status"] == "VOIDED"
+
+
+class TestRefundForOrder:
+    """MA-153 FR-2 — credit an order's debit back, exactly once."""
+
+    @staticmethod
+    def _debit(service, order_id="ord_1", amount=30000, user_id="user-1"):
+        service.debit_for_order(
+            user_id=user_id, order_id=order_id, amount_paise=amount, correlation_id="c"
+        )
+
+    @staticmethod
+    def _refund(service, order_id="ord_1", amount=30000, refund_id="cancel", user_id="user-1"):
+        return service.refund_for_order(
+            user_id=user_id,
+            order_id=order_id,
+            refund_id=refund_id,
+            amount_paise=amount,
+            correlation_id="corr-r",
+        )
+
+    @staticmethod
+    def _refund_entries(repo, user_id="user-1"):
+        w = repo.get_wallet_by_user(user_id)
+        return [
+            e for e in repo.list_ledger_entries(w.id, 50, None) if e.type == LedgerType.REFUND
+        ]
+
+    def test_refund_restores_balance_and_emits_walletrefunded(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        self._debit(service)
+        outcome = self._refund(service)
+
+        assert outcome.replayed is False
+        assert outcome.amount_paise == 30000
+        assert outcome.balance_after_paise == 100000
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+        [entry] = self._refund_entries(repo)
+        assert entry.ref == "refund:ord_1:cancel"
+        assert entry.amount_paise == 30000
+        assert outcome.ledger_entry_id == entry.id
+
+        events = [e for e in repo.fetch_unpublished() if e["event_type"] == "WalletRefunded"]
+        assert len(events) == 1
+        payload = events[0]["payload"]
+        jsonschema.validate(payload, load_schema("WalletRefunded"))
+        assert payload["ref"] == "refund:ord_1:cancel"
+        assert payload["correlationId"] == "corr-r"
+
+    def test_replay_returns_the_original_entry_and_writes_nothing(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        self._debit(service)
+        first = self._refund(service)
+        second = self._refund(service)
+
+        assert second.replayed is True
+        assert second.ledger_entry_id == first.ledger_entry_id
+        assert second.balance_after_paise == first.balance_after_paise
+        assert len(self._refund_entries(repo)) == 1
+        refunded = [e for e in repo.fetch_unpublished() if e["event_type"] == "WalletRefunded"]
+        assert len(refunded) == 1
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+
+    def test_no_debit_is_debit_not_found_409(self, service, engine):
+        seed_wallet(engine, balance_paise=100000)
+        with pytest.raises(RefundDebitNotFoundError) as exc:
+            self._refund(service)
+        assert isinstance(exc.value, DebitNotFoundError)
+        assert exc.value.http_status == 409
+
+    def test_voided_order_is_debit_not_found(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        service.void_debit_for_order("user-1", "ord_1")
+        with pytest.raises(RefundDebitNotFoundError):
+            self._refund(service)
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+
+    def test_over_refund_is_refused_with_details(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        self._debit(service)
+        self._refund(service)
+        with pytest.raises(RefundExceedsDebitError) as exc:
+            self._refund(service, amount=1, refund_id="extra")
+        assert exc.value.http_status == 409
+        assert exc.value.details == {"debitedPaise": 30000, "alreadyRefundedPaise": 30000}
+        assert len(self._refund_entries(repo)) == 1
+
+    def test_partial_refunds_up_to_exactly_the_debit_are_allowed(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        self._debit(service)
+        self._refund(service, amount=10000, refund_id="part1")
+        self._refund(service, amount=20000, refund_id="part2")
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+
+    def test_cap_matches_the_order_prefix_literally(self, service, repo, engine):
+        # `_` must not act as a LIKE wildcard: ordX1's refund isn't ord_1's.
+        seed_wallet(engine, balance_paise=100000)
+        self._debit(service, order_id="ordX1", amount=30000)
+        self._refund(service, order_id="ordX1", amount=30000)
+        self._debit(service, order_id="ord_1", amount=30000)
+        outcome = self._refund(service, order_id="ord_1", amount=30000)
+        assert outcome.replayed is False
+        assert len(self._refund_entries(repo)) == 2
+
+    @pytest.mark.parametrize("amount", [0, -1])
+    def test_non_positive_amount_is_invalid(self, service, engine, amount):
+        seed_wallet(engine, balance_paise=100000)
+        self._debit(service)
+        with pytest.raises(InvalidAmountError):
+            self._refund(service, amount=amount)
+
+    def test_failed_wallet_is_still_credited(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        self._debit(service)
+        with engine.begin() as conn:
+            conn.execute(wallets_table.update().values(status="FAILED"))
+        self._refund(service)
+        assert repo.get_wallet_by_user("user-1").balance_paise == 100000
+
+    def test_other_users_debit_is_a_409_mismatch(self, service, repo, engine):
+        seed_wallet(engine, balance_paise=100000)
+        seed_wallet(engine, user_id="user-2", wallet_id="wal_2", balance_paise=0)
+        self._debit(service)
+        with pytest.raises(RefundOrderUserMismatchError) as exc:
+            self._refund(service, user_id="user-2")
+        assert isinstance(exc.value, OrderUserMismatchError)
+        assert exc.value.http_status == 409
+        assert repo.get_wallet_by_user("user-2").balance_paise == 0
+
+    def test_no_wallet_is_not_found(self, service):
+        with pytest.raises(WalletNotFoundError):
+            self._refund(service, user_id="ghost")

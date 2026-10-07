@@ -41,6 +41,7 @@ def get_order_service() -> OrderService:
         pricing_client,
         wallet_client,
         lease_seconds=settings.sweep_lease_seconds,
+        cutoff_hour_ist=settings.checkout_cutoff_hour_ist,
     )
 
 

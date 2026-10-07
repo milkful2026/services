@@ -16,6 +16,7 @@ service — no prior scaffold.
 | GET | `/orders/me` | Cognito JWT | Paged (keyset), newest-first, optionally filtered by `subscriptionId` (FR-3) |
 | GET | `/orders/{id}` | Cognito JWT | One order's full detail (FR-3) |
 | POST | `/orders/checkout` | Cognito JWT + `Idempotency-Key` | MA-136 cart checkout — see below |
+| POST | `/orders/{id}/cancel` | Cognito JWT | MA-154 customer cancel — see below |
 
 Every order has a `source`: `SUBSCRIPTION` (materialized from
 `SubscriptionOrderDue`, one product) or `CHECKOUT` (a cart's one-time
@@ -57,8 +58,33 @@ order-id idempotency).
   `POST .../remove-items` (SigV4), Subscription `POST /internal/subscriptions`,
   Wallet `GET /wallet/internal/balance` — alongside the existing User /
   Pricing / Wallet-debit calls.
+- **Calls** (cancel): Wallet `POST /wallet/internal/refunds` (MA-153).
 - **Publishes** (transactional outbox → EventBridge): `OrderConfirmed`,
-  `OrderPaymentFailed`.
+  `OrderPaymentFailed`, `OrderCancelled` (MA-154).
+
+## Customer cancel (MA-154)
+
+`POST /orders/{id}/cancel`, body `{"reason": "ORDERED_BY_MISTAKE" | "NOT_HOME" |
+"CHANGED_MIND" | "OTHER"}` (optional; any other value → 400 `VALIDATION_ERROR`).
+Only the owner's `CONFIRMED` order, before the checkout cut-off (20:00 IST the
+day before delivery, `ORDER_CHECKOUT_CUTOFF_HOUR_IST`); otherwise 404
+`ORDER_NOT_FOUND`, 409 `ORDER_NOT_CANCELLABLE` (`status`) or 409
+`CUTOFF_PASSED` (`cancellableUntil`).
+
+- **Step A** (one transaction): `CONFIRMED` → `CANCELLED` /
+  `CUSTOMER_CANCELLED`, `refund_state` `PENDING` (or `NOT_REQUIRED` for ₹0),
+  plus the `OrderCancelled` outbox row.
+- **Step B**: refund through Wallet (`refundId` `cancel`, idempotent). `REFUNDED`
+  on success; `NOT_REQUIRED` if Wallet has no debit; otherwise it stays
+  `PENDING` and **the request still succeeds** — the sweep's refund pass
+  finishes it.
+- A repeat cancel is a 200 replay (finishing a `PENDING` refund first).
+- The refund is a synchronous call, deliberately: no Wallet consumer of
+  `OrderCancelled` exists or should be added.
+
+The order DTO (`GET /orders/me`, `/orders/{id}`) carries `cancellableUntil`
+(only while a `CONFIRMED` order can still be cancelled), `cancelReason`,
+`cancelledAt` and `refundState`.
 
 ## Materialization flow
 
@@ -145,6 +171,8 @@ Metrics (log-based, `"metric"` field): `sweep.subscription_order.{found,resumed,
 `sweep.settle.{settled_not_charged,escalated_charged}`,
 `sweep.checkout.{found,resumed,completed,completed_partial,payment_failed,cancelled,charged_after_cutoff,escalated,failed_attempt}`
 (`escalated` carries `reason`), `sweep.run_duration_ms`, `sweep.run_failed`.
+MA-154 adds `order.refund.outcome{outcome}` and `order.refund.pending_age_seconds`
+(the refund pass) and `order.cancel.count{outcome}` (the cancel request).
 `/healthz` returns 503 if the sweep thread dies.
 
 ## Data (Aurora `order`)
@@ -158,7 +186,9 @@ product_id, quantity)`; `checkouts(…)` with `UNIQUE(user_id,
 idempotency_key)` and a partial unique index allowing one `IN_PROGRESS`
 checkout per user (`migrations/0002_checkout.sql`); sweep lease/attempt
 columns, `orders.charge_state` and `carried_subscription_keys`
-(`migrations/0003_sweep.sql`); plus `outbox(…)`.
+(`migrations/0003_sweep.sql`); customer-cancel columns `cancel_reason`,
+`cancelled_at`, `refund_state`, `refunded_at` (`migrations/0004_customer_cancel.sql`);
+plus `outbox(…)`.
 
 ## Local development
 
@@ -191,6 +221,9 @@ every other service here); no real AWS/DB/network.
   `sweep.*.charged_after_cutoff` or `sweep.settle.escalated_charged` →
   ops notification (money taken, delivery at risk);
   `sweep.run_failed` ≥ 3 in 15 min → ops notification.
+  MA-154 adds: `order.refund.pending_age_seconds` > 900 → ops notification
+  (a refund stuck `PENDING`); any `order.refund.data_error` → ops
+  notification (a refund Wallet refused as a data bug).
 - `services/local-dev` wiring (`docker-compose.yml` entry, database
   bootstrap, queue/rule bootstrap) — same step.
 - The checkout's IAM grant for Cart's internal routes (Cart stack's

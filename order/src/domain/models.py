@@ -22,6 +22,27 @@ class OrderStatus(StrEnum):
 # MA-143 failure reasons set by the sweep (orders.failure_reason).
 FAILURE_CUTOFF_PASSED = "CUTOFF_PASSED"
 FAILURE_SWEEP_EXHAUSTED = "SWEEP_EXHAUSTED"
+# MA-154: the customer cancelled a CONFIRMED order before the cut-off.
+FAILURE_CUSTOMER_CANCELLED = "CUSTOMER_CANCELLED"
+
+
+class CancelReason(StrEnum):
+    """MA-154 FR-1 — the optional reason a customer gives for cancelling."""
+
+    ORDERED_BY_MISTAKE = "ORDERED_BY_MISTAKE"
+    NOT_HOME = "NOT_HOME"
+    CHANGED_MIND = "CHANGED_MIND"
+    OTHER = "OTHER"
+
+
+class RefundState(StrEnum):
+    """MA-154 `orders.refund_state` — set only on a customer cancel. PENDING
+    until Wallet confirms the refund (the sweep finishes it if the request
+    couldn't); NOT_REQUIRED for a ₹0 order or when Wallet holds no debit."""
+
+    PENDING = "PENDING"
+    REFUNDED = "REFUNDED"
+    NOT_REQUIRED = "NOT_REQUIRED"
 
 
 class ChargeState(StrEnum):
@@ -72,6 +93,18 @@ class Order:
     claim_owner: str | None = None
     last_sweep_error: str | None = None
     charge_state: ChargeState | None = None
+    # MA-154 customer cancel.
+    cancel_reason: CancelReason | None = None
+    cancelled_at: datetime | None = None
+    refund_state: RefundState | None = None
+    refunded_at: datetime | None = None
+
+    @property
+    def is_customer_cancelled(self) -> bool:
+        return (
+            self.status == OrderStatus.CANCELLED
+            and self.failure_reason == FAILURE_CUSTOMER_CANCELLED
+        )
 
     def item_list(self) -> list[OrderItem]:
         """Every order as a list of lines — a SUBSCRIPTION order's single
@@ -121,6 +154,17 @@ class DebitLookup:
     amount_paise: int
     balance_after_paise: int
     debited_at: datetime
+
+
+@dataclass(frozen=True)
+class Refunded:
+    """MA-153 — Wallet credited the order's refund (or replayed one that
+    already landed: `replayed=True`)."""
+
+    amount_paise: int
+    balance_after_paise: int
+    refunded_at: datetime
+    replayed: bool = False
 
 
 @dataclass(frozen=True)

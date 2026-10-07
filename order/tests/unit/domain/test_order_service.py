@@ -1,13 +1,22 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
+import jsonschema
 import pytest
+from shared.events import load_schema
 
+from adapters.order_repository import orders_table
 from domain.exceptions import (
     AddressLookupUnavailableError,
+    CutoffPassedError,
+    DebitNotFoundError,
+    OrderNotCancellableError,
+    OrderNotFoundError,
     PricingUnavailableError,
+    RefundExceedsDebitError,
+    ValidationError,
     WalletUnavailableError,
 )
-from domain.models import OrderStatus
+from domain.models import CancelReason, OrderStatus, RefundState
 
 DELIVERY_DATE = date(2026, 2, 1)
 
@@ -263,3 +272,191 @@ class TestSqsResumeLease:
         assert order.claim_owner is None
         assert "order.debit_refused_voided" in caplog.text
         assert repo.fetch_unpublished() == []
+
+
+# --- MA-154: customer cancellation ---------------------------------------
+
+# Cancel deadline for DELIVERY_DATE: 20:00 IST the day before = 14:30 UTC.
+_CUTOFF = datetime(2026, 1, 31, 14, 30, tzinfo=UTC)
+_BEFORE = _CUTOFF - timedelta(seconds=1)
+
+
+def _confirmed(service, repo, **overrides):
+    """A CONFIRMED (debited) subscription order for DELIVERY_DATE."""
+    _materialize(service, **overrides)
+    order = repo.get_by_subscription_and_date(
+        overrides.get("subscription_id", "sub-1"), DELIVERY_DATE
+    )
+    assert order.status == OrderStatus.CONFIRMED
+    return order
+
+
+def _cancel(service, order_id, *, user_id="user-1", reason="NOT_HOME", now=_BEFORE):
+    return service.cancel(order_id, user_id, reason, now, "corr-cancel")
+
+
+def _cancelled_events(repo):
+    return [e for e in repo.fetch_unpublished() if e["event_type"] == "OrderCancelled"]
+
+
+def _set(engine, order_id, **values):
+    with engine.begin() as conn:
+        conn.execute(orders_table.update().where(orders_table.c.id == order_id).values(**values))
+
+
+class TestCancel:
+    def test_cancels_refunds_and_publishes_one_event(self, service, repo, wallet_client):
+        order = _confirmed(service, repo)
+        body = _cancel(service, order.id)
+
+        stored = repo.get(order.id)
+        assert stored.status == OrderStatus.CANCELLED
+        assert stored.failure_reason == "CUSTOMER_CANCELLED"
+        assert stored.cancel_reason == CancelReason.NOT_HOME
+        assert stored.refund_state == RefundState.REFUNDED
+        assert stored.refunded_at is not None
+        assert wallet_client.refund_calls == [
+            ("user-1", order.id, "cancel", order.amount_paise)
+        ]
+        assert body["status"] == "CANCELLED"
+        assert body["refundState"] == "REFUNDED"
+        assert body["cancelReason"] == "NOT_HOME"
+        assert body["cancellableUntil"] is None
+        assert body["cancelledAt"]
+
+        [event] = _cancelled_events(repo)
+        payload = event["payload"]
+        jsonschema.validate(payload, load_schema("OrderCancelled"))
+        assert payload["refundState"] == "PENDING"  # the value at cancel time
+        assert payload["cancelReason"] == "NOT_HOME"
+        assert payload["items"] == [{"productId": "prod-1", "quantity": 2}]
+        assert payload["correlationId"] == "corr-cancel"
+
+    def test_no_reason_is_stored_as_null(self, service, repo):
+        order = _confirmed(service, repo)
+        _cancel(service, order.id, reason=None)
+        assert repo.get(order.id).cancel_reason is None
+        jsonschema.validate(_cancelled_events(repo)[0]["payload"], load_schema("OrderCancelled"))
+
+    @pytest.mark.parametrize("reason", ["LOL", "not_home", 5, ""])
+    def test_unknown_reason_is_a_validation_error(self, service, repo, reason):
+        order = _confirmed(service, repo)
+        with pytest.raises(ValidationError):
+            _cancel(service, order.id, reason=reason)
+        assert repo.get(order.id).status == OrderStatus.CONFIRMED
+
+    def test_at_the_cutoff_is_refused(self, service, repo, wallet_client):
+        order = _confirmed(service, repo)
+        with pytest.raises(CutoffPassedError) as exc:
+            _cancel(service, order.id, now=_CUTOFF)
+        assert exc.value.details == {"cancellableUntil": "2026-01-31T20:00:00+05:30"}
+        assert repo.get(order.id).status == OrderStatus.CONFIRMED
+        assert wallet_client.refund_calls == []
+
+    def test_one_second_before_the_cutoff_succeeds(self, service, repo):
+        order = _confirmed(service, repo)
+        assert _cancel(service, order.id, now=_BEFORE)["status"] == "CANCELLED"
+
+    def test_another_users_order_is_not_found(self, service, repo):
+        order = _confirmed(service, repo)
+        with pytest.raises(OrderNotFoundError):
+            _cancel(service, order.id, user_id="user-2")
+        with pytest.raises(OrderNotFoundError):
+            _cancel(service, "ord_unknown")
+
+    def test_payment_failed_is_not_cancellable(self, service, repo, wallet_client):
+        wallet_client.result_status = "INSUFFICIENT_BALANCE"
+        _materialize(service)
+        order = repo.get_by_subscription_and_date("sub-1", DELIVERY_DATE)
+        with pytest.raises(OrderNotCancellableError) as exc:
+            _cancel(service, order.id)
+        assert exc.value.details == {"status": "PAYMENT_FAILED"}
+
+    @pytest.mark.parametrize(
+        ("status", "reason"), [("CREATED", None), ("CANCELLED", "CUTOFF_PASSED")]
+    )
+    def test_other_statuses_are_not_cancellable(self, service, repo, engine, status, reason):
+        order = _confirmed(service, repo)
+        _set(engine, order.id, status=status, failure_reason=reason)
+        with pytest.raises(OrderNotCancellableError):
+            _cancel(service, order.id)
+
+    def test_replay_after_refund_calls_wallet_once(self, service, repo, wallet_client):
+        order = _confirmed(service, repo)
+        first = _cancel(service, order.id)
+        # A replay is answered even after the cut-off: it changes nothing.
+        second = _cancel(service, order.id, now=_CUTOFF + timedelta(hours=1))
+        assert second["status"] == first["status"] == "CANCELLED"
+        assert second["refundState"] == "REFUNDED"
+        assert len(wallet_client.refund_calls) == 1
+        assert len(_cancelled_events(repo)) == 1
+
+    def test_replay_while_pending_finishes_the_refund(self, service, repo, wallet_client):
+        order = _confirmed(service, repo)
+        wallet_client.refund_exception = WalletUnavailableError("down")
+        assert _cancel(service, order.id)["refundState"] == "PENDING"
+        wallet_client.refund_exception = None
+        assert _cancel(service, order.id)["refundState"] == "REFUNDED"
+        assert len(wallet_client.refund_calls) == 2
+
+    def test_wallet_unavailable_still_cancels_with_refund_pending(
+        self, service, repo, wallet_client
+    ):
+        order = _confirmed(service, repo)
+        wallet_client.refund_exception = WalletUnavailableError("down")
+        body = _cancel(service, order.id)
+        assert body["status"] == "CANCELLED"
+        assert body["refundState"] == "PENDING"
+
+    def test_no_debit_found_means_no_refund_required(self, service, repo, wallet_client):
+        order = _confirmed(service, repo)
+        wallet_client.refund_exception = DebitNotFoundError("none")
+        assert _cancel(service, order.id)["refundState"] == "NOT_REQUIRED"
+
+    def test_refund_data_error_stays_pending(self, service, repo, wallet_client):
+        order = _confirmed(service, repo)
+        wallet_client.refund_exception = RefundExceedsDebitError("bug")
+        assert _cancel(service, order.id)["refundState"] == "PENDING"
+
+    def test_zero_amount_order_needs_no_refund(self, service, repo, engine, wallet_client):
+        order = _confirmed(service, repo)
+        _set(engine, order.id, amount_paise=0)
+        body = _cancel(service, order.id)
+        assert body["refundState"] == "NOT_REQUIRED"
+        assert wallet_client.refund_calls == []
+        payload = _cancelled_events(repo)[0]["payload"]
+        assert payload["refundState"] == "NOT_REQUIRED"
+        jsonschema.validate(payload, load_schema("OrderCancelled"))
+
+    def test_lost_race_replays_the_winner(self, service, repo, monkeypatch):
+        order = _confirmed(service, repo)
+        _cancel(service, order.id)
+        # As if this request read the order just before the winner committed.
+        stale = repo.get(order.id)
+        stale.status, stale.failure_reason = OrderStatus.CONFIRMED, None
+        reads = iter([stale])
+        real_get = repo.get
+        monkeypatch.setattr(repo, "get", lambda oid: next(reads, None) or real_get(oid))
+        body = _cancel(service, order.id)
+        assert body["status"] == "CANCELLED"
+        assert len(_cancelled_events(repo)) == 1
+
+
+class TestCancellableUntil:
+    def test_set_for_confirmed_before_the_cutoff(self, service, repo):
+        order = _confirmed(service, repo)
+        body = service.get(order.id, "user-1", now=_BEFORE)
+        assert body["cancellableUntil"] == "2026-01-31T20:00:00+05:30"
+        assert body["refundState"] is None
+        assert body["cancelReason"] is None
+        assert body["cancelledAt"] is None
+
+    def test_null_at_and_after_the_cutoff(self, service, repo):
+        order = _confirmed(service, repo)
+        assert service.get(order.id, "user-1", now=_CUTOFF)["cancellableUntil"] is None
+
+    def test_null_for_other_statuses(self, service, wallet_client):
+        wallet_client.result_status = "INSUFFICIENT_BALANCE"
+        _materialize(service)
+        listed = service.list_for_user("user-1", None, None, None, now=_BEFORE)
+        assert [o["cancellableUntil"] for o in listed["items"]] == [None]

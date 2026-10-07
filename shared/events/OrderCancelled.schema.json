@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milkful.internal/events/OrderCancelled.schema.json",
+  "title": "OrderCancelled",
+  "description": "EventBridge `detail` for an order the customer cancelled before the cut-off (MA-154). Published once, at cancel time; the refund's outcome is carried by WalletRefunded, not by a second order event. Producer: milkful.order. Consumers (all future): Notification Service (MA-103), Reporting (MA-104), Delivery Service (MA-102). Not routed to Wallet: the refund is a synchronous call (MA-153).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "occurredAt",
+    "correlationId",
+    "orderId",
+    "userId",
+    "source",
+    "amountPaise",
+    "deliveryDate",
+    "cancelledBy",
+    "refundState"
+  ],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1, "description": "Dedupe key for consumers." },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "minLength": 1 },
+    "orderId": { "type": "string", "minLength": 1 },
+    "userId": { "type": "string", "minLength": 1, "description": "Cognito sub." },
+    "source": { "type": "string", "enum": ["SUBSCRIPTION", "CHECKOUT"] },
+    "subscriptionId": { "type": ["string", "null"], "minLength": 1, "description": "Set for SUBSCRIPTION." },
+    "checkoutId": { "type": ["string", "null"], "minLength": 1, "description": "Set for CHECKOUT." },
+    "items": {
+      "type": "array",
+      "description": "Every line in the order (same shape as OrderConfirmed's).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["productId", "quantity"],
+        "properties": {
+          "productId": { "type": "string", "minLength": 1 },
+          "quantity": { "type": "integer", "exclusiveMinimum": 0 }
+        }
+      }
+    },
+    "amountPaise": { "type": "integer", "minimum": 0, "description": "0 for a ₹0 order (refundState NOT_REQUIRED)." },
+    "deliveryDate": { "type": "string", "format": "date" },
+    "cancelledBy": { "const": "CUSTOMER" },
+    "cancelReason": {
+      "type": ["string", "null"],
+      "enum": ["ORDERED_BY_MISTAKE", "NOT_HOME", "CHANGED_MIND", "OTHER", null]
+    },
+    "refundState": {
+      "type": "string",
+      "enum": ["PENDING", "NOT_REQUIRED"],
+      "description": "The value at cancel time."
+    }
+  }
+}

@@ -217,6 +217,30 @@ class DebitVoidedError(OrderError):
     http_status = 409
 
 
+class DebitNotFoundError(OrderError):
+    """MA-153 — Wallet has no debit for the order to refund (never charged,
+    or voided). A definite answer: never retried; the refund isn't needed."""
+
+    error_code = "DEBIT_NOT_FOUND"
+    http_status = 409
+
+
+class RefundExceedsDebitError(OrderError):
+    """MA-153 — the refund would exceed what Wallet debited for the order. A
+    data bug, never retried: alarmed and left for support."""
+
+    error_code = "REFUND_EXCEEDS_DEBIT"
+    http_status = 409
+
+
+class OrderUserMismatchError(OrderError):
+    """MA-153 — Wallet holds the order's debit on another user's wallet. A
+    data bug, never retried: alarmed and left for support."""
+
+    error_code = "ORDER_USER_MISMATCH"
+    http_status = 409
+
+
 class OrderBusyError(OrderError):
     """MA-143 FR-5 — another worker (the sweep) holds this order's lease.
     Raised on the SQS resume path only; the consumer leaves the message
@@ -240,6 +264,22 @@ class CheckoutNeedsAttentionError(OrderError):
     """MA-144 FR-5 — replay of a checkout the sweep escalated."""
 
     error_code = "CHECKOUT_NEEDS_ATTENTION"
+    http_status = 409
+
+
+class OrderNotCancellableError(OrderError):
+    """MA-154 FR-2 — only a CONFIRMED order can be cancelled by its customer.
+    `details`: status."""
+
+    error_code = "ORDER_NOT_CANCELLABLE"
+    http_status = 409
+
+
+class CutoffPassedError(OrderError):
+    """MA-154 FR-2 — the cancel deadline (the checkout cut-off, the day
+    before delivery) has passed. `details`: cancellableUntil."""
+
+    error_code = "CUTOFF_PASSED"
     http_status = 409
 
 

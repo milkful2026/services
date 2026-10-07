@@ -45,16 +45,25 @@ from adapters.interfaces import (
     UserClientPort,
     WalletClientPort,
 )
+from adapters.logging_metrics import LoggingMetricsRecorder
 from adapters.order_repository import decode_cursor, new_order_id
+from domain.cutoff import delivery_cutoff_moment, delivery_cutoff_passed
 from domain.exceptions import (
+    CutoffPassedError,
+    DebitNotFoundError,
     DebitVoidedError,
     InvalidCursorError,
     OrderBusyError,
+    OrderError,
+    OrderNotCancellableError,
     OrderNotFoundError,
+    OrderUserMismatchError,
     ProductPricingUnknownError,
+    RefundExceedsDebitError,
+    ValidationError,
     WalletUnavailableError,
 )
-from domain.models import Order, OrdersPage, OrderStatus
+from domain.models import CancelReason, Order, OrdersPage, OrderStatus, RefundState
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +80,17 @@ class OrderService:
         wallet_client: WalletClientPort,
         *,
         lease_seconds: float = 120,
+        cutoff_hour_ist: int = 20,
+        metrics=None,
     ) -> None:
         self._repo = repository
         self._user_client = user_client
         self._pricing_client = pricing_client
         self._wallet_client = wallet_client
         self._lease_seconds = lease_seconds
+        # MA-154: the cancel deadline is the checkout cut-off (Settings).
+        self._cutoff_hour_ist = cutoff_hour_ist
+        self._metrics = metrics or LoggingMetricsRecorder()
 
     def materialize(
         self,
@@ -286,17 +300,162 @@ class OrderService:
         self._repo.mark_payment_failed(order.id, reason, "OrderPaymentFailed", payload)
         logger.info("order.payment_failed", extra={"orderId": order.id, "reason": reason})
 
+    # --- MA-154: customer cancellation ---
+
+    def cancel(
+        self,
+        order_id: str,
+        user_id: str,
+        reason: object,
+        now: datetime,
+        correlation_id: str,
+    ) -> dict:
+        """`POST /orders/{id}/cancel`. Step A cancels and enqueues
+        OrderCancelled in one transaction; Step B then refunds through Wallet
+        (MA-153). Cancelling first means a cancelled order is never
+        delivered; a refund that can't complete now stays PENDING for the
+        sweep, and the request still succeeds. A repeat cancel is a replay
+        (200 with the current state), finishing a PENDING refund first."""
+        cancel_reason = _parse_reason(reason)
+        order = self._repo.get(order_id)
+        if self._check_cancellable(order, order_id, user_id, now):
+            return self._replay(order, now, correlation_id)
+
+        refund_state = RefundState.PENDING if order.amount_paise > 0 else RefundState.NOT_REQUIRED
+        won = self._repo.cancel_by_customer(
+            order.id,
+            reason=cancel_reason,
+            now=now,
+            refund_state=refund_state,
+            outbox_payload=_order_cancelled_payload(
+                order, cancel_reason, refund_state, now, correlation_id
+            ),
+        )
+        if not won:
+            # A concurrent cancel or another transition got there first.
+            order = self._repo.get(order_id)
+            self._check_cancellable(order, order_id, user_id, now)  # raises unless a replay
+            return self._replay(order, now, correlation_id)
+
+        if refund_state == RefundState.PENDING:
+            self.finish_refund(order, correlation_id)
+        cancelled = self._repo.get(order.id)
+        self._log_cancel(cancelled, "cancelled", correlation_id)
+        return _serialize(cancelled, now, self._cutoff_hour_ist)
+
+    def _check_cancellable(
+        self, order: Order | None, order_id: str, user_id: str, now: datetime
+    ) -> bool:
+        """FR-2, in order. True for a replay (already cancelled by its
+        customer); otherwise raises unless the order may be cancelled now."""
+        if order is None or order.user_id != user_id:
+            # 404, not 403 — don't leak existence to a non-owner.
+            raise OrderNotFoundError(f"No order {order_id!r}")
+        if order.is_customer_cancelled:
+            return True
+        if order.status != OrderStatus.CONFIRMED:
+            raise OrderNotCancellableError(
+                "Only a confirmed order can be cancelled", {"status": order.status.value}
+            )
+        if delivery_cutoff_passed(order.delivery_date, now, self._cutoff_hour_ist):
+            until = delivery_cutoff_moment(order.delivery_date, self._cutoff_hour_ist)
+            raise CutoffPassedError(
+                "The cancellation cut-off has passed", {"cancellableUntil": until.isoformat()}
+            )
+        return False
+
+    def _replay(self, order: Order, now: datetime, correlation_id: str) -> dict:
+        if order.refund_state == RefundState.PENDING:
+            # A customer retry can finish the refund sooner than the sweep.
+            self.finish_refund(order, correlation_id)
+            order = self._repo.get(order.id)
+        self._log_cancel(order, "replayed", correlation_id)
+        return _serialize(order, now, self._cutoff_hour_ist)
+
+    def finish_refund(self, order: Order, correlation_id: str, *, owner: str | None = None) -> str:
+        """FR-3 Step B, shared by the cancel request and the sweep (FR-5).
+        Never raises: a refund that can't complete stays PENDING. Returns
+        `refunded`, `not_required`, `still_pending` or `error`. With `owner`
+        (the sweep), the lease is released whatever happens."""
+        try:
+            self._wallet_client.refund(
+                order.user_id, order.id, _REFUND_ID, order.amount_paise, correlation_id
+            )
+        except DebitNotFoundError:
+            # A CONFIRMED order should always have a debit: investigate.
+            logger.warning(
+                "order.refund: no debit found, nothing to refund",
+                extra={"orderId": order.id, "correlationId": correlation_id},
+            )
+            self._repo.mark_refund_state(order.id, RefundState.NOT_REQUIRED, owner=owner)
+            return self._refund_outcome(order.id, "not_required")
+        except (RefundExceedsDebitError, OrderUserMismatchError) as exc:
+            # A data bug: alarmed, left PENDING for support.
+            logger.error(
+                "order.refund.data_error",
+                extra={
+                    "metric": "order.refund.data_error",
+                    "orderId": order.id,
+                    "errorCode": exc.error_code,
+                    "correlationId": correlation_id,
+                },
+            )
+            self._release(order.id, owner)
+            return self._refund_outcome(order.id, "error")
+        except Exception:  # noqa: BLE001 — Wallet down, timeout, anything: retried by the sweep
+            logger.warning(
+                "order.refund: still pending",
+                exc_info=True,
+                extra={"orderId": order.id, "correlationId": correlation_id},
+            )
+            self._release(order.id, owner)
+            return self._refund_outcome(order.id, "still_pending")
+        self._repo.mark_refund_state(
+            order.id, RefundState.REFUNDED, refunded_at=datetime.now(UTC), owner=owner
+        )
+        return self._refund_outcome(order.id, "refunded")
+
+    def _release(self, order_id: str, owner: str | None) -> None:
+        if owner is None:
+            return
+        try:
+            self._repo.release_order(order_id, owner)
+        except OrderError:
+            pass  # the lease expires on its own
+
+    def _refund_outcome(self, order_id: str, outcome: str) -> str:
+        self._metrics.emit("order.refund.outcome", outcome=outcome, orderId=order_id)
+        return outcome
+
+    def _log_cancel(self, order: Order, outcome: str, correlation_id: str) -> None:
+        refund_state = order.refund_state.value if order.refund_state else None
+        logger.info(
+            "order.cancel",
+            extra={
+                "orderId": order.id,
+                "outcome": outcome,
+                "refundState": refund_state,
+                "correlationId": correlation_id,
+            },
+        )
+        self._metrics.emit("order.cancel.count", outcome=outcome)
+
     # --- FR-3: read APIs ---
 
-    def get(self, order_id: str, user_id: str) -> dict:
+    def get(self, order_id: str, user_id: str, now: datetime | None = None) -> dict:
         order = self._repo.get(order_id)
         if order is None or order.user_id != user_id:
             # 404, not 403 — don't leak existence to a non-owner.
             raise OrderNotFoundError(f"No order {order_id!r}")
-        return _serialize(order)
+        return _serialize(order, now or datetime.now(UTC), self._cutoff_hour_ist)
 
     def list_for_user(
-        self, user_id: str, subscription_id: str | None, limit: int | None, cursor: str | None
+        self,
+        user_id: str,
+        subscription_id: str | None,
+        limit: int | None,
+        cursor: str | None,
+        now: datetime | None = None,
     ) -> dict:
         page_size = _DEFAULT_PAGE if not limit else max(1, min(limit, _MAX_PAGE))
         before_seq = None
@@ -307,13 +466,62 @@ class OrderService:
                 raise InvalidCursorError("Malformed pagination cursor") from exc
 
         page: OrdersPage = self._repo.list_for_user(user_id, subscription_id, page_size, before_seq)
+        now = now or datetime.now(UTC)
         return {
-            "items": [_serialize(o) for o in page.items],
+            "items": [_serialize(o, now, self._cutoff_hour_ist) for o in page.items],
             "nextCursor": page.next_cursor,
         }
 
 
-def _serialize(order: Order) -> dict:
+_REFUND_ID = "cancel"  # MA-153: MA-32 refunds each order once, in full.
+
+
+def _parse_reason(reason: object) -> CancelReason | None:
+    if reason is None:
+        return None
+    if isinstance(reason, str) and reason in CancelReason.__members__:
+        return CancelReason(reason)
+    raise ValidationError(
+        "reason must be one of " + ", ".join(CancelReason), {"field": "reason"}
+    )
+
+
+def _order_cancelled_payload(
+    order: Order,
+    reason: CancelReason | None,
+    refund_state: RefundState,
+    now: datetime,
+    correlation_id: str,
+) -> dict:
+    """MA-154 FR-6. `items` lists every line, a subscription order's single
+    product included: the schema has no productId, and consumers (e.g.
+    Delivery dropping the stop) need to know what was cancelled."""
+    return {
+        "eventId": str(uuid.uuid4()),
+        "occurredAt": now.astimezone(UTC).isoformat(),
+        "correlationId": correlation_id,
+        "orderId": order.id,
+        "userId": order.user_id,
+        "source": order.source.value,
+        "subscriptionId": order.subscription_id,
+        "checkoutId": order.checkout_id,
+        "items": [
+            {"productId": item.product_id, "quantity": item.quantity}
+            for item in order.item_list()
+        ],
+        "amountPaise": order.amount_paise,
+        "deliveryDate": order.delivery_date.isoformat(),
+        "cancelledBy": "CUSTOMER",
+        "cancelReason": reason.value if reason else None,
+        "refundState": refund_state.value,
+    }
+
+
+def _iso(value) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _serialize(order: Order, now: datetime, cutoff_hour_ist: int) -> dict:
     return {
         "orderId": order.id,
         # MA-136 FR-10 — SUBSCRIPTION | CHECKOUT; `items` lists every line
@@ -333,4 +541,16 @@ def _serialize(order: Order) -> dict:
         "failureReason": order.failure_reason,
         "createdAt": order.created_at.isoformat() if order.created_at else None,
         "confirmedAt": order.confirmed_at.isoformat() if order.confirmed_at else None,
+        # MA-154 FR-7 — additive; `cancellableUntil` only while it's still open.
+        "cancellableUntil": _cancellable_until(order, now, cutoff_hour_ist),
+        "cancelReason": order.cancel_reason.value if order.cancel_reason else None,
+        "cancelledAt": _iso(order.cancelled_at),
+        "refundState": order.refund_state.value if order.refund_state else None,
     }
+
+
+def _cancellable_until(order: Order, now: datetime, cutoff_hour_ist: int) -> str | None:
+    if order.status != OrderStatus.CONFIRMED:
+        return None
+    until = delivery_cutoff_moment(order.delivery_date, cutoff_hour_ist)
+    return until.isoformat() if now < until else None

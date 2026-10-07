@@ -7,7 +7,13 @@ from typing import Any
 from pydantic import BaseModel, Field
 from shared.handlers.dto import error_envelope, success_envelope  # noqa: F401
 
-from domain.models import DebitOutcome, DebitResult, LedgerEntry, TransactionsPage
+from domain.models import (
+    DebitOutcome,
+    DebitResult,
+    LedgerEntry,
+    RefundOutcome,
+    TransactionsPage,
+)
 from domain.wallet_service import render_description
 
 
@@ -22,6 +28,19 @@ class VoidRequest(BaseModel):
     """MA-142 FR-2 — the order's owner, whose wallet row the void locks."""
 
     userId: str = Field(min_length=1, max_length=64)  # noqa: N815
+
+
+class RefundRequest(BaseModel):
+    """MA-153 FR-1. Every field optional and unconstrained on purpose: this
+    app maps no RequestValidationError to 400, so bad input must reach the
+    handler's own checks (400 VALIDATION_ERROR / INVALID_AMOUNT), not
+    FastAPI's 422."""
+
+    userId: str | None = None  # noqa: N815 — wire contract casing
+    orderId: str | None = None  # noqa: N815
+    refundId: str | None = None  # noqa: N815
+    amountPaise: int | None = None  # noqa: N815
+    correlationId: str | None = None  # noqa: N815
 
 
 def _iso(value) -> str | None:
@@ -60,3 +79,17 @@ def serialize_debit_outcome(outcome: DebitOutcome) -> dict[str, Any]:
             "requiredPaise": outcome.required_paise,
         }
     return {"status": DebitResult.WALLET_NOT_ACTIVE.value}
+
+
+def serialize_refund(outcome: RefundOutcome) -> dict[str, Any]:
+    """MA-153 FR-3 — a replay carries the original entry's values."""
+    return {
+        "orderId": outcome.order_id,
+        "refundId": outcome.refund_id,
+        "status": "REFUNDED",
+        "amountPaise": outcome.amount_paise,
+        "balanceAfterPaise": outcome.balance_after_paise,
+        "ledgerEntryId": outcome.ledger_entry_id,
+        "refundedAt": _iso(outcome.refunded_at),
+        "replayed": outcome.replayed,
+    }

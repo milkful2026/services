@@ -4,7 +4,15 @@ never imports SQLAlchemy, `requests`, or boto3 directly."""
 from datetime import datetime
 from typing import Protocol
 
-from domain.models import DebitLookup, DebitResult, Order, OrdersPage, Quote, Voided
+from domain.models import (
+    DebitLookup,
+    DebitResult,
+    Order,
+    OrdersPage,
+    Quote,
+    Refunded,
+    Voided,
+)
 
 
 class OrderRepositoryPort(Protocol):
@@ -102,4 +110,18 @@ class WalletClientPort(Protocol):
     def get_debit(self, order_id: str) -> DebitLookup | Voided | None:
         """MA-142, diagnostics only. None means "not debited yet" — never
         grounds to close an order."""
+        ...
+
+    def refund(
+        self,
+        user_id: str,
+        order_id: str,
+        refund_id: str,
+        amount_paise: int,
+        correlation_id: str,
+    ) -> Refunded:
+        """MA-153 — idempotent on (order_id, refund_id). Raises
+        DebitNotFoundError / RefundExceedsDebitError / OrderUserMismatchError
+        for Wallet's definite 409s (never retried), and WalletUnavailableError
+        when Wallet can't be asked."""
         ...

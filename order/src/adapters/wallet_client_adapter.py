@@ -15,6 +15,9 @@ any other 5xx, and if still failing after retries surfaces as
 subscription's first order right after registration retries via SQS
 redelivery instead of permanently failing.
 
+MA-153 adds `refund` (`POST /wallet/internal/refunds`), used by a
+customer cancel (MA-154).
+
 MA-142 adds the void (`POST /wallet/internal/debits/{orderId}/void`) and
 the read-only lookup, and `debit` now raises `DebitVoidedError` on
 `409 DEBIT_VOIDED` (never retried). Wallet's error envelope flattens an
@@ -28,11 +31,14 @@ from requests.exceptions import RequestException
 from shared.adapters.retry import call_with_retry
 
 from domain.exceptions import (
+    DebitNotFoundError,
     DebitVoidedError,
+    OrderUserMismatchError,
+    RefundExceedsDebitError,
     WalletBalanceUnavailableError,
     WalletUnavailableError,
 )
-from domain.models import DebitLookup, DebitResult, Voided
+from domain.models import DebitLookup, DebitResult, Refunded, Voided
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,14 @@ class _RetryableWalletError(Exception):
 
 class _UnexpectedWalletResponse(Exception):
     """A 4xx the contract doesn't allow — not retried, never read as an answer."""
+
+
+# MA-153 FR-4 — Wallet's definite refund refusals (all 409s).
+_REFUND_REFUSALS = {
+    "DEBIT_NOT_FOUND": DebitNotFoundError,
+    "REFUND_EXCEEDS_DEBIT": RefundExceedsDebitError,
+    "ORDER_USER_MISMATCH": OrderUserMismatchError,
+}
 
 
 class HttpWalletClient:
@@ -188,6 +202,58 @@ class HttpWalletClient:
 
         return self._call_debits_route(_attempt, "get_debit", order_id)
 
+    def refund(
+        self,
+        user_id: str,
+        order_id: str,
+        refund_id: str,
+        amount_paise: int,
+        correlation_id: str,
+    ) -> Refunded:
+        """MA-153 FR-6 — `POST /wallet/internal/refunds`. Idempotent on
+        (order_id, refund_id), so transport failures and 5xx are retried
+        with the client's usual policy. Wallet's definite 409s raise their
+        typed exception, never retried. Exhausted retries or a response
+        outside the contract raise WalletUnavailableError."""
+        url = f"{self._base_url}/wallet/internal/refunds"
+        body = {
+            "userId": user_id,
+            "orderId": order_id,
+            "refundId": refund_id,
+            "amountPaise": amount_paise,
+            "correlationId": correlation_id,
+        }
+
+        def _attempt() -> Refunded:
+            try:
+                response = requests.post(
+                    url,
+                    json=body,
+                    timeout=self._timeout_seconds,
+                    headers={
+                        "x-request-id": self._correlation_id,
+                        "X-Correlation-Id": correlation_id,
+                    },
+                )
+            except RequestException as exc:
+                raise _RetryableWalletError(str(exc)) from exc
+            if response.status_code >= 500:
+                raise _RetryableWalletError(f"Wallet returned HTTP {response.status_code}")
+            data = _data(response)
+            if response.status_code == 200:
+                return _refunded(data)
+            refused = _REFUND_REFUSALS.get(data.get("errorCode"))
+            if response.status_code == 409 and refused is not None:
+                raise refused(
+                    f"Wallet refused the refund: {data.get('errorCode')}",
+                    {"orderId": order_id, "refundId": refund_id},
+                )
+            raise _UnexpectedWalletResponse(
+                f"Wallet returned HTTP {response.status_code} ({data.get('errorCode')})"
+            )
+
+        return self._call_debits_route(_attempt, "refund", order_id)
+
     def _call_debits_route(self, attempt, operation: str, order_id: str):
         """Retry transport failures and 5xx with the client's usual policy;
         a response outside the contract is a bug, logged and not retried.
@@ -279,6 +345,18 @@ def _debit_lookup(data: dict) -> DebitLookup:
         )
     except (ValueError, KeyError, TypeError) as exc:
         raise _UnexpectedWalletResponse(f"malformed debit body from Wallet: {exc}") from exc
+
+
+def _refunded(data: dict) -> Refunded:
+    try:
+        return Refunded(
+            amount_paise=int(data["amountPaise"]),
+            balance_after_paise=int(data["balanceAfterPaise"]),
+            refunded_at=datetime.fromisoformat(data["refundedAt"]),
+            replayed=bool(data.get("replayed", False)),
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise _UnexpectedWalletResponse(f"malformed refund body from Wallet: {exc}") from exc
 
 
 def _voided(data: dict) -> Voided:
