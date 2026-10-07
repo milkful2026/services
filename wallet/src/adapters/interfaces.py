@@ -3,7 +3,14 @@ never imports SQLAlchemy or boto3 directly."""
 
 from typing import Protocol
 
-from domain.models import DebitOutcome, DebitVoid, LedgerEntry, LedgerType, Wallet
+from domain.models import (
+    DebitOutcome,
+    DebitVoid,
+    LedgerEntry,
+    LedgerType,
+    RefundOutcome,
+    Wallet,
+)
 
 
 class WalletRepositoryPort(Protocol):
@@ -80,6 +87,27 @@ class WalletRepositoryPort(Protocol):
         INSUFFICIENT_BALANCE; otherwise inserts the ORDER_DEBIT ledger
         row, decrements the balance, and enqueues
         a WalletDebited outbox row built by
+        `outbox_payload_builder(wallet_id, balance_after_paise)`."""
+        ...
+
+    def refund_for_order(
+        self,
+        *,
+        user_id: str,
+        order_id: str,
+        refund_id: str,
+        amount_paise: int,
+        ref: str,
+        correlation_id: str | None,
+        outbox_payload_builder,
+    ) -> RefundOutcome:
+        """MA-153 FR-2, one transaction: SELECT ... FOR UPDATE the wallet (no
+        row -> WalletNotFoundError); `ref` already refunded -> replay (or
+        RefundOrderUserMismatchError on another wallet); no ORDER_DEBIT for
+        the order -> RefundDebitNotFoundError; over the debited amount ->
+        RefundExceedsDebitError; otherwise inserts the REFUND ledger row,
+        increments the balance (whatever the wallet's status), and enqueues
+        a WalletRefunded outbox row built by
         `outbox_payload_builder(wallet_id, balance_after_paise)`."""
         ...
 

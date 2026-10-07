@@ -71,6 +71,21 @@ class DebitResult(StrEnum):
 
 
 @dataclass
+class RefundOutcome:
+    """MA-153 FR-3 — a refund's ledger entry. On a replay, the original
+    entry's values with `replayed=True`."""
+
+    order_id: str
+    refund_id: str
+    wallet_id: str
+    amount_paise: int
+    balance_after_paise: int
+    ledger_entry_id: int
+    refunded_at: datetime
+    replayed: bool = False
+
+
+@dataclass
 class DebitOutcome:
     result: DebitResult
     wallet_id: str | None = None

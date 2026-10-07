@@ -80,6 +80,31 @@ class AlreadyDebitedError(WalletError):
     http_status = 409
 
 
+class RefundDebitNotFoundError(DebitNotFoundError):
+    """MA-153 FR-4 — a refund for an order with no ORDER_DEBIT (never
+    charged, or voided). Same code as MA-142's lookup, but a 409: the
+    lookup's 404 means "not debited yet", while here the refund is refused.
+    A subclass so the lookup route's status doesn't change."""
+
+    http_status = 409
+
+
+class RefundOrderUserMismatchError(OrderUserMismatchError):
+    """MA-153 FR-4 — the order's debit (or an earlier refund of it) is on a
+    different wallet than the caller's. A 409 here; the debit route keeps
+    its 400."""
+
+    http_status = 409
+
+
+class RefundExceedsDebitError(WalletError):
+    """MA-153 FR-2 step 4 — this refund plus earlier ones for the order would
+    exceed what was debited. `details`: debitedPaise, alreadyRefundedPaise."""
+
+    error_code = "REFUND_EXCEEDS_DEBIT"
+    http_status = 409
+
+
 class InvalidOrderIdError(WalletError):
     error_code = "VALIDATION_ERROR"
     http_status = 400

@@ -31,8 +31,12 @@ from sqlalchemy.exc import IntegrityError
 from domain.exceptions import (
     DebitVoidedError,
     OrderUserMismatchError,
+    RefundDebitNotFoundError,
+    RefundExceedsDebitError,
+    RefundOrderUserMismatchError,
     RetryableConsumerError,
     ServiceUnavailableError,
+    WalletNotFoundError,
     WalletProvisioningPendingError,
 )
 from domain.models import (
@@ -41,6 +45,7 @@ from domain.models import (
     DebitVoid,
     LedgerEntry,
     LedgerType,
+    RefundOutcome,
     Wallet,
     WalletStatus,
 )
@@ -403,6 +408,129 @@ class SqlAlchemyWalletRepository(SqlAlchemyOperationMixin):
                     raise
                 return _replay_outcome(_row_to_wallet(wallet_row), existing, order_id)
 
+    def refund_for_order(
+        self,
+        *,
+        user_id: str,
+        order_id: str,
+        refund_id: str,
+        amount_paise: int,
+        ref: str,
+        correlation_id: str | None,
+        outbox_payload_builder,
+    ) -> RefundOutcome:
+        """MA-153 FR-2 — one transaction, the same lock-check-write shape as
+        `debit_for_order`. `SELECT ... FOR UPDATE` the wallet row, then:
+          - no row -> WalletNotFoundError (404). Unlike a debit, this can't
+            be a provisioning race: the order was debited from a wallet.
+          - `ref` already refunded -> replay of that entry (no write), or
+            RefundOrderUserMismatchError if it's on another wallet.
+          - no ORDER_DEBIT `order:{orderId}` entry (never charged, or
+            voided) -> RefundDebitNotFoundError; on another wallet ->
+            RefundOrderUserMismatchError.
+          - this refund plus earlier `refund:{orderId}:*` entries over the
+            debited amount -> RefundExceedsDebitError.
+          - otherwise insert the REFUND ledger row, increment the balance
+            and insert a WalletRefunded outbox row, in this one transaction.
+
+        No wallet-status check, deliberately (FR-2 step 5): it's the
+        customer's own money coming back, so a FAILED or CREATING wallet is
+        still credited. The `ref` UNIQUE constraint resolves concurrent
+        identical calls: the loser's IntegrityError is re-read as a replay.
+        """
+        with self._db_operation("refund_for_order", "Failed to refund wallet"):
+            try:
+                with self._engine.begin() as conn:
+                    row = conn.execute(
+                        select(wallets_table)
+                        .where(wallets_table.c.user_id == user_id)
+                        .with_for_update()
+                    ).fetchone()
+                    if row is None:
+                        raise WalletNotFoundError(f"no wallet for user {user_id!r}")
+                    wallet = _row_to_wallet(row)
+
+                    existing = conn.execute(
+                        select(ledger_entries_table).where(ledger_entries_table.c.ref == ref)
+                    ).fetchone()
+                    if existing is not None:
+                        return _refund_replay(wallet, existing, order_id, refund_id)
+
+                    debit = conn.execute(
+                        select(ledger_entries_table).where(
+                            ledger_entries_table.c.ref == f"order:{order_id}"
+                        )
+                    ).fetchone()
+                    if debit is None or debit.type != LedgerType.ORDER_DEBIT.value:
+                        raise RefundDebitNotFoundError(f"No debit found for order {order_id}")
+                    if debit.wallet_id != wallet.id:
+                        raise RefundOrderUserMismatchError(
+                            f"order {order_id!r} was debited from a different wallet"
+                        )
+
+                    # A literal prefix match: order ids contain `_`, which an
+                    # unescaped LIKE would read as a wildcard (MA-153 §7).
+                    already = int(
+                        conn.execute(
+                            select(
+                                func.coalesce(func.sum(ledger_entries_table.c.amount_paise), 0)
+                            ).where(
+                                ledger_entries_table.c.wallet_id == wallet.id,
+                                ledger_entries_table.c.type == LedgerType.REFUND.value,
+                                ledger_entries_table.c.ref.startswith(
+                                    f"refund:{order_id}:", autoescape=True
+                                ),
+                            )
+                        ).scalar_one()
+                    )
+                    debited = abs(int(debit.amount_paise))
+                    if already + amount_paise > debited:
+                        raise RefundExceedsDebitError(
+                            f"refund would exceed the {debited} paise debited for {order_id!r}",
+                            {"debitedPaise": debited, "alreadyRefundedPaise": already},
+                        )
+
+                    new_balance = wallet.balance_paise + amount_paise
+                    inserted = conn.execute(
+                        ledger_entries_table.insert().values(
+                            wallet_id=wallet.id,
+                            type=LedgerType.REFUND.value,
+                            amount_paise=amount_paise,
+                            balance_after_paise=new_balance,
+                            ref=ref,
+                            correlation_id=correlation_id,
+                        )
+                    )
+                    conn.execute(
+                        wallets_table.update()
+                        .where(wallets_table.c.id == wallet.id)
+                        .values(balance_paise=new_balance, updated_at=func.now())
+                    )
+                    conn.execute(
+                        outbox_table.insert().values(
+                            aggregate_id=wallet.id,
+                            event_type="WalletRefunded",
+                            payload=outbox_payload_builder(wallet.id, new_balance),
+                        )
+                    )
+                    entry = conn.execute(
+                        select(ledger_entries_table).where(
+                            ledger_entries_table.c.id == inserted.inserted_primary_key[0]
+                        )
+                    ).fetchone()
+                    return _refund_outcome(entry, order_id, refund_id, replayed=False)
+            except IntegrityError:
+                with self._engine.connect() as conn:
+                    wallet_row = conn.execute(
+                        select(wallets_table).where(wallets_table.c.user_id == user_id)
+                    ).fetchone()
+                    existing = conn.execute(
+                        select(ledger_entries_table).where(ledger_entries_table.c.ref == ref)
+                    ).fetchone()
+                if wallet_row is None or existing is None:
+                    raise
+                return _refund_replay(_row_to_wallet(wallet_row), existing, order_id, refund_id)
+
     def enqueue_outbox_event(self, *, aggregate_id: str, event_type: str, payload: dict) -> None:
         """Standalone one-row outbox insert for events that aren't part of
         a larger state-changing transaction (e.g. `WalletLowBalance`,
@@ -520,6 +648,27 @@ def _replay_outcome(wallet: Wallet, existing_ledger_row, order_id: str) -> Debit
         wallet_id=wallet.id,
         balance_paise=int(existing_ledger_row.balance_after_paise),
         replayed=True,
+    )
+
+
+def _refund_replay(wallet: Wallet, row, order_id: str, refund_id: str) -> RefundOutcome:
+    if row.wallet_id != wallet.id:
+        raise RefundOrderUserMismatchError(
+            f"refund {refund_id!r} for order {order_id!r} is on a different wallet"
+        )
+    return _refund_outcome(row, order_id, refund_id, replayed=True)
+
+
+def _refund_outcome(row, order_id: str, refund_id: str, *, replayed: bool) -> RefundOutcome:
+    return RefundOutcome(
+        order_id=order_id,
+        refund_id=refund_id,
+        wallet_id=row.wallet_id,
+        amount_paise=int(row.amount_paise),
+        balance_after_paise=int(row.balance_after_paise),
+        ledger_entry_id=int(row.id),
+        refunded_at=row.created_at,
+        replayed=replayed,
     )
 
 

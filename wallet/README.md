@@ -20,6 +20,7 @@ Service scaffold and carries both.
 | GET | `/wallet/internal/limits` | SigV4 (VPC-only) | Recharge min/max for Payment Service (MA-126) |
 | POST | `/wallet/internal/debits/{orderId}/void` | SigV4 (VPC-only) | Body `{userId}`. Fences the order under the wallet row lock: 200 `VOIDED` (no debit for it can ever commit; the debit then returns 409 `DEBIT_VOIDED`), or 409 `ALREADY_DEBITED` with the debit if it landed first. Idempotent; never moves money. Order Service calls it before closing an order without charge (MA-142) |
 | GET | `/wallet/internal/debits/{orderId}` | SigV4 (VPC-only) | Read-only diagnostics: 200 `DEBITED` (amount/balance) or `VOIDED`, else 404 `DEBIT_NOT_FOUND`. A 404 only means "not yet" — never grounds to close an order (MA-142) |
+| POST | `/wallet/internal/refunds` | SigV4 (VPC-only) | Body `{userId, orderId, refundId, amountPaise, correlationId?}`. Credits a `REFUND` ledger entry (ref `refund:{orderId}:{refundId}`) against the order's debit, whatever the wallet's status, and publishes `WalletRefunded`. Idempotent (a replay returns the original entry with `replayed: true`); capped at the debited amount. 409 `DEBIT_NOT_FOUND` / `ORDER_USER_MISMATCH` / `REFUND_EXCEEDS_DEBIT`. Order Service calls it when a customer cancels (MA-153/MA-32) |
 
 ## Events
 

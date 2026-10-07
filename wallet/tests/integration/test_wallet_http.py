@@ -1,9 +1,15 @@
 """FastAPI HTTP surface — TestClient against the SQLite double."""
 
+import threading
+
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event
+from sqlalchemy.pool import NullPool
 
+from adapters.wallet_repository import SqlAlchemyWalletRepository, create_schema
+from domain.wallet_service import WalletService
 from handlers.app import app
 from handlers.dependencies import get_wallet_service
 from tests.conftest import seed_wallet
@@ -343,3 +349,178 @@ def test_transactions_without_types_include_every_type(client, engine, service):
     body = client.get("/wallet/me/transactions?limit=50", headers=_bearer()).json()["data"]
     assert {i["type"] for i in body["items"]} == {"OPENING", "RECHARGE", "ORDER_DEBIT"}
 
+
+
+# --- MA-153: POST /wallet/internal/refunds ---
+
+
+def _debit(client, order_id="ord_x", amount=30000, user_id="user-1"):
+    r = client.post(
+        "/wallet/internal/debit",
+        json={"userId": user_id, "orderId": order_id, "amountPaise": amount},
+    )
+    assert r.status_code == 200
+
+
+def _refund_body(**overrides):
+    body = {"userId": "user-1", "orderId": "ord_x", "refundId": "cancel", "amountPaise": 30000}
+    body.update(overrides)
+    return body
+
+
+def test_internal_refund_after_debit_is_200_and_shows_in_history(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    _debit(client)
+    r = client.post("/wallet/internal/refunds", json=_refund_body())
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["status"] == "REFUNDED"
+    assert data["orderId"] == "ord_x"
+    assert data["refundId"] == "cancel"
+    assert data["amountPaise"] == 30000
+    assert data["balanceAfterPaise"] == 100000
+    assert data["replayed"] is False
+    assert data["refundedAt"]
+
+    history = client.get("/wallet/me/transactions?types=REFUND", headers=_bearer())
+    items = history.json()["data"]["items"]
+    assert [(i["amountPaise"], i["ref"]) for i in items] == [(30000, "refund:ord_x:cancel")]
+    assert items[0]["id"] == f"led_{data['ledgerEntryId']}"
+
+
+def test_internal_refund_replay_is_200_replayed(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    _debit(client)
+    first = client.post("/wallet/internal/refunds", json=_refund_body()).json()["data"]
+    second = client.post("/wallet/internal/refunds", json=_refund_body()).json()["data"]
+    assert second["replayed"] is True
+    assert second["ledgerEntryId"] == first["ledgerEntryId"]
+
+
+@pytest.fixture
+def isolated_client(tmp_path, settings):
+    """A file-backed SQLite engine with one connection per request, unlike the
+    suite's shared StaticPool connection (whose transactions can't overlap).
+    `BEGIN IMMEDIATE` serializes writers the way Postgres' FOR UPDATE does."""
+    eng = create_engine(
+        f"sqlite:///{tmp_path / 'wallet.db'}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+        poolclass=NullPool,
+    )
+
+    @event.listens_for(eng, "connect")
+    def _no_pysqlite_begin(dbapi_conn, _):
+        dbapi_conn.isolation_level = None
+
+    @event.listens_for(eng, "begin")
+    def _begin_immediate(conn):
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+    create_schema(eng)
+    svc = WalletService(SqlAlchemyWalletRepository(eng), settings)
+    get_wallet_service.cache_clear()
+    app.dependency_overrides[get_wallet_service] = lambda: svc
+    yield TestClient(app), eng
+    app.dependency_overrides.clear()
+    eng.dispose()
+
+
+def test_internal_refund_concurrent_identical_requests_write_one_entry(isolated_client):
+    client, eng = isolated_client
+    seed_wallet(eng, balance_paise=100000)
+    _debit(client)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def post():
+        barrier.wait()
+        results.append(client.post("/wallet/internal/refunds", json=_refund_body()).json())
+
+    threads = [threading.Thread(target=post) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [r["status"] for r in results] == ["success", "success"]
+    assert sorted(r["data"]["replayed"] for r in results) == [False, True]
+    history = client.get("/wallet/me/transactions?types=REFUND", headers=_bearer())
+    assert len(history.json()["data"]["items"]) == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"orderId": "bad id"},
+        {"orderId": "a" * 65},
+        {"orderId": None},
+        {"refundId": "bad.id"},
+        {"refundId": "a" * 33},
+        {"refundId": None},
+        {"userId": ""},
+        {"userId": None},
+        {"amountPaise": None},
+    ],
+)
+def test_internal_refund_invalid_body_is_400_validation_error(client, engine, overrides):
+    seed_wallet(engine, balance_paise=100000)
+    r = client.post("/wallet/internal/refunds", json=_refund_body(**overrides))
+    assert r.status_code == 400
+    body = r.json()
+    assert body["status"] == "error"
+    assert body["data"]["errorCode"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("amount", [0, -5])
+def test_internal_refund_non_positive_amount_is_400_invalid_amount(client, engine, amount):
+    seed_wallet(engine, balance_paise=100000)
+    _debit(client)
+    r = client.post("/wallet/internal/refunds", json=_refund_body(amountPaise=amount))
+    assert r.status_code == 400
+    assert r.json()["data"]["errorCode"] == "INVALID_AMOUNT"
+
+
+def test_internal_refund_no_wallet_is_404(client):
+    r = client.post("/wallet/internal/refunds", json=_refund_body(userId="ghost"))
+    assert r.status_code == 404
+    assert r.json()["data"]["errorCode"] == "WALLET_NOT_FOUND"
+
+
+def test_internal_refund_without_debit_is_409_debit_not_found(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    r = client.post("/wallet/internal/refunds", json=_refund_body())
+    assert r.status_code == 409
+    assert r.json()["data"]["errorCode"] == "DEBIT_NOT_FOUND"
+
+
+def test_internal_refund_over_debit_is_409_with_details(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    _debit(client)
+    client.post("/wallet/internal/refunds", json=_refund_body())
+    r = client.post(
+        "/wallet/internal/refunds", json=_refund_body(refundId="extra", amountPaise=1)
+    )
+    assert r.status_code == 409
+    data = r.json()["data"]
+    assert data["errorCode"] == "REFUND_EXCEEDS_DEBIT"
+    assert data["debitedPaise"] == 30000
+    assert data["alreadyRefundedPaise"] == 30000
+
+
+def test_internal_refund_other_users_debit_is_409_mismatch(client, engine):
+    seed_wallet(engine, balance_paise=100000)
+    seed_wallet(engine, user_id="user-2", wallet_id="wal_2")
+    _debit(client)
+    r = client.post("/wallet/internal/refunds", json=_refund_body(userId="user-2"))
+    assert r.status_code == 409
+    assert r.json()["data"]["errorCode"] == "ORDER_USER_MISMATCH"
+
+
+def test_internal_debit_lookup_is_still_404_for_unknown_orders(client, engine):
+    # The refund route's 409 DEBIT_NOT_FOUND is a subclass; the MA-142 lookup keeps its 404.
+    seed_wallet(engine)
+    assert client.get("/wallet/internal/debits/ord_unknown").status_code == 404
+
+
+def test_internal_refund_route_is_only_internal():
+    assert "/wallet/internal/refunds" in app.openapi()["paths"]
+    assert not [p for p in app.openapi()["paths"] if "refund" in p and "internal" not in p]

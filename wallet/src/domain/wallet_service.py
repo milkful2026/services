@@ -24,6 +24,7 @@ from domain.exceptions import (
     InvalidAmountError,
     InvalidCursorError,
     InvalidTransactionTypeError,
+    OrderUserMismatchError,
     WalletError,
     WalletNotFoundError,
 )
@@ -33,6 +34,7 @@ from domain.models import (
     DebitVoid,
     LedgerEntry,
     LedgerType,
+    RefundOutcome,
     TransactionsPage,
     Wallet,
     WalletStatus,
@@ -368,6 +370,60 @@ class WalletService:
             },
         )
 
+    # --- MA-153 (MA-32): order refund for Order Service ---
+
+    def refund_for_order(
+        self,
+        *,
+        user_id: str,
+        order_id: str,
+        refund_id: str,
+        amount_paise: int,
+        correlation_id: str | None,
+    ) -> RefundOutcome:
+        """`POST /wallet/internal/refunds` — credit an order's debit back to
+        the same wallet. Idempotent on `refund:{orderId}:{refundId}`: a
+        replay returns the original entry with `replayed=True`. The amount
+        comes from the caller (MA-32 always refunds in full); the repository
+        caps the order's refunds at what was debited."""
+        if amount_paise <= 0:
+            raise InvalidAmountError("amountPaise must be > 0")
+        # WalletRefunded.schema.json requires a non-empty correlationId.
+        correlation_id = correlation_id or str(uuid.uuid4())
+        ref = f"refund:{order_id}:{refund_id}"
+
+        def _build_refunded_outbox(wallet_id: str, balance_after_paise: int) -> dict:
+            return {
+                "eventId": str(uuid.uuid4()),
+                "occurredAt": datetime.now(UTC).isoformat(),
+                "correlationId": correlation_id,
+                "userId": user_id,
+                "walletId": wallet_id,
+                "orderId": order_id,
+                "refundId": refund_id,
+                "amountPaise": amount_paise,
+                "balanceAfterPaise": balance_after_paise,
+                "ref": ref,
+            }
+
+        try:
+            outcome = self._repo.refund_for_order(
+                user_id=user_id,
+                order_id=order_id,
+                refund_id=refund_id,
+                amount_paise=amount_paise,
+                ref=ref,
+                correlation_id=correlation_id,
+                outbox_payload_builder=_build_refunded_outbox,
+            )
+        except WalletError as exc:
+            _log_refund(order_id, refund_id, exc.error_code, correlation_id)
+            raise
+        _log_refund(
+            order_id, refund_id, "REPLAYED" if outcome.replayed else "REFUNDED", correlation_id
+        )
+        return outcome
+
     # --- MA-127 §5/§7/§11: nightly balance invariant ---
 
     def check_balance_invariant(self) -> list[str]:
@@ -392,6 +448,16 @@ class WalletService:
                 },
             )
         return offending_ids
+
+
+def _log_refund(order_id: str, refund_id: str, outcome: str, correlation_id: str) -> None:
+    """MA-153 §5 — the structured `refund` log, plus the log-based metric
+    `wallet.refund.count{outcome}`. A user mismatch is a data bug: error level."""
+    level = logging.ERROR if outcome == OrderUserMismatchError.error_code else logging.INFO
+    fields = {"orderId": order_id, "refundId": refund_id, "outcome": outcome,
+              "correlationId": correlation_id}
+    logger.log(level, "refund", extra=fields)
+    logger.info("wallet.refund.count", extra={"metric": "wallet.refund.count", **fields})
 
 
 def _debit_body(order_id: str, entry: LedgerEntry) -> dict:
