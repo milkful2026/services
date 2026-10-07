@@ -1,8 +1,13 @@
-"""GET /orders/me, GET /orders/{id} — FR-3. Both Cognito-JWT. No public
-write endpoints — every order is consumer-created from
-`SubscriptionOrderDue`."""
+"""GET /orders/me, GET /orders/{id} — FR-3; POST /orders/{id}/cancel —
+MA-154. All Cognito-JWT. Orders themselves are created by the
+`SubscriptionOrderDue` consumer and by checkout (checkout_handlers)."""
 
-from fastapi import APIRouter, Depends, Query
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+from fastapi import APIRouter, Depends, Header, Query
+from pydantic import BaseModel
 from shared.handlers.auth import current_user_id
 
 from domain.order_service import OrderService
@@ -10,6 +15,13 @@ from handlers.dependencies import get_order_service
 from handlers.dto import success_envelope
 
 router = APIRouter(tags=["orders"])
+
+
+class CancelRequest(BaseModel):
+    """MA-154 FR-1. `reason` is untyped on purpose: the service validates it,
+    so an unknown value is a 400 VALIDATION_ERROR rather than FastAPI's 422."""
+
+    reason: Any = None
 
 
 @router.get("/orders/me")
@@ -30,3 +42,23 @@ def get_order(
     service: OrderService = Depends(get_order_service),
 ):
     return success_envelope(service.get(order_id, user_id))
+
+
+@router.post("/orders/{order_id}/cancel")
+def cancel_order(
+    order_id: str,
+    body: CancelRequest | None = None,
+    correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+    request_id: str | None = Header(default=None, alias="x-request-id"),
+    user_id: str = Depends(current_user_id),
+    service: OrderService = Depends(get_order_service),
+):
+    return success_envelope(
+        service.cancel(
+            order_id,
+            user_id,
+            body.reason if body else None,
+            datetime.now(UTC),
+            correlation_id or request_id or str(uuid.uuid4()),
+        )
+    )

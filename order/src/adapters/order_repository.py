@@ -5,7 +5,7 @@ SQLAlchemy Core only (mirrors wallet/subscription/catalog/inventory) —
 the same Table definitions run against Postgres (production) and an
 in-memory SQLite engine (tests). Table columns are kept column-for-column
 compatible with migrations/0001_orders.sql + 0002_checkout.sql +
-0003_sweep.sql by hand.
+0003_sweep.sql + 0004_customer_cancel.sql by hand.
 """
 
 import base64
@@ -48,14 +48,17 @@ from domain.checkout_models import (
 )
 from domain.exceptions import CheckoutInProgressError, LeaseLostError, ServiceUnavailableError
 from domain.models import (
+    FAILURE_CUSTOMER_CANCELLED,
     FAILURE_CUTOFF_PASSED,
     FAILURE_SWEEP_EXHAUSTED,
+    CancelReason,
     ChargeState,
     Order,
     OrderItem,
     OrderSource,
     OrdersPage,
     OrderStatus,
+    RefundState,
 )
 
 metadata = MetaData()
@@ -94,8 +97,21 @@ orders_table = Table(
     Column("claim_owner", String(64), nullable=True),
     Column("last_sweep_error", Text, nullable=True),
     Column("charge_state", String(16), nullable=True),
+    # MA-154 customer cancel (0004_customer_cancel.sql).
+    Column("cancel_reason", Text, nullable=True),
+    Column("cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("refund_state", Text, nullable=True),
+    Column("refunded_at", DateTime(timezone=True), nullable=True),
     UniqueConstraint(
         "subscription_id", "delivery_date", name="uq_orders_subscription_delivery_date"
+    ),
+    CheckConstraint(
+        "cancel_reason IN ('ORDERED_BY_MISTAKE', 'NOT_HOME', 'CHANGED_MIND', 'OTHER')",
+        name="orders_cancel_reason_check",
+    ),
+    CheckConstraint(
+        "refund_state IN ('PENDING', 'REFUNDED', 'NOT_REQUIRED')",
+        name="orders_refund_state_check",
     ),
     CheckConstraint(
         "(source = 'SUBSCRIPTION' AND subscription_id IS NOT NULL"
@@ -759,6 +775,119 @@ class SqlAlchemyOrderRepository(SqlAlchemyOperationMixin):
                 )
         return result.rowcount == 1
 
+    # --- MA-154: customer cancel + refund ---
+
+    def cancel_by_customer(
+        self,
+        order_id: str,
+        *,
+        reason: CancelReason | None,
+        now: datetime,
+        refund_state: RefundState,
+        outbox_payload: dict,
+    ) -> bool:
+        """FR-3 Step A — CONFIRMED -> CANCELLED(CUSTOMER_CANCELLED) plus the
+        OrderCancelled outbox row, in one transaction. False (nothing
+        written) when the order wasn't CONFIRMED any more: a concurrent cancel
+        or another transition won, and the caller re-reads."""
+        with self._db_operation("cancel_by_customer", "Failed to cancel order"):
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    orders_table.update()
+                    .where(
+                        orders_table.c.id == order_id,
+                        orders_table.c.status == OrderStatus.CONFIRMED.value,
+                    )
+                    .values(
+                        status=OrderStatus.CANCELLED.value,
+                        failure_reason=FAILURE_CUSTOMER_CANCELLED,
+                        cancel_reason=reason.value if reason else None,
+                        cancelled_at=now.astimezone(UTC),
+                        refund_state=refund_state.value,
+                    )
+                )
+                if result.rowcount != 1:
+                    return False
+                conn.execute(
+                    outbox_table.insert().values(
+                        aggregate_id=order_id,
+                        event_type="OrderCancelled",
+                        payload=outbox_payload,
+                    )
+                )
+        return True
+
+    def mark_refund_state(
+        self,
+        order_id: str,
+        state: RefundState,
+        *,
+        refunded_at: datetime | None = None,
+        owner: str | None = None,
+    ) -> bool:
+        """PENDING -> `state`, and releases any lease. Conditional on PENDING,
+        so the request and the sweep can both try it safely; with `owner`,
+        only that lease holder's update counts."""
+        where = [
+            orders_table.c.id == order_id,
+            orders_table.c.refund_state == RefundState.PENDING.value,
+        ]
+        if owner is not None:
+            where.append(orders_table.c.claim_owner == owner)
+        with self._db_operation("mark_refund_state", "Failed to record refund"):
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    orders_table.update()
+                    .where(*where)
+                    .values(
+                        refund_state=state.value,
+                        refunded_at=refunded_at.astimezone(UTC) if refunded_at else None,
+                        **_LEASE_CLEARED,
+                    )
+                )
+        return result.rowcount == 1
+
+    def list_pending_refunds(self, older_than_seconds: float, limit: int) -> list[str]:
+        """FR-5 — PENDING refunds cancelled more than `older_than_seconds`
+        ago (by the database clock), with a free lease, oldest first."""
+        with self._db_operation("list_pending_refunds", "Failed to list refunds"):
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(orders_table.c.id)
+                    .where(
+                        orders_table.c.refund_state == RefundState.PENDING.value,
+                        orders_table.c.cancelled_at < self._db_now_plus(-older_than_seconds),
+                        self._lease_free(orders_table),
+                    )
+                    .order_by(orders_table.c.cancelled_at)
+                    .limit(limit)
+                ).fetchall()
+        return [r.id for r in rows]
+
+    def claim_pending_refund(self, order_id: str, owner: str, lease_seconds: float) -> bool:
+        return self._claim(
+            orders_table,
+            order_id,
+            owner,
+            lease_seconds,
+            orders_table.c.refund_state == RefundState.PENDING.value,
+        )
+
+    def oldest_pending_refund_at(self) -> datetime | None:
+        """For the `order.refund.pending_age_seconds` metric (UTC)."""
+        with self._db_operation("oldest_pending_refund_at", "Failed to read refunds"):
+            with self._engine.connect() as conn:
+                oldest = conn.execute(
+                    select(func.min(orders_table.c.cancelled_at)).where(
+                        orders_table.c.refund_state == RefundState.PENDING.value
+                    )
+                ).scalar_one()
+        if oldest is None:
+            return None
+        if isinstance(oldest, str):  # SQLite's func.min returns the stored text
+            oldest = datetime.fromisoformat(oldest)
+        return oldest if oldest.tzinfo else oldest.replace(tzinfo=UTC)
+
     # --- MA-144: checkout lease + recovery ---
 
     def claim_checkout(self, checkout_id: str, owner: str, lease_seconds: float) -> bool:
@@ -970,6 +1099,10 @@ def _row_to_order(row, items: list[OrderItem] | None = None) -> Order:
         claim_owner=row.claim_owner,
         last_sweep_error=row.last_sweep_error,
         charge_state=ChargeState(row.charge_state) if row.charge_state else None,
+        cancel_reason=CancelReason(row.cancel_reason) if row.cancel_reason else None,
+        cancelled_at=row.cancelled_at,
+        refund_state=RefundState(row.refund_state) if row.refund_state else None,
+        refunded_at=row.refunded_at,
     )
 
 

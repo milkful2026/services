@@ -267,6 +267,22 @@ class CheckoutNeedsAttentionError(OrderError):
     http_status = 409
 
 
+class OrderNotCancellableError(OrderError):
+    """MA-154 FR-2 — only a CONFIRMED order can be cancelled by its customer.
+    `details`: status."""
+
+    error_code = "ORDER_NOT_CANCELLABLE"
+    http_status = 409
+
+
+class CutoffPassedError(OrderError):
+    """MA-154 FR-2 — the cancel deadline (the checkout cut-off, the day
+    before delivery) has passed. `details`: cancellableUntil."""
+
+    error_code = "CUTOFF_PASSED"
+    http_status = 409
+
+
 class LeaseLostError(OrderError):
     """MA-144 — this worker's lease on a record expired and someone else
     took it over. Internal: stop without writing anything further."""

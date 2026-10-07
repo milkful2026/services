@@ -27,6 +27,7 @@ def run_once(service=None, now: datetime | None = None) -> Counter:
         ("subscription_order", service.sweep_subscription_orders),
         ("checkout", service.sweep_checkouts),
         ("settle", service.settle_unknown_charges),  # FR-4b: after the other passes
+        ("refund", service.finish_pending_refunds),  # MA-154 FR-5
     ):
         counts.update({f"{flow}.{k}": v for k, v in run_pass(correlation_id, now).items()})
     duration_ms = int((time.monotonic() - started) * 1000)
