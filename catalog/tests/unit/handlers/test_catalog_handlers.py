@@ -96,6 +96,7 @@ def test_list_products_requires_category_id(client):
             "description": "Farm-fresh",
             "unit": "1L Bottle",
             "price": 68,
+            "priceB2b": 60,
             "imageUrl": "https://example.com/cow-milk.jpg",
             "tag": "ORGANIC",
             "subscriptionEligible": True,

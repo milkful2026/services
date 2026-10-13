@@ -18,8 +18,19 @@ def serialize_category(category: Category) -> dict[str, Any]:
 
 
 def serialize_product(product: Product) -> dict[str, Any]:
-    # MA-116 FR-4: always the B2C price, until a caller can signal B2B
-    # intent (still-open Q2) — price_b2b is deliberately not serialized.
+    # MA-116 FR-4: `price` is always the B2C price — the mobile app's
+    # existing, shipped consumption of this exact key is unchanged.
+    # `priceB2b` is additive (MA-156/MA-157): this same serializer backs
+    # both the public GET /products/{id} (where price_b2b stayed
+    # deliberately absent until now, per MA-116's original "no caller
+    # can signal B2B intent" framing) AND the admin create/edit
+    # responses (POST /products, PATCH /products/{id}) — and an admin
+    # IS a caller who can legitimately see/edit it. Confirmed missing by
+    # live-checking the real response while building MA-157's detail/
+    # edit page, which needs to show the current priceB2b value; adding
+    # it here (rather than a second admin-only serializer) keeps one
+    # source of truth for "the full product shape" the way isActive/
+    # hsnCode/taxRate already do for the identical reason.
     # isActive IS serialized (MA-156 FR-7's edge case: a deactivated
     # product looked up by direct id must show isActive: false, not 404).
     return {
@@ -29,6 +40,7 @@ def serialize_product(product: Product) -> dict[str, Any]:
         "description": product.description,
         "unit": product.unit,
         "price": product.price_b2c,
+        "priceB2b": product.price_b2b,
         "imageUrl": product.image_url,
         "tag": product.tag,
         "subscriptionEligible": product.subscription_eligible,
