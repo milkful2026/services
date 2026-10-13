@@ -709,6 +709,18 @@ def main() -> None:
             # Local dev only — see inventory's identical entry above for
             # why (Flutter web's browser-origin CORS block).
             "CATALOG_CORS_ALLOW_ALL": "true",
+            # Local dev only — see catalog's handlers/local_admin_auth.py
+            # own docstring. Catalog's admin routes are FastAPI/ALB, not
+            # Lambda, so they have no other local stand-in for API
+            # Gateway's authorizer + parameter-mapping hop; without this,
+            # a real browser session 401s on every admin route.
+            "CATALOG_LOCAL_ADMIN_AUTH": "true",
+            # MA-156 (MA-42) — CatalogUpdated publish. The EventBridge
+            # rule/queue/DLQ this feeds are already wired above
+            # (bootstrap_catalog_updated_queue()) — only these two env
+            # vars were missing.
+            "CATALOG_EVENT_BUS_NAME": "default",
+            "CATALOG_EVENT_SOURCE": "catalog",
         },
     )
     _write_env_file(

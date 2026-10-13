@@ -8,9 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from domain.exceptions import CatalogError
+from handlers.admin_catalog_handler import router as admin_catalog_router
 from handlers.categories_handler import router as categories_router
 from handlers.dto import error_envelope
 from handlers.health import consumer_health
+from handlers.local_admin_auth import LocalAdminAuthMiddleware
 from handlers.products_handler import router as products_router
 from handlers.search_handler import router as search_router
 
@@ -18,6 +20,7 @@ app = FastAPI(title="Catalog Service")
 app.include_router(categories_router)
 app.include_router(products_router)
 app.include_router(search_router)
+app.include_router(admin_catalog_router)
 
 # Read directly from os.environ, not config.env.Settings — matches
 # inventory/src/handlers/app.py's own documented reasoning exactly
@@ -30,6 +33,13 @@ if os.environ.get("CATALOG_CORS_ALLOW_ALL", "").lower() == "true":
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# Local dev only — see local_admin_auth.py's own docstring for why this
+# service, unlike the Lambda-shaped ones, has no other stand-in for API
+# Gateway's authorizer + parameter-mapping hop. Same env-var-gated,
+# read-at-import-time pattern as CATALOG_CORS_ALLOW_ALL above.
+if os.environ.get("CATALOG_LOCAL_ADMIN_AUTH", "").lower() == "true":
+    app.add_middleware(LocalAdminAuthMiddleware)
 
 
 @app.exception_handler(CatalogError)
