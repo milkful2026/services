@@ -16,6 +16,11 @@ class Settings(BaseSettings):
 
     stock_changed_queue_url: str = ""
 
+    # MA-156 (MA-42) — CatalogUpdated publish, mirrors Inventory's own
+    # event_bus_name/event_source fields exactly.
+    event_bus_name: str = "default"
+    event_source: str = "catalog"
+
     # Note: local-dev CORS support (CATALOG_CORS_ALLOW_ALL) is read
     # directly from os.environ in handlers/app.py, not through this
     # class — matches inventory/src/handlers/app.py's own documented

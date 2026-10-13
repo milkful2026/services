@@ -103,6 +103,9 @@ def test_list_products_requires_category_id(client):
             "isOrganic": True,
             "stockState": "IN_STOCK",
             "availableFrom": None,
+            "isActive": True,
+            "hsnCode": None,
+            "taxRate": None,
         }
     ]
 

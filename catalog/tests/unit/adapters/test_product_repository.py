@@ -1,6 +1,9 @@
 from datetime import UTC, date, datetime
 
-from adapters.product_repository import SqlAlchemyProductRepository
+import pytest
+
+from adapters.product_repository import SqlAlchemyProductRepository, _to_wire_keys
+from domain.exceptions import CategoryNotFoundError, ProductNotFoundError
 from domain.models import SearchFilters, SortOrder, StockState
 from tests.conftest import seed_category, seed_product
 
@@ -226,3 +229,230 @@ def test_apply_stock_change_for_unknown_product_is_a_noop(sqlite_engine):
     )
 
     assert applied is False
+
+
+# --- MA-156 (MA-42): FR-7 is_active filtering ------------------------------
+
+
+def test_get_products_filters_out_inactive(sqlite_engine):
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine, id="active-one", is_active=True)
+    seed_product(sqlite_engine, id="inactive-one", name="Inactive", is_active=False)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    products = repo.get_products("milk")
+
+    assert [p.id for p in products] == ["active-one"]
+
+
+def test_get_product_does_not_filter_on_is_active(sqlite_engine):
+    # FR-7: a direct-id lookup must keep resolving for an old
+    # cart/order/subscription reference even after deactivation.
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine, is_active=False)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    product = repo.get_product("cow-milk")
+
+    assert product is not None
+    assert product.is_active is False
+
+
+def test_search_filters_out_inactive(sqlite_engine):
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine, id="active-one", is_active=True)
+    seed_product(sqlite_engine, id="inactive-one", name="Inactive", is_active=False)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    results = repo.search(None, None, None)
+
+    assert [p.id for p in results] == ["active-one"]
+
+
+# --- MA-156 (MA-42): admin write API ---------------------------------------
+
+
+def test_to_wire_keys_translates_known_columns():
+    assert _to_wire_keys({"price_b2c": 10, "is_veg": True}) == {"priceB2c": 10, "isVeg": True}
+
+
+def test_to_wire_keys_falls_back_to_the_snake_case_key_for_an_unmapped_column():
+    # Regression (code review finding): `_COLUMN_TO_WIRE` is hand-
+    # maintained and has to stay in sync with `products_table` and
+    # catalog_service.py's writable-fields list across multiple files.
+    # A future column missing from this mapping must degrade to its own
+    # snake_case name, not raise an uncaught KeyError from inside an
+    # open transaction.
+    assert _to_wire_keys({"brand": "Acme"}) == {"brand": "Acme"}
+
+
+def test_category_exists(sqlite_engine):
+    seed_category(sqlite_engine, id="milk")
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    assert repo.category_exists("milk") is True
+    assert repo.category_exists("nonexistent") is False
+
+
+def test_create_product_writes_product_and_create_audit_row_in_one_transaction(sqlite_engine):
+    seed_category(sqlite_engine, id="milk")
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    product = repo.create_product(
+        "new-product",
+        admin_id="admin-1",
+        reason="new SKU",
+        category_id="milk",
+        name="New Product",
+        description="desc",
+        unit="1L",
+        price_b2c=50,
+        price_b2b=None,
+        image_url=None,
+        tag=None,
+        subscription_eligible=False,
+        is_veg=True,
+        is_organic=False,
+        hsn_code=None,
+        tax_rate=None,
+    )
+
+    assert product.id == "new-product"
+    assert product.is_active is True
+
+    audit_page = repo.get_audit_log("new-product", page=1, page_size=10)
+    assert audit_page.total == 1
+    entry = audit_page.items[0]
+    assert entry.action == "CREATE"
+    assert entry.admin_id == "admin-1"
+    assert entry.reason == "new SKU"
+    assert entry.previous_value is None
+    assert entry.new_value["name"] == "New Product"
+
+
+def test_update_product_only_records_changed_fields_in_audit_row(sqlite_engine):
+    seed_category(sqlite_engine, id="milk")
+    seed_product(sqlite_engine, id="cow-milk", name="Cow Milk", price_b2c=68)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    product = repo.update_product(
+        "cow-milk", admin_id="admin-1", reason="price change", price_b2c=75
+    )
+
+    assert product.price_b2c == 75.0
+    audit_page = repo.get_audit_log("cow-milk", page=1, page_size=10)
+    assert audit_page.total == 1
+    entry = audit_page.items[0]
+    assert entry.action == "UPDATE"
+    assert entry.previous_value == {"priceB2c": 68.0}
+    assert entry.new_value == {"priceB2c": 75.0}
+
+
+def test_update_product_raises_not_found_for_unknown_id(sqlite_engine):
+    seed_category(sqlite_engine)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    with pytest.raises(ProductNotFoundError):
+        repo.update_product("nonexistent", admin_id="admin-1", reason=None, price_b2c=10)
+
+
+def test_create_category_and_update_category(sqlite_engine):
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    category = repo.create_category("new-cat", name="New Cat", icon_name="icon", sort_order=5)
+    assert category.id == "new-cat"
+
+    updated = repo.update_category("new-cat", name="Renamed")
+    assert updated.name == "Renamed"
+    assert updated.icon_name == "icon"  # untouched field preserved
+
+
+def test_update_category_raises_not_found_for_unknown_id(sqlite_engine):
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    with pytest.raises(CategoryNotFoundError):
+        repo.update_category("nonexistent", name="x")
+
+
+def test_list_products_admin_includes_inactive(sqlite_engine):
+    seed_category(sqlite_engine, id="milk")
+    seed_product(sqlite_engine, id="active-one", is_active=True)
+    seed_product(sqlite_engine, id="inactive-one", name="Inactive", is_active=False)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    page = repo.list_products_admin(category_id=None, is_active=None, page=1, page_size=50)
+
+    assert page.total == 2
+    assert {s.id for s in page.items} == {"active-one", "inactive-one"}
+
+
+def test_list_products_admin_filters_by_category_and_is_active(sqlite_engine):
+    seed_category(sqlite_engine, id="milk")
+    seed_category(sqlite_engine, id="curd", name="Curd")
+    seed_product(sqlite_engine, id="active-milk", category_id="milk", is_active=True)
+    seed_product(sqlite_engine, id="inactive-milk", category_id="milk", name="x", is_active=False)
+    seed_product(sqlite_engine, id="active-curd", category_id="curd", name="y", is_active=True)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    page = repo.list_products_admin(category_id="milk", is_active=True, page=1, page_size=50)
+
+    assert [s.id for s in page.items] == ["active-milk"]
+
+
+def test_get_audit_log_raises_not_found_for_unknown_product(sqlite_engine):
+    seed_category(sqlite_engine)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    with pytest.raises(ProductNotFoundError):
+        repo.get_audit_log("nonexistent", page=1, page_size=10)
+
+
+def test_get_audit_log_empty_for_product_with_no_audit_rows(sqlite_engine):
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine)
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    page = repo.get_audit_log("cow-milk", page=1, page_size=10)
+
+    assert page.total == 0
+    assert page.items == []
+
+
+def test_get_audit_log_newest_first(sqlite_engine):
+    # Explicit, well-separated created_at values rather than two fast
+    # successive update_product() calls — SQLite's CURRENT_TIMESTAMP
+    # (func.now()) only has second resolution in the test double, which
+    # can't reliably distinguish two calls issued within the same second
+    # (same documented fidelity gap as inventory's own
+    # test_get_audit_log_newest_first, stock_repository tests). This test
+    # is about the ORDER BY clause, not wall-clock timing.
+    from adapters.product_repository import catalog_audit_log_table, new_audit_id
+
+    seed_category(sqlite_engine)
+    seed_product(sqlite_engine)
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            catalog_audit_log_table.insert().values(
+                id=new_audit_id(),
+                product_id="cow-milk",
+                admin_id="admin-1",
+                action="UPDATE",
+                reason="first",
+                created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+        conn.execute(
+            catalog_audit_log_table.insert().values(
+                id=new_audit_id(),
+                product_id="cow-milk",
+                admin_id="admin-1",
+                action="UPDATE",
+                reason="second",
+                created_at=datetime(2026, 6, 1, tzinfo=UTC),
+            )
+        )
+    repo = SqlAlchemyProductRepository(sqlite_engine)
+
+    page = repo.get_audit_log("cow-milk", page=1, page_size=10)
+
+    assert [e.reason for e in page.items] == ["second", "first"]
