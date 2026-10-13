@@ -78,7 +78,7 @@ def test_list_categories_returns_bare_array_in_data(client):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
-    assert body["data"] == [{"id": "milk", "name": "Fresh Milk", "iconName": "milk"}]
+    assert body["data"] == [{"id": "milk", "name": "Fresh Milk", "iconName": "milk", "sortOrder": 0}]
 
 
 def test_list_products_requires_category_id(client):

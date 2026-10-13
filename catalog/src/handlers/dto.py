@@ -14,7 +14,16 @@ from domain.models import AdminProductSummary, CatalogAuditLogEntry, Category, P
 
 
 def serialize_category(category: Category) -> dict[str, Any]:
-    return {"id": category.id, "name": category.name, "iconName": category.icon_name}
+    # sortOrder is additive (MA-157): found missing the same way priceB2b
+    # was - MA-157 FR-5's category screen needs to display/edit it, and
+    # this same serializer backs GET /categories, POST /categories, and
+    # PATCH /categories/{id} alike, so the fix covers all three at once.
+    return {
+        "id": category.id,
+        "name": category.name,
+        "iconName": category.icon_name,
+        "sortOrder": category.sort_order,
+    }
 
 
 def serialize_product(product: Product) -> dict[str, Any]:
